@@ -2149,8 +2149,7 @@ async def chat_completions(
                 "total_tokens": len(str(request.messages).split()) + total_tokens
             }
 
-            openai_response = gemini_to_openai(gemini_response, request, usage_info)
-            return JSONResponse(content=openai_response)
+            return JSONResponse(content=gemini_response)
 
     except HTTPException:
         raise
