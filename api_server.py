@@ -583,104 +583,160 @@ async def log_usage_background(gemini_key_id: int, user_key_id: int, model_name:
         logger.error(f"Background usage logging failed: {e}")
 
 
-async def collect_streaming_response(
-        stream_generator,
-        request: ChatCompletionRequest
+async def collect_gemini_response_directly(
+        gemini_key: str,
+        key_id: int,
+        gemini_request: Dict,
+        openai_request: ChatCompletionRequest,
+        model_name: str
 ) -> Dict:
     """
-    统一的流式响应收集器
-    将流式响应收集并组装成完整的OpenAI格式响应
+    从Google API收集完整响应
     """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
+    
+    # 确定超时时间
+    has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+    is_fast_failover = await should_use_fast_failover()
+    if has_tool_calls:
+        timeout = 60.0
+    elif is_fast_failover:
+        timeout = 60.0
+    else:
+        timeout = float(db.get_config('request_timeout', '60'))
+
+    logger.info(f"Starting direct collection from: {url}")
+    
     complete_content = ""
     thinking_content = ""
-    total_completion_tokens = 0
-    total_prompt_tokens = 0
+    total_tokens = 0
     finish_reason = "stop"
-    
-    logger.info("Starting to collect streaming response chunks")
-    
+    start_time = time.time()
+
     try:
-        async for chunk_bytes in stream_generator:
-            if not chunk_bytes:
-                continue
-                
-            chunk_str = chunk_bytes.decode('utf-8') if isinstance(chunk_bytes, bytes) else chunk_bytes
-            
-            # 解析SSE数据 - 每行都可能包含多个数据包
-            lines = chunk_str.strip().split('\n')
-            for line in lines:
-                line = line.strip()
-                if line.startswith('data: '):
-                    data_part = line[6:].strip()  # 移除 'data: ' 前缀
-                    
-                    if data_part == '[DONE]':
-                        logger.info("Received [DONE] signal, finishing collection")
-                        break
-                        
-                    if not data_part:  # 跳过空数据行
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                    "POST",
+                    url,
+                    json=gemini_request,
+                    headers={"x-goog-api-key": gemini_key}
+            ) as response:
+                if response.status_code != 200:
+                    response_time = time.time() - start_time
+                    asyncio.create_task(
+                        update_key_performance_background(key_id, False, response_time)
+                    )
+                    error_text = await response.aread()
+                    error_msg = error_text.decode() if error_text else f"HTTP {response.status_code}"
+                    logger.error(f"Direct request failed with status {response.status_code}: {error_msg}")
+                    raise Exception(f"Direct request failed: {error_msg}")
+
+                logger.info(f"Direct response started, status: {response.status_code}")
+                processed_lines = 0
+
+                async for line in response.aiter_lines():
+                    processed_lines += 1
+                    if not line:
                         continue
-                        
-                    try:
-                        chunk_data = json.loads(data_part)
-                        
-                        # 提取choices中的delta内容
-                        for choice in chunk_data.get('choices', []):
-                            delta = choice.get('delta', {})
-                            choice_content = delta.get('content', '')
-                            
-                            if choice_content:
-                                complete_content += choice_content
-                                # 简单的token计算（按单词分割）
-                                words = choice_content.split()
-                                total_completion_tokens += len(words)
-                            
-                            # 获取finish_reason
-                            if choice.get('finish_reason'):
-                                finish_reason = choice['finish_reason']
-                        
-                        # 从usage中获取token信息（如果有）
-                        usage = chunk_data.get('usage', {})
-                        if usage.get('prompt_tokens'):
-                            total_prompt_tokens = usage['prompt_tokens']
-                        if usage.get('completion_tokens'):
-                            total_completion_tokens = usage['completion_tokens']
-                            
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse chunk JSON: {data_part[:100]}... Error: {e}")
-                        continue
-    
+
+                    if line.startswith("data: "):
+                        json_str = line[6:]
+                        if json_str.strip() == "[DONE]":
+                            logger.info("Received [DONE] signal")
+                            break
+                        if not json_str.strip():
+                            continue
+
+                        try:
+                            data = json.loads(json_str)
+                            for candidate in data.get("candidates", []):
+                                content_data = candidate.get("content", {})
+                                parts = content_data.get("parts", [])
+
+                                for part in parts:
+                                    if "text" in part:
+                                        text = part["text"]
+                                        if not text:
+                                            continue
+
+                                        total_tokens += len(text.split())
+                                        is_thought = part.get("thought", False)
+
+                                        if is_thought and not (openai_request.thinking_config and 
+                                                             openai_request.thinking_config.include_thoughts):
+                                            thinking_content += text
+                                        else:
+                                            # 为思考过程添加标记
+                                            if is_thought and not thinking_content:
+                                                complete_content += "**Thinking Process:**\n"
+                                            elif not is_thought and thinking_content and not complete_content.endswith("**Response:**\n"):
+                                                complete_content += "\n\n**Response:**\n"
+                                            
+                                            complete_content += text
+
+                                finish_reason = candidate.get("finishReason", "stop")
+                                if finish_reason:
+                                    finish_reason = map_finish_reason(finish_reason)
+
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"JSON decode error: {e}")
+                            continue
+
+                response_time = time.time() - start_time
+                asyncio.create_task(
+                    update_key_performance_background(key_id, True, response_time)
+                )
+
+    except (httpx.TimeoutException, httpx.ConnectError) as e:
+        logger.warning(f"Direct request timeout/connection error: {str(e)}")
+        response_time = time.time() - start_time
+        asyncio.create_task(
+            update_key_performance_background(key_id, False, response_time)
+        )
+        raise Exception(f"Direct request failed: {str(e)}")
+
     except Exception as e:
-        logger.error(f"Error collecting streaming response: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to collect streaming response: {str(e)}")
-    
-    # 计算最终的usage信息
-    if not total_prompt_tokens:
-        total_prompt_tokens = len(str(request.messages).split())
-    
-    usage_info = {
-        "prompt_tokens": total_prompt_tokens,
-        "completion_tokens": total_completion_tokens,
-        "total_tokens": total_prompt_tokens + total_completion_tokens
-    }
-    
-    # 构建最终的OpenAI格式响应
+        logger.error(f"Unexpected direct request error: {str(e)}")
+        response_time = time.time() - start_time
+        asyncio.create_task(
+            update_key_performance_background(key_id, False, response_time)
+        )
+        raise
+
+    # 检查是否收集到内容
+    if not complete_content.strip():
+        logger.error(f"No content collected directly. Processed {processed_lines} lines")
+        raise HTTPException(
+            status_code=502,
+            detail="No content received from Google API"
+        )
+
+    # 计算token使用量
+    prompt_tokens = len(str(openai_request.messages).split())
+    completion_tokens = len(complete_content.split())
+
+    # 构建最终响应
     openai_response = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": request.model,
+        "model": openai_request.model,
         "choices": [{
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": complete_content.strip()  # 去除多余的空白字符
+                "content": complete_content.strip()
             },
             "finish_reason": finish_reason
         }],
-        "usage": usage_info
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
+        }
     }
-    
-    logger.info(f"Successfully collected streaming response: {len(complete_content)} chars, {total_completion_tokens} tokens")
+
+    logger.info(f"Successfully collected direct response: {len(complete_content)} chars, {completion_tokens} tokens")
     return openai_response
 
 
@@ -808,20 +864,17 @@ async def make_request_with_fast_failover(
                 else:
                     timeout_seconds = float(db.get_config('request_timeout', '60'))
                 
-                # 使用流式API并收集完整响应
-                logger.info(f"Using streaming API for non-streaming request with key #{key_info['id']}")
+                # 直接从Google API收集完整响应
+                logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']}")
                 
-                # 创建流式响应生成器
-                stream_generator = stream_gemini_response_single_attempt(
+                # 直接收集响应，避免SSE双重解析
+                response = await collect_gemini_response_directly(
                     key_info['key'],
                     key_info['id'],
                     gemini_request,
                     openai_request,
                     model_name
                 )
-                
-                # 收集流式响应为完整响应
-                response = await collect_streaming_response(stream_generator, openai_request)
                 
                 logger.info(f"✅ Request successful with key #{key_info['id']} on attempt {attempt + 1}")
 
@@ -2200,21 +2253,17 @@ async def make_request_with_failover(
             logger.info(f"Attempt {attempt + 1}: Using key #{key_info['id']} for {model_name}")
 
             try:
-                # 使用流式API并收集完整响应（传统故障转移）
-                logger.info(f"Using streaming API for non-streaming request with key #{key_info['id']} (traditional failover)")
+                # 直接从Google API收集完整响应（传统故障转移）
+                logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']} (traditional failover)")
                 
-                # 创建流式响应生成器
-                stream_generator = stream_gemini_response(
+                # 直接收集响应，避免SSE双重解析
+                response = await collect_gemini_response_directly(
                     key_info['key'],
                     key_info['id'],
                     gemini_request,
                     openai_request,
-                    key_info,
                     model_name
                 )
-                
-                # 收集流式响应为完整响应
-                response = await collect_streaming_response(stream_generator, openai_request)
 
                 logger.info(f"✅ Request successful with key #{key_info['id']} on attempt {attempt + 1}")
 
