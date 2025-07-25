@@ -692,7 +692,7 @@ class Database:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""                SELECT id, gemini_key, health_status, success_rate, avg_response_time
+                cursor.execute("""                SELECT id, key, health_status, success_rate, avg_response_time
                 FROM gemini_keys 
                 WHERE status = 1
                 ORDER BY 
