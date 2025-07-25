@@ -326,10 +326,9 @@ class ChatCompletionRequest(BaseModel):
         if 'n' in data and data['n'] is not None:
             data['n'] = max(1, min(4, data['n']))
         if 'max_tokens' in data and data['max_tokens'] is not None:
-            data['max_tokens'] = max(1, min(8192, data['max_tokens']))
+            data['max_tokens'] = max(1, data['max_tokens'])
 
         super().__init__(**data)
-
 
 # 内存缓存用于RPM/TPM限制
 class RateLimitCache:
@@ -864,10 +863,10 @@ async def make_request_with_fast_failover(
                 else:
                     timeout_seconds = float(db.get_config('request_timeout', '60'))
                 
-                # 直接从Google API收集完整响应
+                # 从Google API收集完整响应
                 logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']}")
                 
-                # 直接收集响应，避免SSE双重解析
+                # 收集响应
                 response = await collect_gemini_response_directly(
                     key_info['key'],
                     key_info['id'],
@@ -3212,6 +3211,7 @@ async def chat_completions(
         
         # 根据流式模式配置决定是否使用流式响应
         should_stream = request.stream  # 默认跟随用户请求
+        logger.info(f"DEBUG: request.stream={request.stream}, stream_mode={stream_mode}, has_tool_calls={has_tool_calls}")
         
         # 工具调用强制使用非流式模式
         if has_tool_calls:
@@ -3219,9 +3219,13 @@ async def chat_completions(
             logger.info("Tool calls detected, forcing non-streaming mode")
         elif stream_mode == 'stream':
             should_stream = True  # 强制流式
+            logger.info("Stream mode forced to streaming")
         elif stream_mode == 'non_stream':
             should_stream = False  # 强制非流式
+            logger.info("Stream mode forced to non-streaming")
         # stream_mode == 'auto' 时保持原有逻辑，跟随用户请求
+
+        logger.info(f"DEBUG: Final should_stream={should_stream}")
 
         if should_stream:
             if await should_use_fast_failover():
@@ -3248,6 +3252,7 @@ async def chat_completions(
                     media_type="text/event-stream; charset=utf-8"
                 )
         else:
+            logger.info("DEBUG: Using non-streaming response path")
             # 使用统一的流式架构（内部收集为完整响应）
             if await should_use_fast_failover():
                 openai_response = await make_request_with_fast_failover(
