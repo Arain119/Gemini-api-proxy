@@ -3018,7 +3018,7 @@ elif page == "系统设置":
 
             # 状态概览
             fast_enabled = current_config.get('fast_failover_enabled', True)
-            max_attempts = current_config.get('max_key_attempts', 5)
+
 
             st.markdown(f'''
             <div style="background: linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(220, 38, 38, 0.1) 100%); 
@@ -3027,8 +3027,7 @@ elif page == "系统设置":
                     <div>
                         <h5 style="margin: 0; color: #374151; font-size: 1.1rem;">故障转移状态</h5>
                         <p style="margin: 0.5rem 0 0 0; color: #6b7280; font-size: 0.9rem;">
-                            模式: {'快速转移' if fast_enabled else '传统重试'} | 
-                            最大尝试: {max_attempts} 次
+                            模式: {'快速转移' if fast_enabled else '传统重试'}
                         </p>
                     </div>
                     <div style="background: {'#10b981' if fast_enabled else '#f59e0b'}; color: white; padding: 0.5rem 1rem; border-radius: 8px; font-weight: 500;">
@@ -3058,13 +3057,7 @@ elif page == "系统设置":
                     help="当前健康状态的密钥数量"
                 )
 
-            with col3:
-                expected_time = max_attempts * 2 if fast_enabled else max_attempts * 5
-                st.metric(
-                    "预期转移时间",
-                    f"≤ {expected_time} 秒",
-                    help="最坏情况下的故障转移时间"
-                )
+
 
             # 配置表单
             st.markdown("##### 转移策略配置")
@@ -3082,14 +3075,7 @@ elif page == "系统设置":
                         help="失败时立即切换到下一个密钥，而不是重试当前密钥"
                     )
 
-                    # 最大Key尝试次数
-                    max_key_attempts = st.slider(
-                        "最大密钥尝试次数",
-                        min_value=1,
-                        max_value=min(20, available_keys) if available_keys > 0 else 20,
-                        value=current_config.get('max_key_attempts', 5),
-                        help="单次请求最多尝试的不同密钥数量"
-                    )
+
 
                 with col2:
                     st.markdown("**高级配置**")
@@ -3136,7 +3122,6 @@ elif page == "系统设置":
                 if save_config:
                     config_data = {
                         'fast_failover_enabled': fast_failover_enabled,
-                        'max_key_attempts': max_key_attempts,
                         'background_health_check': background_health_check,
                         'health_check_delay': health_check_delay
                     }

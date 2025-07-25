@@ -826,8 +826,7 @@ async def make_request_with_fast_failover(
         )
 
     if max_key_attempts is None:
-        config = db.get_failover_config()
-        max_key_attempts = config.get('max_key_attempts', 5)
+        max_key_attempts = len(available_keys)
     max_key_attempts = min(max_key_attempts, len(available_keys))
 
     logger.info(f"Starting fast failover with up to {max_key_attempts} key attempts for model {model_name}")
@@ -1204,8 +1203,7 @@ async def stream_with_fast_failover(
         return
 
     if max_key_attempts is None:
-        config = db.get_failover_config()
-        max_key_attempts = config.get('max_key_attempts', 5)
+        max_key_attempts = len(available_keys)
     max_key_attempts = min(max_key_attempts, len(available_keys))
 
     logger.info(f"Starting stream fast failover with up to {max_key_attempts} key attempts for {model_name}")
@@ -1314,10 +1312,7 @@ async def should_use_fast_failover() -> bool:
     return config.get('fast_failover_enabled', True)
 
 
-async def get_max_key_attempts() -> int:
-    """获取最大Key尝试次数"""
-    config = db.get_failover_config()
-    return config.get('max_key_attempts', 5)
+
 
 # 全局变量
 db = Database()
@@ -2916,7 +2911,7 @@ async def api_v1_info():
             "auto_cleanup_threshold": cleanup_config['days_threshold'],
             "anti_detection_enabled": db.get_config('anti_detection_enabled', 'true').lower() == 'true',
             "fast_failover_enabled": failover_config['fast_failover_enabled'],
-            "max_key_attempts": failover_config['max_key_attempts']
+
         },
         "multimodal_support": {
             "images": ["jpeg", "png", "gif", "webp", "bmp"],
@@ -3200,8 +3195,7 @@ async def chat_completions(
         if anti_detection_enabled:
             logger.info(f"Anti-detection processing applied for user {user_key_info['name']}")
 
-        # 使用配置化的故障转移
-        max_attempts = await get_max_key_attempts()
+
         
         # 获取管理者配置的流式模式
         stream_mode_config = db.get_stream_mode_config()
@@ -3236,7 +3230,7 @@ async def chat_completions(
                         request,
                         actual_model_name,
                         user_key_info=user_key_info,
-                        max_key_attempts=max_attempts
+
                     ),
                     media_type="text/event-stream; charset=utf-8"
                 )
@@ -3248,7 +3242,7 @@ async def chat_completions(
                         request,
                         actual_model_name,
                         user_key_info=user_key_info,
-                        max_key_attempts=max_attempts
+
                     ),
                     media_type="text/event-stream; charset=utf-8"
                 )
@@ -3261,7 +3255,7 @@ async def chat_completions(
                     request,
                     actual_model_name,
                     user_key_info=user_key_info,
-                    max_key_attempts=max_attempts
+
                 )
             else:
                 # 回退到传统故障转移逻辑
@@ -3270,7 +3264,7 @@ async def chat_completions(
                     request,
                     actual_model_name,
                     user_key_info=user_key_info,
-                    max_key_attempts=max_attempts
+
                 )
 
             # 直接返回已经转换好的OpenAI格式响应
@@ -3475,13 +3469,13 @@ async def update_failover_config(request: dict):
     """更新故障转移配置"""
     try:
         fast_failover_enabled = request.get('fast_failover_enabled')
-        max_key_attempts = request.get('max_key_attempts')
+
         background_health_check = request.get('background_health_check')
         health_check_delay = request.get('health_check_delay')
 
         success = db.set_failover_config(
             fast_failover_enabled=fast_failover_enabled,
-            max_key_attempts=max_key_attempts,
+
             background_health_check=background_health_check,
             health_check_delay=health_check_delay
         )

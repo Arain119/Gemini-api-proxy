@@ -240,7 +240,7 @@ class Database:
 
             # 快速故障转移配置
             ('fast_failover_enabled', 'true', '是否启用快速故障转移'),
-            ('max_key_attempts', '5', '单次请求最多尝试的Key数量'),
+
             ('single_key_retry', 'false', '单个Key是否进行重试'),
             ('background_health_check', 'true', '是否启用后台健康检测'),
             ('health_check_delay', '5', '失败后健康检测延迟时间（秒）'),
@@ -461,7 +461,7 @@ class Database:
         try:
             return {
                 'fast_failover_enabled': self.get_config('fast_failover_enabled', 'true').lower() == 'true',
-                'max_key_attempts': int(self.get_config('max_key_attempts', '5')),
+
                 'background_health_check': self.get_config('background_health_check', 'true').lower() == 'true',
                 'health_check_delay': int(self.get_config('health_check_delay', '5')),
             }
@@ -469,22 +469,19 @@ class Database:
             logger.error(f"Failed to get failover config: {e}")
             return {
                 'fast_failover_enabled': True,
-                'max_key_attempts': 5,
+
                 'background_health_check': True,
                 'health_check_delay': 5,
             }
 
-    def set_failover_config(self, fast_failover_enabled: bool = None, max_key_attempts: int = None,
+    def set_failover_config(self, fast_failover_enabled: bool = None,
                             background_health_check: bool = None, health_check_delay: int = None) -> bool:
         """设置故障转移配置"""
         try:
             if fast_failover_enabled is not None:
                 self.set_config('fast_failover_enabled', 'true' if fast_failover_enabled else 'false')
 
-            if max_key_attempts is not None:
-                if not (1 <= max_key_attempts <= 20):
-                    raise ValueError("max_key_attempts must be between 1 and 20")
-                self.set_config('max_key_attempts', str(max_key_attempts))
+
 
             if background_health_check is not None:
                 self.set_config('background_health_check', 'true' if background_health_check else 'false')
