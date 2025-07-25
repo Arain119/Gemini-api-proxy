@@ -775,7 +775,13 @@ async def make_gemini_request_single_attempt(
                 error_detail = response.json() if response.content else {"error": {"message": "Unknown error"}}
                 error_msg = error_detail.get("error", {}).get("message", f"HTTP {response.status_code}")
 
-                logger.warning(f"Key #{key_id} failed with {response.status_code}: {error_msg}")
+                # 如果是429错误，则标记为速率受限
+                if response.status_code == 429:
+                    logger.warning(f"Key #{key_id} is rate-limited (429). Marking as 'rate_limited'.")
+                    db.update_gemini_key_status(key_id, 'rate_limited')
+                else:
+                    logger.warning(f"Key #{key_id} failed with {response.status_code}: {error_msg}")
+
                 raise HTTPException(
                     status_code=response.status_code,
                     detail=error_msg
@@ -2485,6 +2491,11 @@ async def stream_gemini_response(
                     if response.status_code != 200:
                         response_time = time.time() - start_time
                         db.update_key_performance(key_id, False, response_time)
+
+                        # 如果是429错误，则标记为速率受限
+                        if response.status_code == 429:
+                            logger.warning(f"Stream key #{key_id} is rate-limited (429). Marking as 'rate_limited'.")
+                            db.update_gemini_key_status(key_id, 'rate_limited')
 
                         error_text = await response.aread()
                         error_msg = error_text.decode() if error_text else "Unknown error"

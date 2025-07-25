@@ -688,16 +688,25 @@ class Database:
             return []
 
     def get_available_gemini_keys(self) -> List[Dict]:
-        """获取可用的Gemini Keys（状态为激活且健康的）"""
+        """获取所有可用的Gemini Keys"""
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT * FROM gemini_keys 
-                    WHERE status = 1 AND health_status != 'unhealthy'
-                    ORDER BY success_rate DESC, avg_response_time ASC, id ASC
-                ''')
-                return [dict(row) for row in cursor.fetchall()]
+                cursor.execute("""                SELECT id, gemini_key, health_status, success_rate, avg_response_time
+                FROM gemini_keys 
+                WHERE status = 1
+                ORDER BY 
+                    CASE health_status
+                        WHEN 'healthy' THEN 1
+                        WHEN 'untested' THEN 2
+                        WHEN 'rate_limited' THEN 3
+                        ELSE 4
+                    END, 
+                    success_rate DESC, 
+                    avg_response_time ASC
+            """)
+                keys = cursor.fetchall()
+                return [{'id': k[0], 'key': k[1], 'health_status': k[2]} for k in keys]
         except Exception as e:
             logger.error(f"Failed to get available Gemini keys: {e}")
             return []
@@ -733,6 +742,21 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to toggle Gemini key {key_id} status: {e}")
             return False
+
+    def update_gemini_key_status(self, key_id: int, new_status: str):
+        """更新Gemini Key的健康状态"""
+        allowed_statuses = ['healthy', 'unhealthy', 'untested', 'rate_limited']
+        if new_status not in allowed_statuses:
+            raise ValueError(f"Invalid status: {new_status}")
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE gemini_keys 
+                SET health_status = ?, last_check_time = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            """, (new_status, key_id))
+            conn.commit()
 
     def get_gemini_key_by_id(self, key_id: int) -> Optional[Dict]:
         """根据ID获取Gemini Key"""
@@ -784,7 +808,7 @@ class Database:
                     if consecutive_failures >= failure_threshold:
                         health_status = 'unhealthy'
                     else:
-                        health_status = 'unknown'
+                        health_status = 'untested'
 
                 # 更新数据库
                 cursor.execute('''
