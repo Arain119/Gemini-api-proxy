@@ -606,14 +606,19 @@ async def collect_streaming_response(
                 
             chunk_str = chunk_bytes.decode('utf-8') if isinstance(chunk_bytes, bytes) else chunk_bytes
             
-            # 解析SSE数据
-            for line in chunk_str.split('\n'):
+            # 解析SSE数据 - 每行都可能包含多个数据包
+            lines = chunk_str.strip().split('\n')
+            for line in lines:
+                line = line.strip()
                 if line.startswith('data: '):
-                    data_part = line[6:]  # 移除 'data: ' 前缀
+                    data_part = line[6:].strip()  # 移除 'data: ' 前缀
                     
-                    if data_part.strip() == '[DONE]':
+                    if data_part == '[DONE]':
                         logger.info("Received [DONE] signal, finishing collection")
                         break
+                        
+                    if not data_part:  # 跳过空数据行
+                        continue
                         
                     try:
                         chunk_data = json.loads(data_part)
@@ -626,7 +631,8 @@ async def collect_streaming_response(
                             if choice_content:
                                 complete_content += choice_content
                                 # 简单的token计算（按单词分割）
-                                total_completion_tokens += len(choice_content.split())
+                                words = choice_content.split()
+                                total_completion_tokens += len(words)
                             
                             # 获取finish_reason
                             if choice.get('finish_reason'):
@@ -640,7 +646,7 @@ async def collect_streaming_response(
                             total_completion_tokens = usage['completion_tokens']
                             
                     except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse chunk JSON: {e}")
+                        logger.warning(f"Failed to parse chunk JSON: {data_part[:100]}... Error: {e}")
                         continue
     
     except Exception as e:
@@ -667,7 +673,7 @@ async def collect_streaming_response(
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": complete_content
+                "content": complete_content.strip()  # 去除多余的空白字符
             },
             "finish_reason": finish_reason
         }],
