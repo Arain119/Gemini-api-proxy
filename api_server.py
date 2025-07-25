@@ -583,6 +583,101 @@ async def log_usage_background(gemini_key_id: int, user_key_id: int, model_name:
         logger.error(f"Background usage logging failed: {e}")
 
 
+async def collect_streaming_response(
+        stream_generator,
+        request: ChatCompletionRequest
+) -> Dict:
+    """
+    统一的流式响应收集器
+    将流式响应收集并组装成完整的OpenAI格式响应
+    """
+    complete_content = ""
+    thinking_content = ""
+    total_completion_tokens = 0
+    total_prompt_tokens = 0
+    finish_reason = "stop"
+    
+    logger.info("Starting to collect streaming response chunks")
+    
+    try:
+        async for chunk_bytes in stream_generator:
+            if not chunk_bytes:
+                continue
+                
+            chunk_str = chunk_bytes.decode('utf-8') if isinstance(chunk_bytes, bytes) else chunk_bytes
+            
+            # 解析SSE数据
+            for line in chunk_str.split('\n'):
+                if line.startswith('data: '):
+                    data_part = line[6:]  # 移除 'data: ' 前缀
+                    
+                    if data_part.strip() == '[DONE]':
+                        logger.info("Received [DONE] signal, finishing collection")
+                        break
+                        
+                    try:
+                        chunk_data = json.loads(data_part)
+                        
+                        # 提取choices中的delta内容
+                        for choice in chunk_data.get('choices', []):
+                            delta = choice.get('delta', {})
+                            choice_content = delta.get('content', '')
+                            
+                            if choice_content:
+                                complete_content += choice_content
+                                # 简单的token计算（按单词分割）
+                                total_completion_tokens += len(choice_content.split())
+                            
+                            # 获取finish_reason
+                            if choice.get('finish_reason'):
+                                finish_reason = choice['finish_reason']
+                        
+                        # 从usage中获取token信息（如果有）
+                        usage = chunk_data.get('usage', {})
+                        if usage.get('prompt_tokens'):
+                            total_prompt_tokens = usage['prompt_tokens']
+                        if usage.get('completion_tokens'):
+                            total_completion_tokens = usage['completion_tokens']
+                            
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse chunk JSON: {e}")
+                        continue
+    
+    except Exception as e:
+        logger.error(f"Error collecting streaming response: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to collect streaming response: {str(e)}")
+    
+    # 计算最终的usage信息
+    if not total_prompt_tokens:
+        total_prompt_tokens = len(str(request.messages).split())
+    
+    usage_info = {
+        "prompt_tokens": total_prompt_tokens,
+        "completion_tokens": total_completion_tokens,
+        "total_tokens": total_prompt_tokens + total_completion_tokens
+    }
+    
+    # 构建最终的OpenAI格式响应
+    openai_response = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": request.model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": complete_content
+            },
+            "finish_reason": finish_reason
+        }],
+        "usage": usage_info
+    }
+    
+    logger.info(f"Successfully collected streaming response: {len(complete_content)} chars, {total_completion_tokens} tokens")
+    return openai_response
+
+
 async def make_gemini_request_single_attempt(
         gemini_key: str,
         key_id: int,
@@ -707,25 +802,27 @@ async def make_request_with_fast_failover(
                 else:
                     timeout_seconds = float(db.get_config('request_timeout', '60'))
                 
-                # 单次尝试，失败立即切换
-                response = await make_gemini_request_single_attempt(
+                # 使用流式API并收集完整响应
+                logger.info(f"Using streaming API for non-streaming request with key #{key_info['id']}")
+                
+                # 创建流式响应生成器
+                stream_generator = stream_gemini_response_single_attempt(
                     key_info['key'],
                     key_info['id'],
                     gemini_request,
-                    model_name,
-                    timeout=timeout_seconds
+                    openai_request,
+                    model_name
                 )
-
+                
+                # 收集流式响应为完整响应
+                response = await collect_streaming_response(stream_generator, openai_request)
+                
                 logger.info(f"✅ Request successful with key #{key_info['id']} on attempt {attempt + 1}")
 
-                # 计算token使用量
-                total_tokens = 0
-                for candidate in response.get("candidates", []):
-                    content = candidate.get("content", {})
-                    parts = content.get("parts", [])
-                    for part in parts:
-                        if "text" in part:
-                            total_tokens += len(part["text"].split())
+                # 从响应中获取token使用量
+                usage = response.get('usage', {})
+                total_tokens = usage.get('completion_tokens', 0)
+                prompt_tokens = usage.get('prompt_tokens', 0)
 
                 # 记录使用量
                 if user_key_info:
@@ -1422,7 +1519,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Gemini API Proxy",
     description="A high-performance proxy for Gemini API with OpenAI compatibility, optimized multimodal support, auto keep-alive, auto-cleanup and anti-automation detection",
-    version="1.3.1",
+    version="1.3.2",
     lifespan=lifespan
 )
 
@@ -1807,7 +1904,7 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
     return gemini_request
 
 
-def extract_thoughts_and_content(gemini_response: Dict) -> tuple[str, str]:
+def extract_thoughts_and_content(gemini_response: Dict, include_thoughts: bool = True) -> tuple[str, str]:
     """从Gemini响应中提取思考过程和最终内容"""
     thoughts = ""
     content = ""
@@ -1821,6 +1918,9 @@ def extract_thoughts_and_content(gemini_response: Dict) -> tuple[str, str]:
 
                 if is_thought:
                     thoughts += part["text"]
+                    # 当不包含思考内容时，将思考内容也加入到content中
+                    if not include_thoughts:
+                        content += part["text"]
                 else:
                     # 所有非思考内容都添加到 content
                     content += part["text"]
@@ -1831,7 +1931,8 @@ def gemini_to_openai(gemini_response: Dict, request: ChatCompletionRequest, usag
     """将Gemini响应转换为OpenAI格式"""
     choices = []
 
-    thoughts, content = extract_thoughts_and_content(gemini_response)
+    include_thoughts = request.thinking_config and request.thinking_config.include_thoughts
+    thoughts, content = extract_thoughts_and_content(gemini_response, include_thoughts)
 
     for i, candidate in enumerate(gemini_response.get("candidates", [])):
         message_content = content if content else ""
@@ -2093,24 +2194,27 @@ async def make_request_with_failover(
             logger.info(f"Attempt {attempt + 1}: Using key #{key_info['id']} for {model_name}")
 
             try:
-                response = await make_gemini_request_with_retry(
+                # 使用流式API并收集完整响应（传统故障转移）
+                logger.info(f"Using streaming API for non-streaming request with key #{key_info['id']} (traditional failover)")
+                
+                # 创建流式响应生成器
+                stream_generator = stream_gemini_response(
                     key_info['key'],
                     key_info['id'],
                     gemini_request,
-                    model_name,
-                    max_retries=2,
-                    timeout=timeout_seconds
+                    openai_request,
+                    key_info,
+                    model_name
                 )
+                
+                # 收集流式响应为完整响应
+                response = await collect_streaming_response(stream_generator, openai_request)
 
                 logger.info(f"✅ Request successful with key #{key_info['id']} on attempt {attempt + 1}")
 
-                total_tokens = 0
-                for candidate in response.get("candidates", []):
-                    content = candidate.get("content", {})
-                    parts = content.get("parts", [])
-                    for part in parts:
-                        if "text" in part:
-                            total_tokens += len(part["text"].split())
+                # 从响应中获取token使用量
+                usage = response.get('usage', {})
+                total_tokens = usage.get('completion_tokens', 0)
 
                 if user_key_info:
                     db.log_usage(
@@ -2501,7 +2605,8 @@ async def stream_gemini_response(
                                     gemini_key, key_id, gemini_request, model_name, 1, timeout=timeout
                                 )
 
-                                thoughts, content = extract_thoughts_and_content(fallback_response)
+                                include_thoughts_fallback = openai_request.thinking_config and openai_request.thinking_config.include_thoughts
+                                thoughts, content = extract_thoughts_and_content(fallback_response, include_thoughts_fallback)
 
                                 if thoughts and openai_request.thinking_config and openai_request.thinking_config.include_thoughts:
                                     full_content = f"**Thinking Process:**\n{thoughts}\n\n**Response:**\n{content}"
@@ -2599,7 +2704,7 @@ async def root():
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.3.1",
+        "version": "1.3.2",
         "features": ["Gemini 2.5 Multimodal", "OpenAI Compatible", "Smart Polling", "Auto Keep-Alive", "Auto-Cleanup",
                      "Anti-Automation Detection", "Fast Failover"],
         "keep_alive": keep_alive_enabled,
@@ -2624,7 +2729,7 @@ async def health_check():
         "environment": "render" if os.getenv('RENDER_EXTERNAL_URL') else "local",
         "uptime_seconds": int(uptime),
         "request_count": request_count,
-        "version": "1.3.1",
+        "version": "1.3.2",
         "multimodal_support": "Gemini 2.5 Optimized",
         "keep_alive_enabled": keep_alive_enabled,
         "auto_cleanup_enabled": db.get_auto_cleanup_config()['enabled'],
@@ -2658,7 +2763,7 @@ async def get_status():
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.3.1",
+        "version": "1.3.2",
         "render_url": os.getenv('RENDER_EXTERNAL_URL'),
         "python_version": sys.version,
         "models": db.get_supported_models(),
@@ -2713,7 +2818,7 @@ async def api_v1_info():
 
     return {
         "service": "Gemini API Proxy",
-        "version": "1.3.1",
+        "version": "1.3.2",
         "api_version": "v1",
         "compatibility": "OpenAI API v1",
         "description": "A high-performance proxy for Gemini API with OpenAI compatibility, optimized multimodal support, auto keep-alive, auto-cleanup, anti-automation detection, and fast failover",
@@ -3088,8 +3193,9 @@ async def chat_completions(
                     media_type="text/event-stream; charset=utf-8"
                 )
         else:
+            # 使用统一的流式架构（内部收集为完整响应）
             if await should_use_fast_failover():
-                gemini_response = await make_request_with_fast_failover(
+                openai_response = await make_request_with_fast_failover(
                     gemini_request,
                     request,
                     actual_model_name,
@@ -3098,7 +3204,7 @@ async def chat_completions(
                 )
             else:
                 # 回退到传统故障转移逻辑
-                gemini_response = await make_request_with_failover(
+                openai_response = await make_request_with_failover(
                     gemini_request,
                     request,
                     actual_model_name,
@@ -3106,21 +3212,7 @@ async def chat_completions(
                     max_key_attempts=max_attempts
                 )
 
-            total_tokens = 0
-            for candidate in gemini_response.get("candidates", []):
-                content = candidate.get("content", {})
-                parts = content.get("parts", [])
-                for part in parts:
-                    if "text" in part:
-                        total_tokens += len(part["text"].split())
-
-            usage_info = {
-                "prompt_tokens": len(str(request.messages).split()),
-                "completion_tokens": total_tokens,
-                "total_tokens": len(str(request.messages).split()) + total_tokens
-            }
-
-            openai_response = gemini_to_openai(gemini_response, request, usage_info)
+            # 直接返回已经转换好的OpenAI格式响应
             return JSONResponse(content=openai_response)
 
     except HTTPException:
@@ -3459,7 +3551,7 @@ async def test_anti_detection():
 
         return {
             "success": True,
-            "results": results,  # 修改字段名以匹配前端期望
+            "results": results,
             "total_symbols_available": len(anti_detection.safe_symbols)
         }
 
