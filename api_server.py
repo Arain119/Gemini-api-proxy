@@ -1277,14 +1277,15 @@ async def stream_with_fast_failover(
                     )
 
                 if attempt < max_key_attempts - 1:
-                    retry_msg = {
-                        'error': {
-                            'message': f'Key #{key_info["id"]} failed, trying next key...',
-                            'type': 'retry_info',
-                            'retry_attempt': attempt + 1
-                        }
-                    }
-                    yield f"data: {json.dumps(retry_msg, ensure_ascii=False)}\n\n".encode('utf-8')
+                    logger.info(f"Key #{key_info['id']} failed, trying next key...")
+                    # retry_msg = {
+                    #     'error': {
+                    #         'message': f'Key #{key_info["id"]} failed, trying next key...',
+                    #         'type': 'retry_info',
+                    #         'retry_attempt': attempt + 1
+                    #     }
+                    # }
+                    # yield f"data: {json.dumps(retry_msg, ensure_ascii=False)}\n\n".encode('utf-8')
                     continue
                 else:
                     break
