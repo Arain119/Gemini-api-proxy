@@ -1578,7 +1578,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Gemini API Proxy",
-    description="A high-performance proxy for Gemini API with OpenAI compatibility, optimized multimodal support, auto keep-alive, auto-cleanup and anti-automation detection",
+    description="",
     version="1.4",
     lifespan=lifespan
 )
@@ -2923,7 +2923,7 @@ async def api_v1_info():
         "version": "1.4",
         "api_version": "v1",
         "compatibility": "OpenAI API v1",
-        "description": "A high-performance proxy for Gemini API with OpenAI compatibility, optimized multimodal support, auto keep-alive, auto-cleanup, anti-automation detection, and fast failover",
+        "description": "A high-performance proxy for Gemini API with OpenAI compatibility.",
         "status": "operational",
         "base_url": base_url,
         "features": [
