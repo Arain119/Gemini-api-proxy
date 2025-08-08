@@ -2352,33 +2352,27 @@ elif page == "密钥管理":
                 healthy_count = len(
                     [k for k in gemini_keys if k.get('status') == 1 and k.get('health_status') == 'healthy'])
 
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.markdown(f'<div style="color: #374151; font-weight: 500;">共 {len(gemini_keys)} 个密钥</div>',
-                                unsafe_allow_html=True)
-                with col2:
-                    st.markdown(f'<div style="color: #374151; font-weight: 500;">激活 {active_count} 个</div>',
-                                unsafe_allow_html=True)
-                with col3:
-                    st.markdown(f'<div style="color: #059669; font-weight: 500;">正常 {healthy_count} 个</div>',
-                                unsafe_allow_html=True)
-
-                # 一键删除异常 Key 按钮（非 healthy 状态）
                 abnormal_keys = [k for k in gemini_keys if k.get('health_status') != 'healthy']
-                if abnormal_keys:
-                    if st.button(f"🗑️ 一键删除异常 Key（{len(abnormal_keys)}）", key="bulk_delete_abnormal", type="primary"):
-                        deleted = 0
-                        for k in abnormal_keys:
-                            if delete_key('gemini', k['id']):
-                                deleted += 1
-                        if deleted > 0:
-                            st.success(f"已删除 {deleted} 个异常 Key")
-                            # 清理已选择集合中被删ID
-                            if 'selected_gemini_keys' in st.session_state:
-                                st.session_state['selected_gemini_keys'] -= set([k['id'] for k in abnormal_keys])
-                            st.cache_data.clear()
-                            time.sleep(1)
-                            st.rerun()
+
+                col1, col2, col3, col4 = st.columns([1, 1, 2, 1])
+                with col1:
+                    st.markdown(f'<div style="color: #374151; font-weight: 500;">共 {len(gemini_keys)} 个密钥</div>', unsafe_allow_html=True)
+                with col2:
+                    st.markdown(f'<div style="color: #374151; font-weight: 500;">激活 {active_count} 个</div>', unsafe_allow_html=True)
+                with col3:
+                    if abnormal_keys:
+                        if st.button(f"🗑️ 一键删除异常 Key（{len(abnormal_keys)}）", key="bulk_delete_abnormal", type="primary"):
+                            deleted = 0
+                            for k in abnormal_keys:
+                                if delete_key('gemini', k['id']):
+                                    deleted += 1
+                            if deleted > 0:
+                                st.success(f"已删除 {deleted} 个异常 Key")
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.rerun()
+                with col4:
+                    st.markdown(f'<div style="color: #059669; font-weight: 500;">正常 {healthy_count} 个</div>', unsafe_allow_html=True)
 
                 valid_keys = []
                 invalid_count = 0
@@ -2399,10 +2393,7 @@ elif page == "密钥管理":
                 if invalid_count > 0:
                     st.warning(f"发现 {invalid_count} 个数据不完整的密钥，已跳过显示")
                 
-                # 初始化或获取已选择的Gemini密钥ID集合
-                if 'selected_gemini_keys' not in st.session_state:
-                    st.session_state['selected_gemini_keys'] = set()
-                selected_keys = st.session_state['selected_gemini_keys']
+
 
                 # 渲染有效的密钥
                 for key_info in valid_keys:
@@ -2410,17 +2401,10 @@ elif page == "密钥管理":
                         # 创建一个容器来包含整个密钥卡片
                         container = st.container()
                         with container:
-                            # 使用列布局来实现卡片内的元素（新增选择框列）
-                            col_sel, col1, col2, col3, col4, col5, col6 = st.columns([0.4, 0.5, 3.0, 0.9, 0.9, 0.8, 0.8])
+                            # 使用列布局来实现卡片内的元素（移除选择框列）
+                            col1, col2, col3, col4, col5, col6 = st.columns([0.6, 3.0, 0.9, 0.9, 0.8, 0.8])
                             
                             key_id = key_info.get('id')
-                            with col_sel:
-                                if key_id is not None:
-                                    checked = st.checkbox("", key=f"sel_g_{key_id}", value=(key_id in selected_keys))
-                                    if checked:
-                                        selected_keys.add(key_id)
-                                    else:
-                                        selected_keys.discard(key_id)
 
                             with col1:
                                 st.markdown(f'<div class="key-id">#{key_info.get("id", "N/A")}</div>',
@@ -2468,8 +2452,7 @@ elif page == "密钥管理":
                                     if st.button("删除", key=f"del_g_{key_id}", use_container_width=True):
                                         if delete_key('gemini', key_id):
                                             st.success("删除成功")
-                                            # 从选中集合中移除
-                                            st.session_state['selected_gemini_keys'].discard(key_id)
+
                                             st.cache_data.clear()
                                             time.sleep(1)
                                             st.rerun()
@@ -2478,20 +2461,7 @@ elif page == "密钥管理":
                         # 异常时显示错误信息而不是空白
                         st.error(f"渲染密钥 #{key_info.get('id', '?')} 时出错: {str(e)}")
 
-                # 批量删除按钮
-                if selected_keys:
-                    st.markdown("<hr style='margin:1rem 0;'>", unsafe_allow_html=True)
-                    if st.button(f"批量删除选中的 {len(selected_keys)} 个密钥", type="primary"):
-                        deleted = 0
-                        for k in list(selected_keys):
-                            if delete_key('gemini', k):
-                                deleted += 1
-                        st.session_state['selected_gemini_keys'].clear()
-                        if deleted > 0:
-                            st.success(f"已删除 {deleted} 个密钥")
-                            st.cache_data.clear()
-                            time.sleep(1)
-                            st.rerun()
+
                 
                 # 如果没有有效密钥
                 if not valid_keys:
