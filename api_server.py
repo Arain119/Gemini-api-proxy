@@ -1578,8 +1578,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Gemini API Proxy",
-    description="",
-    version="1.4",
+    description="A high-performance proxy for Gemini API with OpenAI compatibility, optimized multimodal support, auto keep-alive, auto-cleanup and anti-automation detection",
+    version="1.3.2",
     lifespan=lifespan
 )
 
@@ -2759,19 +2759,15 @@ async def stream_gemini_response(
 
 
 # API端点
-@app.get("/", summary="服务根端点", tags=["通用"])
+@app.get("/")
 async def root():
-    """
-    **服务根端点**
-
-    返回服务的基本信息、状态和功能列表。
-    可用于快速检查服务是否正在运行。
-    """
+    """根端点"""
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.4",
-        "features": ["Gemini 2.5 Multimodal"],
+        "version": "1.3.2",
+        "features": ["Gemini 2.5 Multimodal", "OpenAI Compatible", "Smart Polling", "Auto Keep-Alive", "Auto-Cleanup",
+                     "Anti-Automation Detection", "Fast Failover"],
         "keep_alive": keep_alive_enabled,
         "auto_cleanup": db.get_auto_cleanup_config()['enabled'],
         "anti_detection": db.get_config('anti_detection_enabled', 'true').lower() == 'true',
@@ -2781,19 +2777,9 @@ async def root():
     }
 
 
-@app.get("/health", summary="服务健康检查", tags=["通用"])
+@app.get("/health")
 async def health_check():
-    """
-    **服务健康检查**
-
-    提供详细的服务健康状况，包括：
-    - 运行状态
-    - 可用密钥数量
-    - 运行环境
-    - 运行时长
-    - 请求总数
-    - 各项高级功能（如保活、自动清理）的启用状态
-    """
+    """健康检查端点"""
     available_keys = len(db.get_available_gemini_keys())
     uptime = time.time() - start_time
 
@@ -2804,7 +2790,7 @@ async def health_check():
         "environment": "render" if os.getenv('RENDER_EXTERNAL_URL') else "local",
         "uptime_seconds": int(uptime),
         "request_count": request_count,
-        "version": "1.4",
+        "version": "1.3.2",
         "multimodal_support": "Gemini 2.5 Optimized",
         "keep_alive_enabled": keep_alive_enabled,
         "auto_cleanup_enabled": db.get_auto_cleanup_config()['enabled'],
@@ -2813,14 +2799,9 @@ async def health_check():
     }
 
 
-@app.get("/wake", summary="服务唤醒", tags=["通用"])
+@app.get("/wake")
 async def wake_up():
-    """
-    **服务唤醒**
-
-    用于在 Render 等平台从休眠状态唤醒服务。
-    定期调用此端点可以保持服务持续在线（保活）。
-    """
+    """快速唤醒端点"""
     return {
         "status": "awake",
         "timestamp": datetime.now().isoformat(),
@@ -2832,14 +2813,9 @@ async def wake_up():
     }
 
 
-@app.get("/status", summary="获取详细服务状态", tags=["通用"])
+@app.get("/status")
 async def get_status():
-    """
-    **获取详细服务状态**
-
-    返回包括资源使用情况（内存、CPU）、Python版本、支持的模型列表等在内的详细技术状态。
-    主要用于调试和监控。
-    """
+    """获取详细服务状态"""
     import psutil
     import sys
 
@@ -2848,7 +2824,7 @@ async def get_status():
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.4",
+        "version": "1.3.2",
         "render_url": os.getenv('RENDER_EXTERNAL_URL'),
         "python_version": sys.version,
         "models": db.get_supported_models(),
@@ -2867,17 +2843,9 @@ async def get_status():
     }
 
 
-@app.get("/metrics", summary="获取服务指标", tags=["通用"])
+@app.get("/metrics")
 async def get_metrics():
-    """
-    **获取服务指标**
-
-    提供可用于监控系统（如 Prometheus）的核心指标，包括：
-    - 内存和CPU使用率
-    - 活跃连接数
-    - 数据库大小
-    - 各项功能的启用状态
-    """
+    """获取服务指标"""
     import psutil
 
     process = psutil.Process(os.getpid())
@@ -2897,18 +2865,9 @@ async def get_metrics():
     }
 
 
-@app.get("/v1", summary="获取 v1 API 信息", tags=["通用"])
+@app.get("/v1")
 async def api_v1_info():
-    """
-    **获取 v1 API 信息**
-
-    返回关于 v1 API 的详细信息，包括：
-    - OpenAI 兼容性说明
-    - 功能列表
-    - 端点列表
-    - 支持的模型
-    - 多模态能力详情
-    """
+    """v1 API 信息端点"""
     available_keys = len(db.get_available_gemini_keys())
     supported_models = db.get_supported_models()
     thinking_config = db.get_thinking_config()
@@ -2920,10 +2879,10 @@ async def api_v1_info():
 
     return {
         "service": "Gemini API Proxy",
-        "version": "1.4",
+        "version": "1.3.2",
         "api_version": "v1",
         "compatibility": "OpenAI API v1",
-        "description": "A high-performance proxy for Gemini API with OpenAI compatibility.",
+        "description": "A high-performance proxy for Gemini API with OpenAI compatibility, optimized multimodal support, auto keep-alive, auto-cleanup, anti-automation detection, and fast failover",
         "status": "operational",
         "base_url": base_url,
         "features": [
@@ -2976,21 +2935,12 @@ async def api_v1_info():
 
 
 # 文件上传端点
-@app.post("/v1/files", summary="上传文件", tags=["用户 API"])
+@app.post("/v1/files")
 async def upload_file(
-        file: UploadFile = File(..., description="要上传的文件，最大100MB"),
-        authorization: str = Header(None, description="用户访问密钥，格式为 'Bearer sk-...'")
+        file: UploadFile = File(...),
+        authorization: str = Header(None)
 ):
-    """
-    **上传文件用于多模态对话**
-
-    此端点用于上传文件（图片、音频、视频、文档），以便在 `/v1/chat/completions` 中引用。
-
-    - **智能处理**:
-        - 小于20MB的文件将作为内联数据处理。
-        - 大于20MB的文件将自动上传到Gemini File API。
-    - **返回**: 返回一个文件对象，其中包含一个唯一的 `file_id`，可在对话中引用。
-    """
+    """上传文件用于多模态对话"""
     try:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -3085,14 +3035,9 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/files", summary="列出已上传的文件", tags=["用户 API"])
-async def list_files(authorization: str = Header(None, description="用户访问密钥，格式为 'Bearer sk-...'")):
-    """
-    **列出已上传的文件**
-
-    返回当前服务器上所有已上传文件的列表。
-    文件会在24小时后自动清理。
-    """
+@app.get("/v1/files")
+async def list_files(authorization: str = Header(None)):
+    """列出已上传的文件"""
     try:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -3126,16 +3071,9 @@ async def list_files(authorization: str = Header(None, description="用户访问
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/files/{file_id}", summary="获取文件信息", tags=["用户 API"])
-async def get_file(
-    file_id: str,
-    authorization: str = Header(None, description="用户访问密钥，格式为 'Bearer sk-...'")
-):
-    """
-    **获取文件信息**
-
-    根据文件ID获取指定文件的详细信息。
-    """
+@app.get("/v1/files/{file_id}")
+async def get_file(file_id: str, authorization: str = Header(None)):
+    """获取文件信息"""
     try:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -3166,17 +3104,9 @@ async def get_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/v1/files/{file_id}", summary="删除文件", tags=["用户 API"])
-async def delete_file(
-    file_id: str,
-    authorization: str = Header(None, description="用户访问密钥，格式为 'Bearer sk-...'")
-):
-    """
-    **删除文件**
-
-    从服务器删除指定的文件。
-    如果文件已上传到Gemini File API，也会尝试从Gemini侧删除。
-    """
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str, authorization: str = Header(None)):
+    """删除文件"""
     try:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -3218,21 +3148,11 @@ async def delete_file(
 
 
 # chat_completions端点
-@app.post("/v1/chat/completions", summary="创建聊天补全", tags=["用户 API"])
+@app.post("/v1/chat/completions")
 async def chat_completions(
         request: ChatCompletionRequest,
-        authorization: str = Header(None, description="用户访问密钥，格式为 'Bearer sk-...'")
+        authorization: str = Header(None)
 ):
-    """
-    **创建聊天补全**
-
-    这是核心的对话接口，与OpenAI的API完全兼容。
-    它支持：
-    - 文本对话
-    - 多模态对话（引用已上传的文件）
-    - 流式响应
-    - 高级功能如思考模式和提示词注入
-    """
     try:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Invalid authorization header")
@@ -3368,13 +3288,9 @@ async def chat_completions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/v1/models", summary="列出可用模型", tags=["用户 API"])
+@app.get("/v1/models")
 async def list_models():
-    """
-    **列出可用模型**
-
-    返回当前服务支持的所有模型列表，格式与OpenAI兼容。
-    """
+    """列出可用的模型"""
     models = db.get_supported_models()
 
     model_list = []
@@ -3390,16 +3306,9 @@ async def list_models():
 
 
 # 健康检测相关端点
-@app.post("/admin/health/check-all", summary="一键健康检测", tags=["管理 API：健康与状态"])
+@app.post("/admin/health/check-all")
 async def check_all_keys_health():
-    """
-    **一键健康检测**
-
-    对所有已激活的Gemini API Key执行一次健康检查。
-    - **操作**: 向每个Key发送一个测试请求。
-    - **结果**: 更新每个Key的健康状态、响应时间和成功率。
-    - **用途**: 在添加新Key或服务出现问题时，快速诊断所有Key的可用性。
-    """
+    """一键检测所有Gemini Keys的健康状态"""
     try:
         all_keys = db.get_all_gemini_keys()
         active_keys = [key for key in all_keys if key['status'] == 1]
@@ -3459,18 +3368,9 @@ async def check_all_keys_health():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/health/summary", summary="获取健康状态汇总", tags=["管理 API：健康与状态"])
+@app.get("/admin/health/summary")
 async def get_health_summary():
-    """
-    **获取健康状态汇总**
-
-    返回所有Gemini API Key的健康状态统计信息，包括：
-    - 总数
-    - 激活数
-    - 健康数
-    - 异常数
-    - 未知数
-    """
+    """获取健康状态汇总"""
     try:
         summary = db.get_keys_health_summary()
         return {
@@ -3483,16 +3383,9 @@ async def get_health_summary():
 
 
 # 自动清理管理端点
-@app.get("/admin/cleanup/status", summary="获取自动清理状态", tags=["管理 API：配置"])
+@app.get("/admin/cleanup/status")
 async def get_cleanup_status():
-    """
-    **获取自动清理状态**
-
-    返回自动清理功能的当前配置和状态，包括：
-    - 是否启用
-    - 清理阈值（连续异常天数）
-    - 处于风险状态（可能被清理）的密钥列表
-    """
+    """获取自动清理状态"""
     try:
         cleanup_config = db.get_auto_cleanup_config()
         at_risk_keys = db.get_at_risk_keys(cleanup_config['days_threshold'])
@@ -3511,16 +3404,9 @@ async def get_cleanup_status():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/cleanup/config", summary="更新自动清理配置", tags=["管理 API：配置"])
+@app.post("/admin/cleanup/config")
 async def update_cleanup_config(request: dict):
-    """
-    **更新自动清理配置**
-
-    允许管理员修改自动清理的参数。
-    - **enabled**: `true` 或 `false`
-    - **days_threshold**: 连续异常多少天后进行清理 (整数)
-    - **min_checks_per_day**: 每日最少需要被检测多少次才纳入统计 (整数)
-    """
+    """更新自动清理配置"""
     try:
         enabled = request.get('enabled')
         days_threshold = request.get('days_threshold')
@@ -3550,14 +3436,9 @@ async def update_cleanup_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/cleanup/manual", summary="手动执行清理", tags=["管理 API：配置"])
+@app.post("/admin/cleanup/manual")
 async def manual_cleanup():
-    """
-    **手动执行清理**
-
-    立即根据当前配置执行一次自动清理任务。
-    主要用于测试或紧急处理。
-    """
+    """手动执行清理任务"""
     try:
         await auto_cleanup_failed_keys()
         return {
@@ -3570,16 +3451,9 @@ async def manual_cleanup():
 
 
 # 故障转移配置管理端点
-@app.get("/admin/config/failover", summary="获取故障转移配置", tags=["管理 API：配置"])
+@app.get("/admin/config/failover")
 async def get_failover_config():
-    """
-    **获取故障转移配置**
-
-    返回故障转移功能的当前配置，包括：
-    - 是否启用快速故障转移
-    - 后台健康检测设置
-    - 当前可用和健康的密钥统计
-    """
+    """获取故障转移配置"""
     try:
         config = db.get_failover_config()
 
@@ -3601,13 +3475,9 @@ async def get_failover_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/config/failover", summary="更新故障转移配置", tags=["管理 API：配置"])
+@app.post("/admin/config/failover")
 async def update_failover_config(request: dict):
-    """
-    **更新故障转移配置**
-
-    允许管理员修改故障转移策略的参数。
-    """
+    """更新故障转移配置"""
     try:
         fast_failover_enabled = request.get('fast_failover_enabled')
 
@@ -3637,15 +3507,9 @@ async def update_failover_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/failover/stats", summary="获取故障转移统计", tags=["管理 API：健康与状态"])
+@app.get("/admin/failover/stats")
 async def get_failover_stats():
-    """
-    **获取故障转移统计信息**
-
-    返回与故障转移相关的统计数据和建议，例如：
-    - 密钥健康状态汇总
-    - 基于当前状态的配置建议
-    """
+    """获取故障转移统计信息"""
     try:
         # 获取Key健康状态统计
         health_summary = db.get_keys_health_summary()
@@ -3667,16 +3531,9 @@ async def get_failover_stats():
 
 
 # 防检测管理端点
-@app.post("/admin/config/anti-detection", summary="更新防检测配置", tags=["管理 API：配置"])
+@app.post("/admin/config/anti-detection")
 async def update_anti_detection_config(request: dict):
-    """
-    **更新防检测配置**
-
-    修改防自动化检测功能的参数。
-    - **enabled**: `true` 或 `false`
-    - **disable_for_tools**: 在工具调用时是否禁用
-    - **token_threshold**: 触发防检测的最小Token阈值
-    """
+    """更新防检测配置"""
     try:
         enabled = request.get('enabled')
         disable_for_tools = request.get('disable_for_tools')
@@ -3718,13 +3575,9 @@ async def update_anti_detection_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/config/anti-detection", summary="获取防检测配置", tags=["管理 API：配置"])
+@app.get("/admin/config/anti-detection")
 async def get_anti_detection_config():
-    """
-    **获取防检测配置**
-
-    返回防自动化检测功能的当前配置和统计信息。
-    """
+    """获取防检测配置"""
     try:
         enabled = db.get_config('anti_detection_enabled', 'true').lower() == 'true'
         disable_for_tools = db.get_config('anti_detection_disable_for_tools', 'true').lower() == 'true'
@@ -3742,14 +3595,9 @@ async def get_anti_detection_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/test/anti-detection", summary="测试防检测功能", tags=["管理 API：配置"])
+@app.post("/admin/test/anti-detection")
 async def test_anti_detection():
-    """
-    **测试防检测功能**
-
-    对示例文本执行一次防检测注入处理，并返回结果。
-    用于验证注入功能是否正常工作。
-    """
+    """测试防检测功能"""
     try:
         test_texts = [
             "请帮我分析这个问题",
@@ -3779,13 +3627,9 @@ async def test_anti_detection():
 
 
 # 保活管理端点
-@app.post("/admin/keep-alive/toggle", summary="切换保活状态", tags=["管理 API：配置"])
+@app.post("/admin/keep-alive/toggle")
 async def toggle_keep_alive():
-    """
-    **切换保活状态**
-
-    启用或禁用服务的自动保活功能。
-    """
+    """切换保活状态"""
     global scheduler, keep_alive_enabled
 
     try:
@@ -3866,13 +3710,9 @@ async def toggle_keep_alive():
         }
 
 
-@app.get("/admin/keep-alive/status", summary="获取保活状态", tags=["管理 API：配置"])
+@app.get("/admin/keep-alive/status")
 async def get_keep_alive_status():
-    """
-    **获取保活状态**
-
-    返回保活功能的当前状态，包括是否启用、下次ping时间等。
-    """
+    """获取保活状态"""
     global keep_alive_enabled
 
     next_run = None
@@ -3893,13 +3733,9 @@ async def get_keep_alive_status():
     }
 
 
-@app.post("/admin/keep-alive/ping", summary="手动执行保活ping", tags=["管理 API：配置"])
+@app.post("/admin/keep-alive/ping")
 async def manual_keep_alive_ping():
-    """
-    **手动执行保活ping**
-
-    立即执行一次保活ping操作。
-    """
+    """手动执行保活ping"""
     try:
         await keep_alive_ping()
         return {
@@ -3917,13 +3753,9 @@ async def manual_keep_alive_ping():
 
 
 # 密钥管理端点
-@app.get("/admin/keys/gemini", summary="获取所有Gemini密钥", tags=["管理 API：密钥管理"])
+@app.get("/admin/keys/gemini")
 async def get_gemini_keys():
-    """
-    **获取所有Gemini密钥**
-
-    返回数据库中存储的所有Gemini API Key的详细列表，包括其状态和性能指标。
-    """
+    """获取所有Gemini密钥列表"""
     try:
         keys = db.get_all_gemini_keys()
         return {
@@ -3935,13 +3767,9 @@ async def get_gemini_keys():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/keys/user", summary="获取所有用户密钥", tags=["管理 API：密钥管理"])
+@app.get("/admin/keys/user")
 async def get_user_keys():
-    """
-    **获取所有用户密钥**
-
-    返回数据库中存储的所有用户访问密钥的列表。
-    """
+    """获取所有用户密钥列表"""
     try:
         keys = db.get_all_user_keys()
         return {
@@ -3953,13 +3781,9 @@ async def get_user_keys():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/admin/keys/gemini/{key_id}", summary="删除Gemini密钥", tags=["管理 API：密钥管理"])
+@app.delete("/admin/keys/gemini/{key_id}")
 async def delete_gemini_key(key_id: int):
-    """
-    **删除指定的Gemini密钥**
-
-    根据ID从数据库中永久删除一个Gemini API Key。
-    """
+    """删除指定的Gemini密钥"""
     try:
         success = db.delete_gemini_key(key_id)
         if success:
@@ -3977,13 +3801,9 @@ async def delete_gemini_key(key_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/admin/keys/user/{key_id}", summary="删除用户密钥", tags=["管理 API：密钥管理"])
+@app.delete("/admin/keys/user/{key_id}")
 async def delete_user_key(key_id: int):
-    """
-    **删除指定的用户密钥**
-
-    根据ID从数据库中永久删除一个用户访问密钥。
-    """
+    """删除指定的用户密钥"""
     try:
         success = db.delete_user_key(key_id)
         if success:
@@ -4001,14 +3821,9 @@ async def delete_user_key(key_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/keys/gemini/{key_id}/toggle", summary="切换Gemini密钥状态", tags=["管理 API：密钥管理"])
+@app.post("/admin/keys/gemini/{key_id}/toggle")
 async def toggle_gemini_key_status(key_id: int):
-    """
-    **切换Gemini密钥状态**
-
-    切换指定Gemini API Key的激活/禁用状态。
-    禁用的密钥将不会被用于处理请求。
-    """
+    """切换Gemini密钥状态"""
     try:
         success = db.toggle_gemini_key_status(key_id)
         if success:
@@ -4026,13 +3841,9 @@ async def toggle_gemini_key_status(key_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/keys/user/{key_id}/toggle", summary="切换用户密钥状态", tags=["管理 API：密钥管理"])
+@app.post("/admin/keys/user/{key_id}/toggle")
 async def toggle_user_key_status(key_id: int):
-    """
-    **切换用户密钥状态**
-
-    切换指定用户访问密钥的激活/禁用状态。
-    """
+    """切换用户密钥状态"""
     try:
         success = db.toggle_user_key_status(key_id)
         if success:
@@ -4051,13 +3862,9 @@ async def toggle_user_key_status(key_id: int):
 
 
 # 管理端点
-@app.get("/admin/models/{model_name}", summary="获取模型配置", tags=["管理 API：模型配置"])
+@app.get("/admin/models/{model_name}")
 async def get_model_config(model_name: str):
-    """
-    **获取指定模型的配置**
-
-    返回指定模型的速率限制（RPM, RPD, TPM）和状态。
-    """
+    """获取指定模型的配置"""
     try:
         model_config = db.get_model_config(model_name)
         if not model_config:
@@ -4073,13 +3880,9 @@ async def get_model_config(model_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/models/{model_name}", summary="更新模型配置", tags=["管理 API：模型配置"])
+@app.post("/admin/models/{model_name}")
 async def update_model_config(model_name: str, request: dict):
-    """
-    **更新指定模型的配置**
-
-    修改指定模型的速率限制和状态。
-    """
+    """更新指定模型的配置"""
     try:
         if model_name not in db.get_supported_models():
             raise HTTPException(status_code=404, detail=f"Model {model_name} not supported")
@@ -4113,13 +3916,9 @@ async def update_model_config(model_name: str, request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/models", summary="列出所有模型配置", tags=["管理 API：模型配置"])
+@app.get("/admin/models")
 async def list_model_configs():
-    """
-    **获取所有模型的配置**
-
-    返回所有支持的模型的配置列表。
-    """
+    """获取所有模型的配置"""
     try:
         model_configs = db.get_all_model_configs()
         return {
@@ -4131,14 +3930,9 @@ async def list_model_configs():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/config/gemini-key", summary="添加Gemini密钥", tags=["管理 API：密钥管理"])
+@app.post("/admin/config/gemini-key")
 async def add_gemini_key(request: dict):
-    """
-    **添加Gemini密钥**
-
-    向数据库中添加一个新的或多个Gemini API Key。
-    支持通过逗号、分号、换行符等分隔符进行批量添加。
-    """
+    """通过API添加Gemini密钥，支持批量添加"""
     input_keys = request.get("key", "").strip()
 
     if not input_keys:
@@ -4229,30 +4023,18 @@ async def add_gemini_key(request: dict):
     return results
 
 
-@app.post("/admin/config/user-key", summary="生成用户密钥", tags=["管理 API：密钥管理"])
+@app.post("/admin/config/user-key")
 async def generate_user_key(request: dict):
-    """
-    **生成用户密钥**
-
-    创建一个新的用户访问密钥 (sk-...)，用于API调用认证。
-    可以为密钥指定一个名称以方便识别。
-    """
+    """生成用户密钥"""
     name = request.get("name", "API User")
     key = db.generate_user_key(name)
     logger.info(f"Generated new user key for: {name}")
     return {"success": True, "key": key, "name": name}
 
 
-@app.post("/admin/config/thinking", summary="更新思考模式配置", tags=["管理 API：配置"])
+@app.post("/admin/config/thinking")
 async def update_thinking_config(request: dict):
-    """
-    **更新思考模式配置**
-
-    修改思考模式的参数。
-    - **enabled**: `true` 或 `false`
-    - **budget**: 思考预算 (-1=自动, 0=禁用, >0=具体值)
-    - **include_thoughts**: 是否在响应中包含思考过程
-    """
+    """更新思考模式配置"""
     try:
         enabled = request.get('enabled')
         budget = request.get('budget')
@@ -4280,16 +4062,9 @@ async def update_thinking_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/config/inject-prompt", summary="更新提示词注入配置", tags=["管理 API：配置"])
+@app.post("/admin/config/inject-prompt")
 async def update_inject_prompt_config(request: dict):
-    """
-    **更新提示词注入配置**
-
-    修改自动提示词注入的参数。
-    - **enabled**: `true` 或 `false`
-    - **content**: 要注入的提示词内容
-    - **position**: 注入位置 ('system', 'user_prefix', 'user_suffix')
-    """
+    """更新提示词注入配置"""
     try:
         enabled = request.get('enabled')
         content = request.get('content')
@@ -4317,14 +4092,9 @@ async def update_inject_prompt_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/config/stream-mode", summary="更新流式模式配置", tags=["管理 API：配置"])
+@app.post("/admin/config/stream-mode")
 async def update_stream_mode_config(request: dict):
-    """
-    **更新流式模式配置**
-
-    修改API响应的全局流式行为。
-    - **mode**: 'auto', 'stream', 'non_stream'
-    """
+    """更新流式模式配置"""
     try:
         mode = request.get('mode')
 
@@ -4346,44 +4116,9 @@ async def update_stream_mode_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/config/load-balance", summary="更新负载均衡策略", tags=["管理 API：配置"])
-async def update_load_balance_config(request: dict):
-    """
-    **更新负载均衡策略**
-
-    修改选择Gemini API Key时使用的负载均衡算法。
-    - **load_balance_strategy**: 'adaptive', 'least_used', 'round_robin'
-    """
-    try:
-        strategy = request.get('load_balance_strategy')
-        if strategy not in ['adaptive', 'least_used', 'round_robin']:
-            raise ValueError("Invalid load balance strategy")
-
-        success = db.set_config('load_balance_strategy', strategy)
-
-        if success:
-            logger.info(f"Updated load balance strategy: {strategy}")
-            return {
-                "success": True,
-                "message": "Load balance strategy updated successfully"
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to update load balance strategy")
-
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        logger.error(f"Failed to update load balance strategy: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/admin/config", summary="获取所有系统配置", tags=["管理 API：配置"])
+@app.get("/admin/config")
 async def get_all_config():
-    """
-    **获取所有系统配置**
-
-    返回一个包含所有可配置项的JSON对象，包括系统、思考、注入、清理、防检测、流式和故障转移等配置。
-    """
+    """获取所有系统配置"""
     try:
         configs = db.get_all_configs()
         thinking_config = db.get_thinking_config()
@@ -4414,13 +4149,9 @@ async def get_all_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/stats", summary="获取管理统计", tags=["管理 API：健康与状态"])
+@app.get("/admin/stats")
 async def get_admin_stats():
-    """
-    **获取管理统计**
-
-    返回一个全面的服务统计信息汇总，用于管理仪表盘。
-    """
+    """获取管理统计"""
     health_summary = db.get_keys_health_summary()
 
     return {

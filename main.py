@@ -2039,7 +2039,7 @@ with st.sidebar:
     <div class="sidebar-footer">
         <div class="sidebar-footer-content">
             <div class="sidebar-footer-item">
-                <span>版本 v1.4</span>
+                <span>版本 v1.3.2</span>
             </div>
             <div class="sidebar-footer-item">
                 <a href="{API_BASE_URL}/docs" target="_blank" class="sidebar-footer-link">API 文档</a>
@@ -2648,7 +2648,7 @@ elif page == "系统设置":
 
     # 包含故障转移配置的标签页
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "思考模式", "提示词注入", "流式模式", "负载均衡", "故障转移", "自动清理", "防检测", "系统信息"
+        "思考模式", "提示词注入", "流式模式", "负载均衡", "故障转移", "自动清理", "系统信息", "防检测"
     ])
 
     with tab1:
@@ -2994,7 +2994,7 @@ elif page == "系统设置":
             st.markdown(f"**{strategy_options[strategy]}**: {strategy_descriptions[strategy]}")
 
             if st.form_submit_button("保存策略", type="primary", use_container_width=True):
-                result = call_api('/admin/config/load-balance', 'POST', {
+                result = call_api('/admin/config', 'POST', {
                     'load_balance_strategy': strategy
                 })
                 if result and result.get('success'):
@@ -3408,6 +3408,122 @@ elif page == "系统设置":
                 """)
 
     with tab7:
+        st.markdown("#### 系统信息")
+        st.markdown("查看系统运行状态和资源使用情况")
+
+        # 系统概览
+        python_version = status_data.get('python_version', 'Unknown').split()[0]
+        version = status_data.get('version', '1.3.2')
+        uptime_hours = status_data.get('uptime_seconds', 0) // 3600
+
+        st.markdown(f'''
+        <div style="background: linear-gradient(135deg, rgba(107, 114, 128, 0.1) 0%, rgba(75, 85, 99, 0.1) 100%); 
+                    border: 1px solid rgba(107, 114, 128, 0.2); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h5 style="margin: 0; color: #374151; font-size: 1.1rem;">系统状态</h5>
+                    <p style="margin: 0.5rem 0 0 0; color: #6b7280; font-size: 0.9rem;">
+                        版本: {version} | Python: {python_version} | 运行时间: {uptime_hours} 小时
+                    </p>
+                </div>
+                <div style="background: #10b981; color: white; padding: 0.5rem 1rem; border-radius: 8px; font-weight: 500;">
+                    运行中
+                </div>
+            </div>
+        </div>
+        ''', unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("##### 服务信息")
+
+            # 服务信息表格
+            service_info = {
+                "Python版本": python_version,
+                "系统版本": version,
+                "运行时间": f"{uptime_hours} 小时",
+                "支持模型": len(status_data.get('models', [])),
+                "API端点": f"{API_BASE_URL}"
+            }
+
+            for key, value in service_info.items():
+                st.markdown(f"**{key}**: {value}")
+
+        with col2:
+            st.markdown("##### 资源使用")
+
+            # 资源使用指标
+            memory_mb = status_data.get('memory_usage_mb', 0)
+            cpu_percent = status_data.get('cpu_percent', 0)
+
+            # 内存使用
+            st.metric(
+                "内存使用",
+                f"{memory_mb:.1f} MB",
+                delta=f"{memory_mb / 1024:.1f} GB" if memory_mb > 1024 else None
+            )
+
+            # CPU使用
+            st.metric(
+                "CPU使用率",
+                f"{cpu_percent:.1f}%",
+                delta="正常" if cpu_percent < 80 else "偏高",
+                delta_color="normal" if cpu_percent < 80 else "inverse"
+            )
+
+        # 支持的模型列表
+        st.markdown("##### 支持的模型")
+        models = status_data.get('models', [])
+        if models:
+            # 创建模型网格布局
+            cols = st.columns(3)
+            for i, model in enumerate(models):
+                with cols[i % 3]:
+                    st.markdown(f'''
+                    <div style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.2); 
+                                border-radius: 8px; padding: 0.75rem; margin-bottom: 0.5rem; text-align: center;">
+                        <div style="font-weight: 500; color: #1e40af;">{model}</div>
+                    </div>
+                    ''', unsafe_allow_html=True)
+        else:
+            st.info("暂无支持的模型信息")
+
+        # 健康检查链接
+        st.markdown("##### 快速链接")
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.markdown(f'''
+            <a href="{API_BASE_URL}/health" target="_blank" style="display: block; text-decoration: none;">
+                <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); 
+                            border-radius: 8px; padding: 1rem; text-align: center; color: #065f46; font-weight: 500;">
+                    健康检查
+                </div>
+            </a>
+            ''', unsafe_allow_html=True)
+
+        with col2:
+            st.markdown(f'''
+            <a href="{API_BASE_URL}/docs" target="_blank" style="display: block; text-decoration: none;">
+                <div style="background: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.2); 
+                            border-radius: 8px; padding: 1rem; text-align: center; color: #4338ca; font-weight: 500;">
+                    API文档
+                </div>
+            </a>
+            ''', unsafe_allow_html=True)
+
+        with col3:
+            st.markdown(f'''
+            <a href="{API_BASE_URL}/status" target="_blank" style="display: block; text-decoration: none;">
+                <div style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.2); 
+                            border-radius: 8px; padding: 1rem; text-align: center; color: #6d28d9; font-weight: 500;">
+                    系统状态
+                </div>
+            </a>
+            ''', unsafe_allow_html=True)
+
+    with tab8:
         st.markdown("#### 防检测配置")
         st.markdown("管理自动化检测防护功能")
 
@@ -3530,129 +3646,13 @@ elif page == "系统设置":
         else:
             st.error("无法获取防检测配置数据")
 
-    with tab8:
-        st.markdown("#### 系统信息")
-        st.markdown("查看系统运行状态和资源使用情况")
-
-        # 系统概览
-        python_version = status_data.get('python_version', 'Unknown').split()[0]
-        version = status_data.get('version', '1.4')
-        uptime_hours = status_data.get('uptime_seconds', 0) // 3600
-
-        st.markdown(f'''
-        <div style="background: linear-gradient(135deg, rgba(107, 114, 128, 0.1) 0%, rgba(75, 85, 99, 0.1) 100%); 
-                    border: 1px solid rgba(107, 114, 128, 0.2); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <div>
-                    <h5 style="margin: 0; color: #374151; font-size: 1.1rem;">系统状态</h5>
-                    <p style="margin: 0.5rem 0 0 0; color: #6b7280; font-size: 0.9rem;">
-                        版本: {version} | Python: {python_version} | 运行时间: {uptime_hours} 小时
-                    </p>
-                </div>
-                <div style="background: #10b981; color: white; padding: 0.5rem 1rem; border-radius: 8px; font-weight: 500;">
-                    运行中
-                </div>
-            </div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("##### 服务信息")
-
-            # 服务信息表格
-            service_info = {
-                "Python版本": python_version,
-                "系统版本": version,
-                "运行时间": f"{uptime_hours} 小时",
-                "支持模型": len(status_data.get('models', [])),
-                "API端点": f"{API_BASE_URL}"
-            }
-
-            for key, value in service_info.items():
-                st.markdown(f"**{key}**: {value}")
-
-        with col2:
-            st.markdown("##### 资源使用")
-
-            # 资源使用指标
-            memory_mb = status_data.get('memory_usage_mb', 0)
-            cpu_percent = status_data.get('cpu_percent', 0)
-
-            # 内存使用
-            st.metric(
-                "内存使用",
-                f"{memory_mb:.1f} MB",
-                delta=f"{memory_mb / 1024:.1f} GB" if memory_mb > 1024 else None
-            )
-
-            # CPU使用
-            st.metric(
-                "CPU使用率",
-                f"{cpu_percent:.1f}%",
-                delta="正常" if cpu_percent < 80 else "偏高",
-                delta_color="normal" if cpu_percent < 80 else "inverse"
-            )
-
-        # 支持的模型列表
-        st.markdown("##### 支持的模型")
-        models = status_data.get('models', [])
-        if models:
-            # 创建模型网格布局
-            cols = st.columns(3)
-            for i, model in enumerate(models):
-                with cols[i % 3]:
-                    st.markdown(f'''
-                    <div style="background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.2); 
-                                border-radius: 8px; padding: 0.75rem; margin-bottom: 0.5rem; text-align: center;">
-                        <div style="font-weight: 500; color: #1e40af;">{model}</div>
-                    </div>
-                    ''', unsafe_allow_html=True)
-        else:
-            st.info("暂无支持的模型信息")
-
-        # 健康检查链接
-        st.markdown("##### 快速链接")
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.markdown(f'''
-            <a href="{API_BASE_URL}/health" target="_blank" style="display: block; text-decoration: none;">
-                <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); 
-                            border-radius: 8px; padding: 1rem; text-align: center; color: #065f46; font-weight: 500;">
-                    健康检查
-                </div>
-            </a>
-            ''', unsafe_allow_html=True)
-
-        with col2:
-            st.markdown(f'''
-            <a href="{API_BASE_URL}/docs" target="_blank" style="display: block; text-decoration: none;">
-                <div style="background: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.2); 
-                            border-radius: 8px; padding: 1rem; text-align: center; color: #4338ca; font-weight: 500;">
-                    API文档
-                </div>
-            </a>
-            ''', unsafe_allow_html=True)
-
-        with col3:
-            st.markdown(f'''
-            <a href="{API_BASE_URL}/status" target="_blank" style="display: block; text-decoration: none;">
-                <div style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.2); 
-                            border-radius: 8px; padding: 1rem; text-align: center; color: #6d28d9; font-weight: 500;">
-                    系统状态
-                </div>
-            </a>
-            ''', unsafe_allow_html=True)
-
 # --- 页脚 ---
 st.markdown(
     f"""
     <div style='text-align: center; color: rgba(255, 255, 255, 0.7); font-size: 0.8125rem; margin-top: 4rem; padding: 2rem 0; border-top: 1px solid rgba(255, 255, 255, 0.15); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); background: rgba(255, 255, 255, 0.05); border-radius: 16px 16px 0 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);'>
         <a href='{API_BASE_URL}/health' target='_blank' style='color: rgba(255, 255, 255, 0.8); text-decoration: none; transition: all 0.3s ease; padding: 0.25rem 0.5rem; border-radius: 6px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);' onmouseover='this.style.color="white"; this.style.background="rgba(255, 255, 255, 0.1)"; this.style.textShadow="0 0 8px rgba(255, 255, 255, 0.5)";' onmouseout='this.style.color="rgba(255, 255, 255, 0.8)"; this.style.background="transparent"; this.style.textShadow="none";'>健康检查</a> · 
         <span style='color: rgba(255, 255, 255, 0.6);'>{API_BASE_URL}</span> ·
-        <span style='color: rgba(255, 255, 255, 0.6);'>v1.4</span>
+        <span style='color: rgba(255, 255, 255, 0.6);'>v1.3.2</span>
     </div>
     """,
     unsafe_allow_html=True
