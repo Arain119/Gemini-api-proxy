@@ -1615,7 +1615,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Gemini API Proxy",
     description="",
-    version="1.4",
+    version="1.5",
     lifespan=lifespan
 )
 
@@ -2806,7 +2806,7 @@ async def root():
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.4",
+        "version": "1.5",
         "features": ["Gemini 2.5 Multimodal"],
         "keep_alive": keep_alive_enabled,
         "auto_cleanup": db.get_auto_cleanup_config()['enabled'],
@@ -2840,7 +2840,7 @@ async def health_check():
         "environment": "render" if os.getenv('RENDER_EXTERNAL_URL') else "local",
         "uptime_seconds": int(uptime),
         "request_count": request_count,
-        "version": "1.4",
+        "version": "1.5",
         "multimodal_support": "Gemini 2.5 Optimized",
         "keep_alive_enabled": keep_alive_enabled,
         "auto_cleanup_enabled": db.get_auto_cleanup_config()['enabled'],
@@ -2884,7 +2884,7 @@ async def get_status():
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.4",
+        "version": "1.5",
         "render_url": os.getenv('RENDER_EXTERNAL_URL'),
         "python_version": sys.version,
         "models": db.get_supported_models(),
@@ -2956,7 +2956,7 @@ async def api_v1_info():
 
     return {
         "service": "Gemini API Proxy",
-        "version": "1.4",
+        "version": "1.5",
         "api_version": "v1",
         "compatibility": "OpenAI API v1",
         "description": "A high-performance proxy for Gemini API with OpenAI compatibility.",

@@ -898,7 +898,7 @@ st.markdown("""
         box-shadow: 
             0 4px 16px rgba(0, 0, 0, 0.06),
             inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
-        -webkit-tap-highlight-color: transparent !important; /* 移除iOS点击高亮 */
+        -webkit-tap-highlight-color: transparent !important; 
     }
 
     /* 移动端导航项调整 */
@@ -2039,7 +2039,7 @@ with st.sidebar:
     <div class="sidebar-footer">
         <div class="sidebar-footer-content">
             <div class="sidebar-footer-item">
-                <span>版本 v1.4</span>
+                <span>版本 v1.5</span>
             </div>
             <div class="sidebar-footer-item">
                 <a href="{API_BASE_URL}/docs" target="_blank" class="sidebar-footer-link">API 文档</a>
@@ -2363,6 +2363,23 @@ elif page == "密钥管理":
                     st.markdown(f'<div style="color: #059669; font-weight: 500;">正常 {healthy_count} 个</div>',
                                 unsafe_allow_html=True)
 
+                # 一键删除异常 Key 按钮（非 healthy 状态）
+                abnormal_keys = [k for k in gemini_keys if k.get('health_status') != 'healthy']
+                if abnormal_keys:
+                    if st.button(f"🗑️ 一键删除异常 Key（{len(abnormal_keys)}）", key="bulk_delete_abnormal", type="primary"):
+                        deleted = 0
+                        for k in abnormal_keys:
+                            if delete_key('gemini', k['id']):
+                                deleted += 1
+                        if deleted > 0:
+                            st.success(f"已删除 {deleted} 个异常 Key")
+                            # 清理已选择集合中被删ID
+                            if 'selected_gemini_keys' in st.session_state:
+                                st.session_state['selected_gemini_keys'] -= set([k['id'] for k in abnormal_keys])
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+
                 valid_keys = []
                 invalid_count = 0
 
@@ -2381,6 +2398,11 @@ elif page == "密钥管理":
                 # 如果有无效数据，给出提示
                 if invalid_count > 0:
                     st.warning(f"发现 {invalid_count} 个数据不完整的密钥，已跳过显示")
+                
+                # 初始化或获取已选择的Gemini密钥ID集合
+                if 'selected_gemini_keys' not in st.session_state:
+                    st.session_state['selected_gemini_keys'] = set()
+                selected_keys = st.session_state['selected_gemini_keys']
 
                 # 渲染有效的密钥
                 for key_info in valid_keys:
@@ -2388,8 +2410,17 @@ elif page == "密钥管理":
                         # 创建一个容器来包含整个密钥卡片
                         container = st.container()
                         with container:
-                            # 使用列布局来实现卡片内的元素
-                            col1, col2, col3, col4, col5, col6 = st.columns([0.5, 3.5, 0.9, 0.9, 0.8, 0.8])
+                            # 使用列布局来实现卡片内的元素（新增选择框列）
+                            col_sel, col1, col2, col3, col4, col5, col6 = st.columns([0.4, 0.5, 3.0, 0.9, 0.9, 0.8, 0.8])
+                            
+                            key_id = key_info.get('id')
+                            with col_sel:
+                                if key_id is not None:
+                                    checked = st.checkbox("", key=f"sel_g_{key_id}", value=(key_id in selected_keys))
+                                    if checked:
+                                        selected_keys.add(key_id)
+                                    else:
+                                        selected_keys.discard(key_id)
 
                             with col1:
                                 st.markdown(f'<div class="key-id">#{key_info.get("id", "N/A")}</div>',
@@ -2437,6 +2468,8 @@ elif page == "密钥管理":
                                     if st.button("删除", key=f"del_g_{key_id}", use_container_width=True):
                                         if delete_key('gemini', key_id):
                                             st.success("删除成功")
+                                            # 从选中集合中移除
+                                            st.session_state['selected_gemini_keys'].discard(key_id)
                                             st.cache_data.clear()
                                             time.sleep(1)
                                             st.rerun()
@@ -2445,6 +2478,21 @@ elif page == "密钥管理":
                         # 异常时显示错误信息而不是空白
                         st.error(f"渲染密钥 #{key_info.get('id', '?')} 时出错: {str(e)}")
 
+                # 批量删除按钮
+                if selected_keys:
+                    st.markdown("<hr style='margin:1rem 0;'>", unsafe_allow_html=True)
+                    if st.button(f"批量删除选中的 {len(selected_keys)} 个密钥", type="primary"):
+                        deleted = 0
+                        for k in list(selected_keys):
+                            if delete_key('gemini', k):
+                                deleted += 1
+                        st.session_state['selected_gemini_keys'].clear()
+                        if deleted > 0:
+                            st.success(f"已删除 {deleted} 个密钥")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+                
                 # 如果没有有效密钥
                 if not valid_keys:
                     st.warning("所有密钥数据都不完整，请检查数据源")
@@ -3536,7 +3584,7 @@ elif page == "系统设置":
 
         # 系统概览
         python_version = status_data.get('python_version', 'Unknown').split()[0]
-        version = status_data.get('version', '1.4')
+        version = status_data.get('version', '1.5')
         uptime_hours = status_data.get('uptime_seconds', 0) // 3600
 
         st.markdown(f'''
@@ -3652,7 +3700,7 @@ st.markdown(
     <div style='text-align: center; color: rgba(255, 255, 255, 0.7); font-size: 0.8125rem; margin-top: 4rem; padding: 2rem 0; border-top: 1px solid rgba(255, 255, 255, 0.15); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); background: rgba(255, 255, 255, 0.05); border-radius: 16px 16px 0 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);'>
         <a href='{API_BASE_URL}/health' target='_blank' style='color: rgba(255, 255, 255, 0.8); text-decoration: none; transition: all 0.3s ease; padding: 0.25rem 0.5rem; border-radius: 6px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);' onmouseover='this.style.color="white"; this.style.background="rgba(255, 255, 255, 0.1)"; this.style.textShadow="0 0 8px rgba(255, 255, 255, 0.5)";' onmouseout='this.style.color="rgba(255, 255, 255, 0.8)"; this.style.background="transparent"; this.style.textShadow="none";'>健康检查</a> · 
         <span style='color: rgba(255, 255, 255, 0.6);'>{API_BASE_URL}</span> ·
-        <span style='color: rgba(255, 255, 255, 0.6);'>v1.4</span>
+        <span style='color: rgba(255, 255, 255, 0.6);'>v1.5</span>
     </div>
     """,
     unsafe_allow_html=True
