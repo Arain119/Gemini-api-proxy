@@ -2,9 +2,7 @@
 fastapi==0.108.0
 uvicorn==0.25.0
 httpx>=0.28.1
-httpcore<1
-pydantic==2.5.2
-pydantic-core==2.14.5
+pydantic==2.5.3
 APScheduler==3.10.4
 psutil==5.9.6
 aiofiles==23.2.1
@@ -21,4 +19,4 @@ requests==2.31.0
 python-multipart==0.0.6
 
 # Gemini 2.5 多模态支持
-google-generativeai>=0.3.0
+google-genai>=0.3.0
