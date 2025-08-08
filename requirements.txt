@@ -19,4 +19,4 @@ requests==2.31.0
 python-multipart==0.0.6
 
 # Gemini 2.5 多模态支持
-google-generativeai==0.8.5
+google-genai

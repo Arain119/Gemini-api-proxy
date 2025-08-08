@@ -16,8 +16,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 import google.generativeai as genai
-import google.generativeai.aio as genai_async
-from google.generativeai import types as genai_types
+from google.generativeai import types
 from google.generativeai import errors as genai_errors
 from fastapi import FastAPI, HTTPException, Request, Header, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -397,13 +396,12 @@ async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, 
     """检测单个Gemini Key的健康状态"""
     start_time = time.time()
     try:
-        # ** FIX: Use async client and pass api_key via client_options **
-        model = genai_async.GenerativeModel(
+        model = genai.GenerativeModel(
             model_name='gemini-1.5-flash',
             client_options={"api_key": api_key},
-            request_options=genai_types.RequestOptions(timeout=timeout)
+            request_options=types.RequestOptions(timeout=timeout)
         )
-        await model.generate_content_async("Hello", generation_config=genai_types.GenerationConfig(temperature=0))
+        await model.generate_content_async("Hello", generation_config=types.GenerationConfig(temperature=0))
         response_time = time.time() - start_time
         return {
             "healthy": True,
@@ -578,8 +576,7 @@ async def collect_gemini_response_directly(
     """
     start_time = time.time()
     try:
-        # ** FIX: Use async client and pass api_key via client_options **
-        model = genai_async.GenerativeModel(
+        model = genai.GenerativeModel(
             model_name=model_name,
             system_instruction=sdk_request.get("system_instruction"),
             client_options={"api_key": gemini_key},
@@ -755,8 +752,7 @@ async def stream_gemini_response_single_attempt(
     """
     start_time = time.time()
     try:
-        # ** FIX: Use async client and pass api_key via client_options **
-        model = genai_async.GenerativeModel(
+        model = genai.GenerativeModel(
             model_name=model_name,
             system_instruction=sdk_request.get("system_instruction"),
             client_options={"api_key": gemini_key}
@@ -766,6 +762,7 @@ async def stream_gemini_response_single_attempt(
             contents=sdk_request["contents"],
             generation_config=sdk_request["generation_config"],
             request_options=sdk_request.get("request_options"),
+            stream=True
         )
 
         stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -1013,15 +1010,13 @@ def init_anti_detection_config():
 async def upload_file_to_gemini(file_content: bytes, mime_type: str, filename: str, gemini_key: str) -> Optional[str]:
     """使用 google-genai SDK 上传文件到Gemini File API并返回fileUri"""
     try:
-        # ** FIX: Use aion file uploader **
         # SDK 不直接支持从 bytes 上传，所以我们先保存为临时文件
         temp_file_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4().hex}_{filename}")
         with open(temp_file_path, "wb") as f:
             f.write(file_content)
 
-        # ** FIX: Use async file API **
-        genai.configure(api_key=gemini_key) # Configure for this operation
-        uploaded_file = await genai_async.upload_file(path=temp_file_path, mime_type=mime_type, display_name=filename)
+        genai.configure(api_key=gemini_key)
+        uploaded_file = await genai.upload_file_async(path=temp_file_path, mime_type=mime_type, display_name=filename)
         
         # 删除临时文件
         os.remove(temp_file_path)
@@ -1044,10 +1039,9 @@ async def upload_file_to_gemini(file_content: bytes, mime_type: str, filename: s
 async def delete_file_from_gemini(file_uri: str, gemini_key: str) -> bool:
     """使用 google-genai SDK 从Gemini File API删除文件"""
     try:
-        # ** FIX: Use async file API **
-        genai.configure(api_key=gemini_key) # Configure for this operation
+        genai.configure(api_key=gemini_key)
         file_name = file_uri.split('/')[-1]
-        await genai_async.delete_file(name=f"files/{file_name}")
+        await genai.delete_file_async(name=f"files/{file_name}")
         logger.info(f"File deleted from Gemini successfully: {file_uri}")
         return True
     except Exception as e:
@@ -1537,7 +1531,7 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
             text_content = msg.content
             if anti_detection_enabled and msg.role == 'user':
                 text_content = anti_detection.inject_symbols(text_content)
-            parts.append(genai_types.Part(text=text_content))
+            parts.append(types.Part(text=text_content))
 
         elif isinstance(msg.content, list):
             for item in msg.content:
@@ -1545,27 +1539,27 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
                     text_content = item
                     if anti_detection_enabled and msg.role == 'user':
                         text_content = anti_detection.inject_symbols(text_content)
-                    parts.append(genai_types.Part(text=text_content))
+                    parts.append(types.Part(text=text_content))
                 elif isinstance(item, dict):
                     if item.get('type') == 'text':
                         text_content = item.get('text', '')
                         if anti_detection_enabled and msg.role == 'user':
                             text_content = anti_detection.inject_symbols(text_content)
-                        parts.append(genai_types.Part(text=text_content))
+                        parts.append(types.Part(text=text_content))
                     elif item.get('type') in ['image', 'image_url', 'audio', 'video', 'document']:
                         multimodal_part = process_multimodal_content(item)
                         if multimodal_part:
                             if 'inlineData' in multimodal_part:
-                                parts.append(genai_types.Part(inline_data=multimodal_part['inlineData']))
+                                parts.append(types.Part(inline_data=multimodal_part['inlineData']))
                             elif 'fileData' in multimodal_part:
-                                parts.append(genai_types.Part(file_data=multimodal_part['fileData']))
+                                parts.append(types.Part(file_data=multimodal_part['fileData']))
 
         role = "user" if msg.role == "user" else "model"
         if parts:
-            contents.append(genai_types.Content(parts=parts, role=role))
+            contents.append(types.Content(parts=parts, role=role))
 
     # 构建 generation_config
-    generation_config = genai_types.GenerationConfig(
+    generation_config = types.GenerationConfig(
         temperature=request.temperature,
         top_p=request.top_p,
         candidate_count=request.n,
@@ -1583,7 +1577,7 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
         "contents": contents,
         "generation_config": generation_config,
         "system_instruction": system_instruction,
-        "request_options": genai_types.RequestOptions(timeout=60) # 默认超时
+        "request_options": types.RequestOptions(timeout=60) # 默认超时
     }
     
     # thinking_config 是 generate_content 的一个独立参数
@@ -1616,7 +1610,7 @@ def extract_thoughts_and_content(gemini_response: Dict, include_thoughts: bool =
 
     return thoughts, content
 
-def gemini_to_openai(gemini_response: genai_types.GenerateContentResponse, request: ChatCompletionRequest, usage_info: Dict = None) -> Dict:
+def gemini_to_openai(gemini_response: types.GenerateContentResponse, request: ChatCompletionRequest, usage_info: Dict = None) -> Dict:
     """将Gemini SDK响应转换为OpenAI格式"""
     choices = []
     full_content = ""
