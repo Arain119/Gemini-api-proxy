@@ -15,9 +15,9 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-from google import genai
-from google.genai import types as genai_types
-from google.genai import errors as genai_errors
+import google.generativeai as genai
+from google.generativeai import types as genai_types
+from google.generativeai import errors as genai_errors
 from fastapi import FastAPI, HTTPException, Request, Header, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
