@@ -15,15 +15,18 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-import google.generativeai as genai
-from google.generativeai import types
-from google.generativeai import errors as genai_errors
 from fastapi import FastAPI, HTTPException, Request, Header, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError, validator
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# Gemini SDK Imports
+from google import genai
+from google.generativeai import types
+from google.generativeai import protos
+from google.api_core import exceptions as google_exceptions
 
 from database import Database
 
@@ -396,12 +399,18 @@ async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, 
     """检测单个Gemini Key的健康状态"""
     start_time = time.time()
     try:
+        # 使用一个临时的异步客户端进行健康检查
+        # 注意：genai.configure是全局的，这里我们通过模型实例传递api_key来避免全局状态污染
         model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
-            client_options={"api_key": api_key},
-            request_options=types.RequestOptions(timeout=timeout)
+            model_name="gemini-1.5-flash-latest", # 使用一个通用的、快速的模型
+            api_key=api_key,
+            # 为健康检查设置一个较短的超时
+            request_options={'timeout': timeout}
         )
-        await model.generate_content_async("Hello", generation_config=types.GenerationConfig(temperature=0))
+
+        # 一个简单的、低token的请求
+        await model.generate_content_async("Hello", generation_config={"max_output_tokens": 1})
+
         response_time = time.time() - start_time
         return {
             "healthy": True,
@@ -409,13 +418,22 @@ async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, 
             "status_code": 200,
             "error": None
         }
-    except Exception as e:
+    except (google_exceptions.GoogleAPICallError, google_exceptions.RetryError, google_exceptions.DeadlineExceeded) as e:
         response_time = time.time() - start_time
-        status_code = e.code if isinstance(e, genai_errors.APIError) else None
+        status_code = 408 if isinstance(e, google_exceptions.DeadlineExceeded) else (e.grpc_status_code.value[0] if hasattr(e, 'grpc_status_code') and e.grpc_status_code else 500)
+        error_message = "Timeout" if isinstance(e, google_exceptions.DeadlineExceeded) else str(e)
         return {
             "healthy": False,
             "response_time": response_time,
             "status_code": status_code,
+            "error": error_message
+        }
+    except Exception as e:
+        response_time = time.time() - start_time
+        return {
+            "healthy": False,
+            "response_time": response_time,
+            "status_code": None,
             "error": str(e)
         }
 
@@ -564,47 +582,8 @@ async def log_usage_background(gemini_key_id: int, user_key_id: int, model_name:
         logger.error(f"Background usage logging failed: {e}")
 
 
-async def collect_gemini_response_directly(
-        gemini_key: str,
-        key_id: int,
-        sdk_request: Dict,
-        openai_request: ChatCompletionRequest,
-        model_name: str
-) -> Dict:
-    """
-    使用 google-genai SDK 收集完整响应
-    """
-    start_time = time.time()
-    try:
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=sdk_request.get("system_instruction"),
-            client_options={"api_key": gemini_key},
-        )
-        
-        response = await model.generate_content_async(
-            contents=sdk_request["contents"],
-            generation_config=sdk_request["generation_config"],
-            request_options=sdk_request.get("request_options")
-        )
-
-        response_time = time.time() - start_time
-        asyncio.create_task(update_key_performance_background(key_id, True, response_time))
-
-        # 将SDK响应转换为OpenAI格式
-        return gemini_to_openai(response, openai_request)
-
-    except Exception as e:
-        response_time = time.time() - start_time
-        asyncio.create_task(update_key_performance_background(key_id, False, response_time))
-        logger.error(f"SDK request failed for key #{key_id}: {str(e)}")
-        raise
-
-
-
-
 async def make_request_with_fast_failover(
-        gemini_request: Dict,
+        gemini_sdk_request: Dict,
         openai_request: ChatCompletionRequest,
         model_name: str,
         user_key_info: Dict = None,
@@ -633,7 +612,6 @@ async def make_request_with_fast_failover(
 
     for attempt in range(max_key_attempts):
         try:
-            # 选择下一个可用的key（排除已失败的）
             selection_result = await select_gemini_key_and_check_limits(
                 model_name,
                 excluded_keys=set(failed_keys)
@@ -647,80 +625,76 @@ async def make_request_with_fast_failover(
             logger.info(f"Fast failover attempt {attempt + 1}: Using key #{key_info['id']}")
 
             try:
-                # 确定超时时间：工具调用或快速响应模式使用60秒，其他使用配置值
                 has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
                 is_fast_failover = await should_use_fast_failover()
                 if has_tool_calls:
-                    timeout_seconds = 60.0  # 工具调用强制60秒超时
-                    logger.info("Using extended 60s timeout for tool calls")
+                    timeout_seconds = 60.0
                 elif is_fast_failover:
-                    timeout_seconds = 60.0  # 快速响应模式使用60秒超时
-                    logger.info("Using extended 60s timeout for fast response mode")
+                    timeout_seconds = 60.0
                 else:
                     timeout_seconds = float(db.get_config('request_timeout', '60'))
+
+                start_time = time.time()
                 
-                # 从Google API收集完整响应
-                logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']}")
-                
-                # 收集响应
-                response = await collect_gemini_response_directly(
-                    key_info['key'],
-                    key_info['id'],
-                    gemini_request,
-                    openai_request,
-                    model_name
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    api_key=key_info['key'],
+                    system_instruction=gemini_sdk_request.get('system_instruction'),
+                    request_options={'timeout': timeout_seconds}
                 )
+
+                response = await model.generate_content_async(
+                    contents=gemini_sdk_request['contents'],
+                    generation_config=gemini_sdk_request['generation_config'],
+                    tools=gemini_sdk_request.get('tools'),
+                    tool_config=gemini_sdk_request.get('tool_config')
+                )
+                
+                response_time = time.time() - start_time
+                asyncio.create_task(update_key_performance_background(key_info['id'], True, response_time))
                 
                 logger.info(f"✅ Request successful with key #{key_info['id']} on attempt {attempt + 1}")
 
-                # 从响应中获取token使用量
-                usage = response.get('usage', {})
-                total_tokens = usage.get('completion_tokens', 0)
-                prompt_tokens = usage.get('prompt_tokens', 0)
+                usage_metadata = response.usage_metadata
+                usage = {
+                    "prompt_tokens": usage_metadata.prompt_token_count,
+                    "completion_tokens": usage_metadata.candidates_token_count,
+                    "total_tokens": usage_metadata.total_token_count,
+                }
+                
+                openai_response = gemini_to_openai(response, openai_request, usage_info=usage)
 
-                # 记录使用量
                 if user_key_info:
-                    # 在后台记录使用量，不阻塞响应
                     asyncio.create_task(
                         log_usage_background(
                             key_info['id'],
                             user_key_info['id'],
                             model_name,
                             1,
-                            total_tokens
+                            usage['completion_tokens']
                         )
                     )
+                await rate_limiter.add_usage(model_name, 1, usage['total_tokens'])
+                return openai_response
 
-                # 更新速率限制
-                await rate_limiter.add_usage(model_name, 1, total_tokens)
-                return response
-
-            except HTTPException as e:
+            except (google_exceptions.GoogleAPICallError, google_exceptions.RetryError, google_exceptions.DeadlineExceeded) as e:
+                response_time = time.time() - start_time
+                asyncio.create_task(update_key_performance_background(key_info['id'], False, response_time))
+                
+                status_code = 408 if isinstance(e, google_exceptions.DeadlineExceeded) else (e.grpc_status_code.value[0] if hasattr(e, 'grpc_status_code') and e.grpc_status_code else 500)
+                error_detail = str(e)
+                
                 failed_keys.append(key_info['id'])
-                last_error = e
+                last_error = HTTPException(status_code=status_code, detail=error_detail)
+                logger.warning(f"❌ Key #{key_info['id']} failed with code {status_code}: {error_detail}")
 
-                logger.warning(f"❌ Key #{key_info['id']} failed: {e.detail}")
-
-                # 记录失败的使用量
                 if user_key_info:
-                    asyncio.create_task(
-                        log_usage_background(
-                            key_info['id'],
-                            user_key_info['id'],
-                            model_name,
-                            1,
-                            0
-                        )
-                    )
-
+                    asyncio.create_task(log_usage_background(key_info['id'], user_key_info['id'], model_name, 1, 0))
                 await rate_limiter.add_usage(model_name, 1, 0)
 
-                # 如果是客户端错误（4xx），不继续尝试其他key
-                if 400 <= e.status_code < 500:
-                    logger.warning(f"Client error {e.status_code}, stopping failover")
-                    raise e
-
-                # 服务器错误或网络错误，继续尝试下一个key
+                if 400 <= status_code < 500 and status_code != 429 and status_code != 408:
+                    logger.warning(f"Client error {status_code}, stopping failover")
+                    raise last_error
                 continue
 
         except Exception as e:
@@ -728,7 +702,6 @@ async def make_request_with_fast_failover(
             last_error = HTTPException(status_code=500, detail=str(e))
             continue
 
-    # 所有key都失败了
     failed_count = len(failed_keys)
     logger.error(f"❌ All {failed_count} attempted keys failed for {model_name}")
 
@@ -740,83 +713,9 @@ async def make_request_with_fast_failover(
             detail=f"All {failed_count} available API keys failed"
         )
 
-async def stream_gemini_response_single_attempt(
-        gemini_key: str,
-        key_id: int,
-        sdk_request: Dict,
-        openai_request: ChatCompletionRequest,
-        model_name: str
-) -> AsyncGenerator[bytes, None]:
-    """
-    使用 google-genai SDK 进行单次流式请求尝试
-    """
-    start_time = time.time()
-    try:
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=sdk_request.get("system_instruction"),
-            client_options={"api_key": gemini_key}
-        )
-
-        stream = await model.generate_content_async(
-            contents=sdk_request["contents"],
-            generation_config=sdk_request["generation_config"],
-            request_options=sdk_request.get("request_options"),
-            stream=True
-        )
-
-        stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-        created = int(time.time())
-        total_tokens = 0
-        has_content = False
-
-        async for chunk in stream:
-            has_content = True
-            total_tokens += len(chunk.text.split())
-            
-            chunk_data = {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": openai_request.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": chunk.text},
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
-
-        if has_content:
-            finish_reason = map_finish_reason(stream.finish_reason.name)
-            finish_chunk = {
-                "id": stream_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": openai_request.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": finish_reason
-                }]
-            }
-            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-        
-        yield "data: [DONE]\n\n".encode('utf-8')
-        
-        response_time = time.time() - start_time
-        asyncio.create_task(update_key_performance_background(key_id, True, response_time))
-        await rate_limiter.add_usage(model_name, 1, total_tokens)
-
-    except Exception as e:
-        response_time = time.time() - start_time
-        asyncio.create_task(update_key_performance_background(key_id, False, response_time))
-        logger.error(f"SDK stream request failed for key #{key_id}: {str(e)}")
-        raise
-
 
 async def stream_with_fast_failover(
-        gemini_request: Dict,
+        gemini_sdk_request: Dict,
         openai_request: ChatCompletionRequest,
         model_name: str,
         user_key_info: Dict = None,
@@ -828,13 +727,7 @@ async def stream_with_fast_failover(
     available_keys = db.get_available_gemini_keys()
 
     if not available_keys:
-        error_data = {
-            'error': {
-                'message': 'No available API keys',
-                'type': 'service_unavailable',
-                'code': 503
-            }
-        }
+        error_data = {'error': {'message': 'No available API keys', 'type': 'service_unavailable', 'code': 503}}
         yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
         yield "data: [DONE]\n\n".encode('utf-8')
         return
@@ -860,82 +753,90 @@ async def stream_with_fast_failover(
             key_info = selection_result['key_info']
             logger.info(f"Stream fast failover attempt {attempt + 1}: Using key #{key_info['id']}")
 
-            success = False
+            has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+            is_fast_failover = await should_use_fast_failover()
+            if has_tool_calls:
+                timeout_seconds = 60.0
+            elif is_fast_failover:
+                timeout_seconds = 60.0
+            else:
+                timeout_seconds = float(db.get_config('request_timeout', '60'))
+
+            start_time = time.time()
+            stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+            created = int(time.time())
             total_tokens = 0
-
+            has_content = False
+            
             try:
-                async for chunk in stream_gemini_response_single_attempt(
-                        key_info['key'],
-                        key_info['id'],
-                        gemini_request,
-                        openai_request,
-                        model_name
-                ):
-                    yield chunk
-                    success = True
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    api_key=key_info['key'],
+                    system_instruction=gemini_sdk_request.get('system_instruction'),
+                    request_options={'timeout': timeout_seconds}
+                )
 
-                if success:
-                    # 在后台记录使用量
-                    if user_key_info:
-                        asyncio.create_task(
-                            log_usage_background(
-                                key_info['id'],
-                                user_key_info['id'],
-                                model_name,
-                                1,
-                                total_tokens
-                            )
-                        )
+                stream = await model.generate_content_async(
+                    contents=gemini_sdk_request['contents'],
+                    generation_config=gemini_sdk_request['generation_config'],
+                    tools=gemini_sdk_request.get('tools'),
+                    tool_config=gemini_sdk_request.get('tool_config'),
+                    stream=True
+                )
 
-                    await rate_limiter.add_usage(model_name, 1, total_tokens)
-                    return
+                async for chunk in stream:
+                    has_content = True
+                    if chunk.text:
+                        total_tokens += len(chunk.text.split())
+                        chunk_data = {
+                            "id": stream_id, "object": "chat.completion.chunk", "created": created,
+                            "model": openai_request.model,
+                            "choices": [{"index": 0, "delta": {"content": chunk.text}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
+                
+                # After the loop, check for finish_reason
+                finish_reason = stream.finish_reason.name if hasattr(stream, 'finish_reason') else "STOP"
+                
+                finish_chunk = {
+                    "id": stream_id, "object": "chat.completion.chunk", "created": created,
+                    "model": openai_request.model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": map_finish_reason(finish_reason)}]
+                }
+                yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
+                yield "data: [DONE]\n\n".encode('utf-8')
 
-            except Exception as e:
+                response_time = time.time() - start_time
+                asyncio.create_task(update_key_performance_background(key_info['id'], True, response_time))
+                
+                if user_key_info:
+                    asyncio.create_task(log_usage_background(key_info['id'], user_key_info['id'], model_name, 1, total_tokens))
+                await rate_limiter.add_usage(model_name, 1, total_tokens)
+                return
+
+            except (google_exceptions.GoogleAPICallError, google_exceptions.RetryError, google_exceptions.DeadlineExceeded) as e:
+                response_time = time.time() - start_time
+                asyncio.create_task(update_key_performance_background(key_info['id'], False, response_time))
+                
                 failed_keys.append(key_info['id'])
                 logger.warning(f"Stream key #{key_info['id']} failed: {str(e)}")
 
-                # 在后台更新性能指标
-                asyncio.create_task(
-                    update_key_performance_background(key_info['id'], False, 0.0)
-                )
-
-                # 记录失败的使用量
                 if user_key_info:
-                    asyncio.create_task(
-                        log_usage_background(
-                            key_info['id'],
-                            user_key_info['id'],
-                            model_name,
-                            1,
-                            0
-                        )
-                    )
-
+                    asyncio.create_task(log_usage_background(key_info['id'], user_key_info['id'], model_name, 1, 0))
+                
                 if attempt < max_key_attempts - 1:
                     logger.info(f"Key #{key_info['id']} failed, trying next key...")
-                    # retry_msg = {
-                    #     'error': {
-                    #         'message': f'Key #{key_info["id"]} failed, trying next key...',
-                    #         'type': 'retry_info',
-                    #         'retry_attempt': attempt + 1
-                    #     }
-                    # }
-                    # yield f"data: {json.dumps(retry_msg, ensure_ascii=False)}\n\n".encode('utf-8')
                     continue
                 else:
                     break
-
         except Exception as e:
             logger.error(f"Stream failover error on attempt {attempt + 1}: {str(e)}")
             continue
 
-    # 所有key都失败了
     error_data = {
         'error': {
             'message': f'All {len(failed_keys)} available API keys failed',
-            'type': 'all_keys_failed',
-            'code': 503,
-            'failed_keys': failed_keys
+            'type': 'all_keys_failed', 'code': 503, 'failed_keys': failed_keys
         }
     }
     yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
@@ -992,9 +893,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # 文件存储字典（内存存储，生产环境建议使用数据库）
 file_storage: Dict[str, Dict] = {}
 
-# Gemini File API 基础URL
-GEMINI_FILE_API_BASE = "https://generativelanguage.googleapis.com/v1beta/files"
-
 
 # 初始化防检测配置
 def init_anti_detection_config():
@@ -1008,44 +906,56 @@ def init_anti_detection_config():
 
 
 async def upload_file_to_gemini(file_content: bytes, mime_type: str, filename: str, gemini_key: str) -> Optional[str]:
-    """使用 google-genai SDK 上传文件到Gemini File API并返回fileUri"""
+    """上传文件到Gemini File API并返回fileUri"""
     try:
-        # SDK 不直接支持从 bytes 上传，所以我们先保存为临时文件
-        temp_file_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4().hex}_{filename}")
-        with open(temp_file_path, "wb") as f:
+        # 使用SDK上传文件
+        # 注意：SDK的upload_file_async需要一个文件路径，而不是字节。
+        # 我们将文件临时写入磁盘来解决这个问题。
+        temp_dir = "temp_uploads"
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_{filename}")
+        
+        with open(temp_path, "wb") as f:
             f.write(file_content)
 
+        # 配置一个临时的客户端实例用于上传
         genai.configure(api_key=gemini_key)
-        uploaded_file = await genai.upload_file_async(path=temp_file_path, mime_type=mime_type, display_name=filename)
         
-        # 删除临时文件
-        os.remove(temp_file_path)
+        uploaded_file = await genai.upload_file_async(
+            path=temp_path,
+            display_name=filename,
+            mime_type=mime_type
+        )
+        
+        # 清理临时文件
+        os.remove(temp_path)
 
-        if uploaded_file and uploaded_file.uri:
+        if uploaded_file.uri:
             logger.info(f"File uploaded to Gemini successfully: {uploaded_file.uri}")
             return uploaded_file.uri
         else:
-            logger.error(f"No URI returned from Gemini File API.")
+            logger.error(f"No URI returned from Gemini File API: {uploaded_file}")
             return None
-            
+
     except Exception as e:
-        logger.error(f"Error uploading file to Gemini with SDK: {str(e)}")
-        # 确保临时文件被删除
-        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        logger.error(f"Error uploading file to Gemini: {str(e)}")
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            os.remove(temp_path)
         return None
 
 
 async def delete_file_from_gemini(file_uri: str, gemini_key: str) -> bool:
-    """使用 google-genai SDK 从Gemini File API删除文件"""
+    """从Gemini File API删除文件"""
     try:
+        # 配置一个临时的客户端实例用于删除
         genai.configure(api_key=gemini_key)
+        
         file_name = file_uri.split('/')[-1]
-        await genai.delete_file_async(name=f"files/{file_name}")
+        await genai.delete_file_async(name=file_name)
         logger.info(f"File deleted from Gemini successfully: {file_uri}")
         return True
     except Exception as e:
-        logger.error(f"Error deleting file from Gemini with SDK: {str(e)}")
+        logger.error(f"Error deleting file from Gemini: {str(e)}")
         return False
 
 
@@ -1290,7 +1200,7 @@ def get_actual_model_name(request_model: str) -> str:
         logger.info(f"Using requested model: {request_model}")
         return request_model
 
-    default_model = db.get_config('default_model_name', 'gemini-2.5-flash')
+    default_model = db.get_config('default_model_name', 'gemini-1.5-flash-latest')
     logger.info(f"Unsupported model: {request_model}, using default: {default_model}")
     return default_model
 
@@ -1368,85 +1278,40 @@ def get_thinking_config(request: ChatCompletionRequest) -> Dict:
     return thinking_config
 
 
-def process_multimodal_content(item: Dict) -> Optional[Dict]:
-    """处理多模态内容"""
+def process_multimodal_content(item: Dict) -> Optional[types.Part]:
+    """处理多模态内容并返回 a types.Part object"""
     try:
-        # 检查是否有文件数据
         file_data = item.get('file_data') or item.get('fileData')
         inline_data = item.get('inline_data') or item.get('inlineData')
 
         if inline_data:
-            # 内联数据格式
             mime_type = inline_data.get('mimeType') or inline_data.get('mime_type')
             data = inline_data.get('data')
-
             if mime_type and data:
-                return {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": data
-                    }
-                }
+                return types.Part.from_data(data=base64.b64decode(data), mime_type=mime_type)
         elif file_data:
-            # 文件引用格式
-            mime_type = file_data.get('mimeType') or file_data.get('mime_type')
             file_uri = file_data.get('fileUri') or file_data.get('file_uri')
+            if file_uri:
+                return types.Part.from_uri(uri=file_uri, mime_type=file_data.get('mimeType'))
 
-            if mime_type and file_uri:
-                return {
-                    "fileData": {
-                        "mimeType": mime_type,
-                        "fileUri": file_uri
-                    }
-                }
-
-        # 处理通过文件ID引用的情况
         elif item.get('type') == 'file' and 'file_id' in item:
             file_id = item['file_id']
             if file_id in file_storage:
                 file_info = file_storage[file_id]
-
                 if file_info.get('format') == 'inlineData':
-                    return {
-                        "inlineData": {
-                            "mimeType": file_info['mime_type'],
-                            "data": file_info['data']
-                        }
-                    }
-                elif file_info.get('format') == 'fileData':
-                    if 'gemini_file_uri' in file_info:
-                        # 使用Gemini File API的URI
-                        return {
-                            "fileData": {
-                                "mimeType": file_info['mime_type'],
-                                "fileUri": file_info['gemini_file_uri']
-                            }
-                        }
-                    elif 'file_uri' in file_info:
-                        # 回退到本地文件URI（不推荐，但作为备用）
-                        logger.warning(f"Using local file URI for file {file_id}, this may not work with Gemini")
-                        return {
-                            "fileData": {
-                                "mimeType": file_info['mime_type'],
-                                "fileUri": file_info['file_uri']
-                            }
-                        }
+                    return types.Part.from_data(data=base64.b64decode(file_info['data']), mime_type=file_info['mime_type'])
+                elif file_info.get('format') == 'fileData' and 'gemini_file_uri' in file_info:
+                    return types.Part.from_uri(uri=file_info['gemini_file_uri'], mime_type=file_info['mime_type'])
             else:
                 logger.warning(f"File ID {file_id} not found in storage")
 
-        # 处理直接的图片URL格式（OpenAI兼容）
         if item.get('type') == 'image_url' and 'image_url' in item:
             image_url = item['image_url'].get('url', '')
             if image_url.startswith('data:'):
                 try:
                     header, data = image_url.split(',', 1)
                     mime_type = header.split(';')[0].split(':')[1]
-                    return {
-                        "inlineData": {
-                            "mimeType": mime_type,
-                            "data": data
-                        }
-                    }
+                    return types.Part.from_data(data=base64.b64decode(data), mime_type=mime_type)
                 except Exception as e:
                     logger.warning(f"Failed to parse data URL: {e}")
             else:
@@ -1474,17 +1339,14 @@ def should_apply_anti_detection(request: ChatCompletionRequest, enable_anti_dete
     if not enable_anti_detection:
         return False
     
-    # 检查全局防检测开关
     if not db.get_config('anti_detection_enabled', 'true').lower() == 'true':
         return False
     
-    # 检查是否有工具调用且配置为禁用
     disable_for_tools = db.get_config('anti_detection_disable_for_tools', 'true').lower() == 'true'
     if disable_for_tools and (request.tools or request.tool_choice):
         logger.info("Anti-detection disabled for tool calls")
         return False
     
-    # 检查Token阈值
     token_threshold = int(db.get_config('anti_detection_token_threshold', '5000'))
     total_tokens = 0
     
@@ -1508,57 +1370,45 @@ def should_apply_anti_detection(request: ChatCompletionRequest, enable_anti_dete
 
 def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool = True) -> Dict:
     """
-    将OpenAI格式转换为Gemini SDK格式
+    将OpenAI格式转换为Gemini SDK所需的格式
     """
     contents = []
     system_instruction = None
-
-    # 检查是否应用防检测
     anti_detection_enabled = should_apply_anti_detection(request, enable_anti_detection)
 
     for msg in request.messages:
         parts = []
-        
-        # 提取系统消息
         if msg.role == "system":
-            if isinstance(msg.content, str):
-                system_instruction = msg.content
-            elif isinstance(msg.content, list):
-                system_instruction = " ".join([p.get('text', '') for p in msg.content if isinstance(p, dict) and p.get('type') == 'text'])
-            continue # 系统消息不加入contents
+            system_instruction = msg.get_text_content()
+            continue
 
         if isinstance(msg.content, str):
             text_content = msg.content
             if anti_detection_enabled and msg.role == 'user':
                 text_content = anti_detection.inject_symbols(text_content)
-            parts.append(types.Part(text=text_content))
-
+            parts.append(types.Part.from_text(text_content))
         elif isinstance(msg.content, list):
             for item in msg.content:
                 if isinstance(item, str):
                     text_content = item
                     if anti_detection_enabled and msg.role == 'user':
                         text_content = anti_detection.inject_symbols(text_content)
-                    parts.append(types.Part(text=text_content))
+                    parts.append(types.Part.from_text(text_content))
                 elif isinstance(item, dict):
                     if item.get('type') == 'text':
                         text_content = item.get('text', '')
                         if anti_detection_enabled and msg.role == 'user':
                             text_content = anti_detection.inject_symbols(text_content)
-                        parts.append(types.Part(text=text_content))
-                    elif item.get('type') in ['image', 'image_url', 'audio', 'video', 'document']:
+                        parts.append(types.Part.from_text(text_content))
+                    else:
                         multimodal_part = process_multimodal_content(item)
                         if multimodal_part:
-                            if 'inlineData' in multimodal_part:
-                                parts.append(types.Part(inline_data=multimodal_part['inlineData']))
-                            elif 'fileData' in multimodal_part:
-                                parts.append(types.Part(file_data=multimodal_part['fileData']))
-
+                            parts.append(multimodal_part)
+        
         role = "user" if msg.role == "user" else "model"
         if parts:
             contents.append(types.Content(parts=parts, role=role))
 
-    # 构建 generation_config
     generation_config = types.GenerationConfig(
         temperature=request.temperature,
         top_p=request.top_p,
@@ -1566,77 +1416,42 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
         max_output_tokens=request.max_tokens,
         stop_sequences=request.stop,
     )
+    
+    # Tools and tool_config are passed directly if they are in OpenAI format
+    # The SDK can often handle this conversion.
+    tools = request.tools
+    tool_config = {'function_calling_config': request.tool_choice} if isinstance(request.tool_choice, str) else None
 
-    # 处理 thinking_config
-    thinking_config_dict = get_thinking_config(request)
-    if thinking_config_dict:
-        # SDK 不直接在 GenerationConfig 中接受 thinking_config，它是一个顶级参数
-        pass
 
-    sdk_request = {
+    return {
         "contents": contents,
         "generation_config": generation_config,
         "system_instruction": system_instruction,
-        "request_options": types.RequestOptions(timeout=60) # 默认超时
+        "tools": tools,
+        "tool_config": tool_config
     }
-    
-    # thinking_config 是 generate_content 的一个独立参数
-    if thinking_config_dict:
-        sdk_request["thinking_config"] = thinking_config_dict
-
-    return sdk_request
 
 
-def extract_thoughts_and_content(gemini_response: Dict, include_thoughts: bool = True) -> tuple[str, str]:
-    """从Gemini响应中提取思考过程和最终内容"""
-    thoughts = ""
-    content = ""
-
-    for candidate in gemini_response.get("candidates", []):
-        parts = candidate.get("content", {}).get("parts", [])
-
-        for part in parts:
-            if "text" in part and part["text"]:  # 确保文本不为空
-                is_thought = part.get("thought", False)
-
-                if is_thought:
-                    thoughts += part["text"]
-                    # 当不包含思考内容时，将思考内容也加入到content中
-                    if not include_thoughts:
-                        content += part["text"]
-                else:
-                    # 所有非思考内容都添加到 content
-                    content += part["text"]
-
-    return thoughts, content
-
-def gemini_to_openai(gemini_response: types.GenerateContentResponse, request: ChatCompletionRequest, usage_info: Dict = None) -> Dict:
-    """将Gemini SDK响应转换为OpenAI格式"""
+def gemini_to_openai(gemini_response: protos.GenerateContentResponse, request: ChatCompletionRequest, usage_info: Dict = None) -> Dict:
+    """将Gemini响应转换为OpenAI格式"""
     choices = []
-    full_content = ""
     
-    # 拼接所有部分的文本
-    for candidate in gemini_response.candidates:
+    for i, candidate in enumerate(gemini_response.candidates):
+        content_parts = []
         for part in candidate.content.parts:
             if part.text:
-                full_content += part.text
-
-    # SDK的响应对象已经处理了思考过程的包含与否，这里直接使用 .text 属性即可
-    message_content = gemini_response.text
-
-    choices.append({
-        "index": 0,
-        "message": {
-            "role": "assistant",
-            "content": message_content.strip()
-        },
-        "finish_reason": map_finish_reason(gemini_response.candidates[0].finish_reason.name)
-    })
-
-    # 估算 token
-    prompt_tokens = gemini_response.usage_metadata.prompt_token_count
-    completion_tokens = gemini_response.usage_metadata.candidates_token_count
-    total_tokens = gemini_response.usage_metadata.total_token_count
+                content_parts.append(part.text)
+        
+        message_content = "".join(content_parts)
+        
+        choices.append({
+            "index": i,
+            "message": {
+                "role": "assistant",
+                "content": message_content
+            },
+            "finish_reason": map_finish_reason(candidate.finish_reason.name)
+        })
 
     response = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -1644,13 +1459,12 @@ def gemini_to_openai(gemini_response: types.GenerateContentResponse, request: Ch
         "created": int(time.time()),
         "model": request.model,
         "choices": choices,
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens
+        "usage": usage_info or {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
         }
     }
-
     return response
 
 
@@ -1755,8 +1569,6 @@ async def select_gemini_key_and_check_limits(model_name: str, excluded_keys: set
         'key_info': selected_key,
         'model_config': model_config
     }
-
-
 
 
 # API端点
@@ -2039,7 +1851,6 @@ async def upload_file(
             file_info["format"] = "inlineData"
         else:
             # 大文件上传到Gemini File API
-            # 获取一个可用的Gemini Key用于文件上传
             gemini_keys = db.get_available_gemini_keys()
             if not gemini_keys:
                 raise HTTPException(status_code=503, detail="No available Gemini keys for file upload")
@@ -2053,14 +1864,7 @@ async def upload_file(
                 file_info["format"] = "fileData"
                 logger.info(f"File uploaded to Gemini File API: {gemini_file_uri}")
             else:
-                # 如果上传到Gemini失败，回退到本地存储
-                file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
-                with open(file_path, "wb") as f:
-                    f.write(file_content)
-                file_info["file_path"] = file_path
-                file_info["file_uri"] = f"file://{os.path.abspath(file_path)}"
-                file_info["format"] = "fileData"
-                logger.warning(f"Failed to upload to Gemini, using local storage: {file_path}")
+                raise HTTPException(status_code=500, detail="Failed to upload file to Gemini File API")
 
         file_storage[file_id] = file_info
 
@@ -2193,11 +1997,9 @@ async def delete_file(
 
         file_info = file_storage[file_id]
 
-        # 如果文件存储在Gemini File API，先从Gemini删除
         if "gemini_file_uri" in file_info and "gemini_key_used" in file_info:
             await delete_file_from_gemini(file_info["gemini_file_uri"], file_info["gemini_key_used"])
 
-        # 如果有本地文件，也删除
         if "file_path" in file_info and os.path.exists(file_info["file_path"]):
             os.remove(file_info["file_path"])
 
@@ -2249,7 +2051,6 @@ async def chat_completions(
         if not request.messages or len(request.messages) == 0:
             raise HTTPException(status_code=422, detail="Messages cannot be empty")
 
-        # 验证消息格式和多模态内容
         total_content_size = 0
         for msg in request.messages:
             if not hasattr(msg, 'role') or not hasattr(msg, 'content'):
@@ -2257,7 +2058,6 @@ async def chat_completions(
             if msg.role not in ['system', 'user', 'assistant']:
                 raise HTTPException(status_code=422, detail=f"Invalid role: {msg.role}")
 
-            # 检查多模态内容大小
             if isinstance(msg.content, list):
                 for item in msg.content:
                     if isinstance(item, dict) and item.get('type') in ['image', 'audio', 'video', 'document']:
@@ -2265,7 +2065,6 @@ async def chat_completions(
                         if inline_data and 'data' in inline_data:
                             total_content_size += len(inline_data['data']) * 3 // 4
 
-        # 检查总请求大小（Gemini 2.5限制20MB）
         if total_content_size > MAX_INLINE_SIZE:
             raise HTTPException(
                 status_code=413,
@@ -2275,49 +2074,34 @@ async def chat_completions(
         actual_model_name = get_actual_model_name(request.model)
         request.messages = inject_prompt_to_messages(request.messages)
 
-        # 使用增强版的转换函数，包含防检测功能
-        gemini_request = openai_to_gemini(request, enable_anti_detection=True)
+        gemini_sdk_request = openai_to_gemini(request, enable_anti_detection=True)
 
         has_multimodal = any(msg.has_multimodal_content() for msg in request.messages)
         if has_multimodal:
             logger.info(f"Processing multimodal request for model {actual_model_name}")
 
-        # 记录防检测应用情况
         anti_detection_enabled = db.get_config('anti_detection_enabled', 'true').lower() == 'true'
         if anti_detection_enabled:
             logger.info(f"Anti-detection processing applied for user {user_key_info['name']}")
 
-
-        
-        # 获取管理者配置的流式模式
         stream_mode_config = db.get_stream_mode_config()
         stream_mode = stream_mode_config.get('mode', 'auto')
         
-        # 检查是否有工具调用
         has_tool_calls = bool(request.tools or request.tool_choice)
         
-        # 根据流式模式配置决定是否使用流式响应
-        should_stream = request.stream  # 默认跟随用户请求
-        logger.info(f"DEBUG: request.stream={request.stream}, stream_mode={stream_mode}, has_tool_calls={has_tool_calls}")
-        
-        # 工具调用强制使用非流式模式
+        should_stream = request.stream
         if has_tool_calls:
             should_stream = False
             logger.info("Tool calls detected, forcing non-streaming mode")
         elif stream_mode == 'stream':
-            should_stream = True  # 强制流式
-            logger.info("Stream mode forced to streaming")
+            should_stream = True
         elif stream_mode == 'non_stream':
-            should_stream = False  # 强制非流式
-            logger.info("Stream mode forced to non-streaming")
-        # stream_mode == 'auto' 时保持原有逻辑，跟随用户请求
-
-        logger.info(f"DEBUG: Final should_stream={should_stream}")
+            should_stream = False
 
         if should_stream:
             return StreamingResponse(
                 stream_with_fast_failover(
-                    gemini_request,
+                    gemini_sdk_request,
                     request,
                     actual_model_name,
                     user_key_info=user_key_info,
@@ -2326,7 +2110,7 @@ async def chat_completions(
             )
         else:
             openai_response = await make_request_with_fast_failover(
-                gemini_request,
+                gemini_sdk_request,
                 request,
                 actual_model_name,
                 user_key_info=user_key_info,
@@ -2394,17 +2178,12 @@ async def check_all_keys_health():
         for key_id, task in tasks:
             health_result = await task
 
-            # Log the full health check result for each key
-            log_level = logging.INFO if health_result['healthy'] else logging.WARNING
-            logger.log(log_level, f"Health check result for key #{key_id}: {health_result}")
-
             db.update_key_performance(
                 key_id,
                 health_result['healthy'],
                 health_result['response_time']
             )
 
-            # 同时记录到健康检测历史
             db.record_daily_health_status(
                 key_id,
                 health_result['healthy'],
@@ -2559,7 +2338,6 @@ async def get_failover_config():
     try:
         config = db.get_failover_config()
 
-        # 获取当前Key统计信息
         available_keys = db.get_available_gemini_keys()
         healthy_keys = db.get_healthy_gemini_keys()
 
@@ -2623,10 +2401,8 @@ async def get_failover_stats():
     - 基于当前状态的配置建议
     """
     try:
-        # 获取Key健康状态统计
         health_summary = db.get_keys_health_summary()
 
-        # 获取最近的故障转移统计（可以从使用日志中统计）
         return {
             "success": True,
             "health_summary": health_summary,
@@ -2766,7 +2542,6 @@ async def toggle_keep_alive():
 
     try:
         if keep_alive_enabled and scheduler and scheduler.running:
-            # 停用保活
             scheduler.shutdown(wait=False)
             scheduler = None
             keep_alive_enabled = False
@@ -2777,52 +2552,17 @@ async def toggle_keep_alive():
                 "enabled": False
             }
         else:
-            # 启用保活
             keep_alive_interval = int(os.getenv('KEEP_ALIVE_INTERVAL', '10'))
             scheduler = AsyncIOScheduler()
 
-            scheduler.add_job(
-                keep_alive_ping,
-                'interval',
-                minutes=keep_alive_interval,
-                id='keep_alive',
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=30
-            )
-
-            scheduler.add_job(
-                rate_limiter.cleanup_expired,
-                'interval',
-                minutes=5,
-                id='cache_cleanup',
-                max_instances=1
-            )
-
-            # 重新添加健康检测和自动清理任务
-            scheduler.add_job(
-                record_hourly_health_check,
-                'interval',
-                hours=1,
-                id='hourly_health_check',
-                max_instances=1,
-                coalesce=True
-            )
-
-            scheduler.add_job(
-                auto_cleanup_failed_keys,
-                'cron',
-                hour=2,
-                minute=0,
-                id='daily_cleanup',
-                max_instances=1,
-                coalesce=True
-            )
+            scheduler.add_job(keep_alive_ping, 'interval', minutes=keep_alive_interval, id='keep_alive', max_instances=1, coalesce=True, misfire_grace_time=30)
+            scheduler.add_job(rate_limiter.cleanup_expired, 'interval', minutes=5, id='cache_cleanup', max_instances=1)
+            scheduler.add_job(record_hourly_health_check, 'interval', hours=1, id='hourly_health_check', max_instances=1, coalesce=True)
+            scheduler.add_job(auto_cleanup_failed_keys, 'cron', hour=2, minute=0, id='daily_cleanup', max_instances=1, coalesce=True)
 
             scheduler.start()
             keep_alive_enabled = True
 
-            # 立即执行一次保活
             await keep_alive_ping()
 
             logger.info(f"🟢 Keep-alive enabled manually (interval: {keep_alive_interval} minutes)")
@@ -3367,12 +3107,10 @@ async def get_all_config():
         cleanup_config = db.get_auto_cleanup_config()
         failover_config = db.get_failover_config()
 
-        # 添加防检测配置
         anti_detection_config = {
             'enabled': db.get_config('anti_detection_enabled', 'true').lower() == 'true'
         }
         
-        # 添加流式模式配置
         stream_mode_config = db.get_stream_mode_config()
 
         return {
