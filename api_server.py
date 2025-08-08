@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 import google.generativeai as genai
+import google.generativeai.aio as genai_async
 from google.generativeai import types as genai_types
 from google.generativeai import errors as genai_errors
 from fastapi import FastAPI, HTTPException, Request, Header, File, UploadFile, Form
@@ -396,12 +397,13 @@ async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, 
     """检测单个Gemini Key的健康状态"""
     start_time = time.time()
     try:
-        client = genai.GenerativeModel(
+        # ** FIX: Use async client and pass api_key via client_options **
+        model = genai_async.GenerativeModel(
             model_name='gemini-1.5-flash',
-            api_key=api_key,
+            client_options={"api_key": api_key},
             request_options=genai_types.RequestOptions(timeout=timeout)
         )
-        await client.generate_content_async("Hello", generation_config=genai_types.GenerationConfig(temperature=0))
+        await model.generate_content_async("Hello", generation_config=genai_types.GenerationConfig(temperature=0))
         response_time = time.time() - start_time
         return {
             "healthy": True,
@@ -576,13 +578,14 @@ async def collect_gemini_response_directly(
     """
     start_time = time.time()
     try:
-        client = genai.GenerativeModel(
+        # ** FIX: Use async client and pass api_key via client_options **
+        model = genai_async.GenerativeModel(
             model_name=model_name,
-            api_key=gemini_key,
             system_instruction=sdk_request.get("system_instruction"),
+            client_options={"api_key": gemini_key},
         )
         
-        response = await client.generate_content_async(
+        response = await model.generate_content_async(
             contents=sdk_request["contents"],
             generation_config=sdk_request["generation_config"],
             request_options=sdk_request.get("request_options")
@@ -752,17 +755,17 @@ async def stream_gemini_response_single_attempt(
     """
     start_time = time.time()
     try:
-        client = genai.GenerativeModel(
+        # ** FIX: Use async client and pass api_key via client_options **
+        model = genai_async.GenerativeModel(
             model_name=model_name,
-            api_key=gemini_key,
             system_instruction=sdk_request.get("system_instruction"),
+            client_options={"api_key": gemini_key}
         )
 
-        stream = await client.generate_content_async(
+        stream = await model.generate_content_async(
             contents=sdk_request["contents"],
             generation_config=sdk_request["generation_config"],
             request_options=sdk_request.get("request_options"),
-            stream=True
         )
 
         stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -1010,13 +1013,15 @@ def init_anti_detection_config():
 async def upload_file_to_gemini(file_content: bytes, mime_type: str, filename: str, gemini_key: str) -> Optional[str]:
     """使用 google-genai SDK 上传文件到Gemini File API并返回fileUri"""
     try:
+        # ** FIX: Use aion file uploader **
         # SDK 不直接支持从 bytes 上传，所以我们先保存为临时文件
         temp_file_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4().hex}_{filename}")
         with open(temp_file_path, "wb") as f:
             f.write(file_content)
 
-        client = genai.Client(api_key=gemini_key)
-        uploaded_file = client.files.upload(path=temp_file_path, mime_type=mime_type, display_name=filename)
+        # ** FIX: Use async file API **
+        genai.configure(api_key=gemini_key) # Configure for this operation
+        uploaded_file = await genai_async.upload_file(path=temp_file_path, mime_type=mime_type, display_name=filename)
         
         # 删除临时文件
         os.remove(temp_file_path)
@@ -1039,9 +1044,10 @@ async def upload_file_to_gemini(file_content: bytes, mime_type: str, filename: s
 async def delete_file_from_gemini(file_uri: str, gemini_key: str) -> bool:
     """使用 google-genai SDK 从Gemini File API删除文件"""
     try:
+        # ** FIX: Use async file API **
+        genai.configure(api_key=gemini_key) # Configure for this operation
         file_name = file_uri.split('/')[-1]
-        client = genai.Client(api_key=gemini_key)
-        client.files.delete(name=f"files/{file_name}")
+        await genai_async.delete_file(name=f"files/{file_name}")
         logger.info(f"File deleted from Gemini successfully: {file_uri}")
         return True
     except Exception as e:
