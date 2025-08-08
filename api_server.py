@@ -2394,6 +2394,10 @@ async def check_all_keys_health():
         for key_id, task in tasks:
             health_result = await task
 
+            # Log the full health check result for each key
+            log_level = logging.INFO if health_result['healthy'] else logging.WARNING
+            logger.log(log_level, f"Health check result for key #{key_id}: {health_result}")
+
             db.update_key_performance(
                 key_id,
                 health_result['healthy'],
