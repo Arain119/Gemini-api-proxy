@@ -17,6 +17,7 @@ import httpx
 import uvicorn
 from google import genai
 from google.genai import types as genai_types
+from google.genai import errors as genai_errors
 from fastapi import FastAPI, HTTPException, Request, Header, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -410,7 +411,7 @@ async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, 
         }
     except Exception as e:
         response_time = time.time() - start_time
-        status_code = e.code if isinstance(e, genai_types.APIError) else None
+        status_code = e.code if isinstance(e, genai_errors.APIError) else None
         return {
             "healthy": False,
             "response_time": response_time,
