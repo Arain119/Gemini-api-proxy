@@ -3628,7 +3628,7 @@ elif page == "系统设置":
                         result = call_api('/admin/config/anti-detection', 'POST', data=update_data)
                         if result and result.get('success'):
                             st.success("防检测配置已更新")
-                            st.cache_data.clear()
+                            clear_cache()
                             st.rerun()
                         else:
                             st.error("更新防检测配置失败")
