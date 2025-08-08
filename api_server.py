@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
+from google import genai
+from google.genai import types as genai_types
 from fastapi import FastAPI, HTTPException, Request, Header, File, UploadFile, Form
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -391,49 +393,28 @@ class RateLimitCache:
 # 健康检测功能
 async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, Any]:
     """检测单个Gemini Key的健康状态"""
-    test_request = {
-        "contents": [{"role": "user", "parts": [{"text": "Test"}]}],
-        "generationConfig": {"maxOutputTokens": 1}
-    }
-
     start_time = time.time()
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-                json=test_request,
-                headers={"x-goog-api-key": api_key}
-            )
-
+        client = genai.GenerativeModel(
+            model_name='gemini-1.5-flash',
+            api_key=api_key,
+            request_options=genai_types.RequestOptions(timeout=timeout)
+        )
+        await client.generate_content_async("Hello", generation_config=genai_types.GenerationConfig(temperature=0))
         response_time = time.time() - start_time
-
-        if response.status_code == 200:
-            return {
-                "healthy": True,
-                "response_time": response_time,
-                "status_code": response.status_code,
-                "error": None
-            }
-        else:
-            return {
-                "healthy": False,
-                "response_time": response_time,
-                "status_code": response.status_code,
-                "error": f"HTTP {response.status_code}"
-            }
-
-    except asyncio.TimeoutError:
         return {
-            "healthy": False,
-            "response_time": timeout,
-            "status_code": None,
-            "error": "Timeout"
+            "healthy": True,
+            "response_time": response_time,
+            "status_code": 200,
+            "error": None
         }
     except Exception as e:
+        response_time = time.time() - start_time
+        status_code = e.code if isinstance(e, genai_types.APIError) else None
         return {
             "healthy": False,
-            "response_time": time.time() - start_time,
-            "status_code": None,
+            "response_time": response_time,
+            "status_code": status_code,
             "error": str(e)
         }
 
@@ -585,231 +566,40 @@ async def log_usage_background(gemini_key_id: int, user_key_id: int, model_name:
 async def collect_gemini_response_directly(
         gemini_key: str,
         key_id: int,
-        gemini_request: Dict,
+        sdk_request: Dict,
         openai_request: ChatCompletionRequest,
         model_name: str
 ) -> Dict:
     """
-    从Google API收集完整响应
+    使用 google-genai SDK 收集完整响应
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
-    
-    # 确定超时时间
-    has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-    is_fast_failover = await should_use_fast_failover()
-    if has_tool_calls:
-        timeout = 60.0
-    elif is_fast_failover:
-        timeout = 60.0
-    else:
-        timeout = float(db.get_config('request_timeout', '60'))
-
-    logger.info(f"Starting direct collection from: {url}")
-    
-    complete_content = ""
-    thinking_content = ""
-    total_tokens = 0
-    finish_reason = "stop"
     start_time = time.time()
-
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream(
-                    "POST",
-                    url,
-                    json=gemini_request,
-                    headers={"x-goog-api-key": gemini_key}
-            ) as response:
-                if response.status_code != 200:
-                    response_time = time.time() - start_time
-                    asyncio.create_task(
-                        update_key_performance_background(key_id, False, response_time)
-                    )
-                    error_text = await response.aread()
-                    error_msg = error_text.decode() if error_text else f"HTTP {response.status_code}"
-                    logger.error(f"Direct request failed with status {response.status_code}: {error_msg}")
-                    raise Exception(f"Direct request failed: {error_msg}")
-
-                logger.info(f"Direct response started, status: {response.status_code}")
-                processed_lines = 0
-
-                async for line in response.aiter_lines():
-                    processed_lines += 1
-                    if not line:
-                        continue
-
-                    if line.startswith("data: "):
-                        json_str = line[6:]
-                        if json_str.strip() == "[DONE]":
-                            logger.info("Received [DONE] signal")
-                            break
-                        if not json_str.strip():
-                            continue
-
-                        try:
-                            data = json.loads(json_str)
-                            for candidate in data.get("candidates", []):
-                                content_data = candidate.get("content", {})
-                                parts = content_data.get("parts", [])
-
-                                for part in parts:
-                                    if "text" in part:
-                                        text = part["text"]
-                                        if not text:
-                                            continue
-
-                                        total_tokens += len(text.split())
-                                        is_thought = part.get("thought", False)
-
-                                        if is_thought and not (openai_request.thinking_config and 
-                                                             openai_request.thinking_config.include_thoughts):
-                                            thinking_content += text
-                                        else:
-                                            # 为思考过程添加标记
-                                            if is_thought and not thinking_content:
-                                                complete_content += "**Thinking Process:**\n"
-                                            elif not is_thought and thinking_content and not complete_content.endswith("**Response:**\n"):
-                                                complete_content += "\n\n**Response:**\n"
-                                            
-                                            complete_content += text
-
-                                finish_reason = candidate.get("finishReason", "stop")
-                                if finish_reason:
-                                    finish_reason = map_finish_reason(finish_reason)
-
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"JSON decode error: {e}")
-                            continue
-
-                response_time = time.time() - start_time
-                asyncio.create_task(
-                    update_key_performance_background(key_id, True, response_time)
-                )
-
-    except (httpx.TimeoutException, httpx.ConnectError) as e:
-        logger.warning(f"Direct request timeout/connection error: {str(e)}")
-        response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(key_id, False, response_time)
+        client = genai.GenerativeModel(
+            model_name=model_name,
+            api_key=gemini_key,
+            system_instruction=sdk_request.get("system_instruction"),
         )
-        raise Exception(f"Direct request failed: {str(e)}")
+        
+        response = await client.generate_content_async(
+            contents=sdk_request["contents"],
+            generation_config=sdk_request["generation_config"],
+            request_options=sdk_request.get("request_options")
+        )
+
+        response_time = time.time() - start_time
+        asyncio.create_task(update_key_performance_background(key_id, True, response_time))
+
+        # 将SDK响应转换为OpenAI格式
+        return gemini_to_openai(response, openai_request)
 
     except Exception as e:
-        logger.error(f"Unexpected direct request error: {str(e)}")
         response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(key_id, False, response_time)
-        )
+        asyncio.create_task(update_key_performance_background(key_id, False, response_time))
+        logger.error(f"SDK request failed for key #{key_id}: {str(e)}")
         raise
 
-    # 检查是否收集到内容
-    if not complete_content.strip():
-        logger.error(f"No content collected directly. Processed {processed_lines} lines")
-        raise HTTPException(
-            status_code=502,
-            detail="No content received from Google API"
-        )
 
-    # 计算token使用量
-    prompt_tokens = len(str(openai_request.messages).split())
-    completion_tokens = len(complete_content.split())
-
-    # 构建最终响应
-    openai_response = {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": openai_request.model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": complete_content.strip()
-            },
-            "finish_reason": finish_reason
-        }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens
-        }
-    }
-
-    logger.info(f"Successfully collected direct response: {len(complete_content)} chars, {completion_tokens} tokens")
-    return openai_response
-
-
-async def make_gemini_request_single_attempt(
-        gemini_key: str,
-        key_id: int,
-        gemini_request: Dict,
-        model_name: str,
-        timeout: float = 60.0
-) -> Dict:
-    start_time = time.time()
-
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-
-            response = await client.post(
-                gemini_url,
-                json=gemini_request,
-                headers={"x-goog-api-key": gemini_key}
-            )
-
-            response_time = time.time() - start_time
-
-            if response.status_code == 200:
-                # 请求成功，在后台更新性能指标
-                asyncio.create_task(
-                    update_key_performance_background(key_id, True, response_time)
-                )
-                return response.json()
-            else:
-                # 请求失败，立即标记为失败并抛出异常
-                asyncio.create_task(
-                    update_key_performance_background(key_id, False, response_time)
-                )
-
-                error_detail = response.json() if response.content else {"error": {"message": "Unknown error"}}
-                error_msg = error_detail.get("error", {}).get("message", f"HTTP {response.status_code}")
-
-                # 如果是429错误，则标记为速率受限
-                if response.status_code == 429:
-                    logger.warning(f"Key #{key_id} is rate-limited (429). Marking as 'rate_limited'.")
-                    db.update_gemini_key_status(key_id, 'rate_limited')
-                else:
-                    logger.warning(f"Key #{key_id} failed with {response.status_code}: {error_msg}")
-
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=error_msg
-                )
-
-    except httpx.TimeoutException:
-        response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(key_id, False, response_time)
-        )
-        logger.warning(f"Key #{key_id} timeout after {response_time:.2f}s")
-        raise HTTPException(status_code=504, detail="Request timeout")
-
-    except httpx.RequestError as e:
-        response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(key_id, False, response_time)
-        )
-        logger.warning(f"Key #{key_id} request error: {str(e)}")
-        raise HTTPException(status_code=503, detail=f"Request error: {str(e)}")
-
-    except Exception as e:
-        response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(key_id, False, response_time)
-        )
-        logger.error(f"Key #{key_id} unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 async def make_request_with_fast_failover(
@@ -952,235 +742,75 @@ async def make_request_with_fast_failover(
 async def stream_gemini_response_single_attempt(
         gemini_key: str,
         key_id: int,
-        gemini_request: Dict,
+        sdk_request: Dict,
         openai_request: ChatCompletionRequest,
         model_name: str
 ) -> AsyncGenerator[bytes, None]:
     """
-    单次流式请求尝试，失败立即抛出异常
+    使用 google-genai SDK 进行单次流式请求尝试
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
-    
-    # 确定超时时间：工具调用或快速响应模式使用60秒，其他使用配置值
-    has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-    is_fast_failover = await should_use_fast_failover()
-    if has_tool_calls:
-        timeout = 60.0  # 工具调用强制60秒超时
-        logger.info("Using extended 60s timeout for tool calls in streaming")
-    elif is_fast_failover:
-        timeout = 60.0  # 快速响应模式使用60秒超时
-        logger.info("Using extended 60s timeout for fast response mode in streaming")
-    else:
-        timeout = float(db.get_config('request_timeout', '60'))
-
-    logger.info(f"Starting single stream request to: {url}")
-
     start_time = time.time()
-
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream(
-                    "POST",
-                    url,
-                    json=gemini_request,
-                    headers={"x-goog-api-key": gemini_key}
-            ) as response:
-                if response.status_code != 200:
-                    response_time = time.time() - start_time
-                    asyncio.create_task(
-                        update_key_performance_background(key_id, False, response_time)
-                    )
-
-                    error_text = await response.aread()
-                    error_msg = error_text.decode() if error_text else f"HTTP {response.status_code}"
-                    logger.error(f"Stream request failed with status {response.status_code}: {error_msg}")
-                    raise Exception(f"Stream request failed: {error_msg}")
-
-                stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-                created = int(time.time())
-                total_tokens = 0
-                thinking_sent = False
-                has_content = False
-                processed_lines = 0
-
-                logger.info(f"Stream response started, status: {response.status_code}")
-
-                try:
-                    async for line in response.aiter_lines():
-                        processed_lines += 1
-
-                        if not line:
-                            continue
-
-                        if processed_lines <= 5:
-                            logger.debug(f"Stream line {processed_lines}: {line[:100]}...")
-
-                        if line.startswith("data: "):
-                            json_str = line[6:]
-
-                            if json_str.strip() == "[DONE]":
-                                logger.info("Received [DONE] signal from stream")
-                                break
-
-                            if not json_str.strip():
-                                continue
-
-                            try:
-                                data = json.loads(json_str)
-
-                                for candidate in data.get("candidates", []):
-                                    content_data = candidate.get("content", {})
-                                    parts = content_data.get("parts", [])
-
-                                    for part in parts:
-                                        if "text" in part:
-                                            text = part["text"]
-                                            if not text:
-                                                continue
-
-                                            total_tokens += len(text.split())
-                                            has_content = True
-
-                                            is_thought = part.get("thought", False)
-
-                                            if is_thought and not (openai_request.thinking_config and
-                                                                   openai_request.thinking_config.include_thoughts):
-                                                continue
-
-                                            if is_thought and not thinking_sent:
-                                                thinking_header = {
-                                                    "id": stream_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": created,
-                                                    "model": openai_request.model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {"content": "**Thinking Process:**\n"},
-                                                        "finish_reason": None
-                                                    }]
-                                                }
-                                                yield f"data: {json.dumps(thinking_header, ensure_ascii=False)}\n\n".encode(
-                                                    'utf-8')
-                                                thinking_sent = True
-                                                logger.debug("Sent thinking header")
-                                            elif not is_thought and thinking_sent:
-                                                response_header = {
-                                                    "id": stream_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": created,
-                                                    "model": openai_request.model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {"content": "\n\n**Response:**\n"},
-                                                        "finish_reason": None
-                                                    }]
-                                                }
-                                                yield f"data: {json.dumps(response_header, ensure_ascii=False)}\n\n".encode(
-                                                    'utf-8')
-                                                thinking_sent = False
-                                                logger.debug("Sent response header")
-
-                                            chunk_data = {
-                                                "id": stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created,
-                                                "model": openai_request.model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {"content": text},
-                                                    "finish_reason": None
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode(
-                                                'utf-8')
-
-                                    finish_reason = candidate.get("finishReason")
-                                    if finish_reason:
-                                        finish_chunk = {
-                                            "id": stream_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created,
-                                            "model": openai_request.model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {},
-                                                "finish_reason": map_finish_reason(finish_reason)
-                                            }]
-                                        }
-                                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode(
-                                            'utf-8')
-                                        yield "data: [DONE]\n\n".encode('utf-8')
-
-                                        logger.info(
-                                            f"Stream completed with finish_reason: {finish_reason}, tokens: {total_tokens}")
-
-                                        response_time = time.time() - start_time
-                                        asyncio.create_task(
-                                            update_key_performance_background(key_id, True, response_time)
-                                        )
-                                        await rate_limiter.add_usage(model_name, 1, total_tokens)
-                                        return
-
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"JSON decode error: {e}, line: {json_str[:200]}...")
-                                continue
-
-                        elif line.startswith("event: ") or line.startswith("id: ") or line.startswith("retry: "):
-                            continue
-
-                    # 如果正常结束但没有内容，抛出异常
-                    if not has_content:
-                        logger.warning(f"Stream ended without content after processing {processed_lines} lines")
-                        raise Exception("Stream response had no content")
-
-                    # 正常结束，发送完成信号
-                    if has_content:
-                        finish_chunk = {
-                            "id": stream_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": openai_request.model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": "stop"
-                            }]
-                        }
-                        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                        yield "data: [DONE]\n\n".encode('utf-8')
-
-                        logger.info(
-                            f"Stream ended naturally, processed {processed_lines} lines, tokens: {total_tokens}")
-
-                        response_time = time.time() - start_time
-                        asyncio.create_task(
-                            update_key_performance_background(key_id, True, response_time)
-                        )
-
-                    await rate_limiter.add_usage(model_name, 1, total_tokens)
-
-                except (httpx.ReadError, httpx.RemoteProtocolError) as e:
-                    logger.warning(f"Stream connection error: {str(e)}")
-                    response_time = time.time() - start_time
-                    asyncio.create_task(
-                        update_key_performance_background(key_id, False, response_time)
-                    )
-                    raise Exception(f"Stream connection error: {str(e)}")
-
-    except (httpx.TimeoutException, httpx.ConnectError) as e:
-        logger.warning(f"Stream timeout/connection error: {str(e)}")
-        response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(key_id, False, response_time)
+        client = genai.GenerativeModel(
+            model_name=model_name,
+            api_key=gemini_key,
+            system_instruction=sdk_request.get("system_instruction"),
         )
-        raise Exception(f"Stream connection failed: {str(e)}")
+
+        stream = await client.generate_content_async(
+            contents=sdk_request["contents"],
+            generation_config=sdk_request["generation_config"],
+            request_options=sdk_request.get("request_options"),
+            stream=True
+        )
+
+        stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        created = int(time.time())
+        total_tokens = 0
+        has_content = False
+
+        async for chunk in stream:
+            has_content = True
+            total_tokens += len(chunk.text.split())
+            
+            chunk_data = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": openai_request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": chunk.text},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
+
+        if has_content:
+            finish_reason = map_finish_reason(stream.finish_reason.name)
+            finish_chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": openai_request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason
+                }]
+            }
+            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
+        
+        yield "data: [DONE]\n\n".encode('utf-8')
+        
+        response_time = time.time() - start_time
+        asyncio.create_task(update_key_performance_background(key_id, True, response_time))
+        await rate_limiter.add_usage(model_name, 1, total_tokens)
 
     except Exception as e:
-        logger.error(f"Unexpected stream error: {str(e)}")
         response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(key_id, False, response_time)
-        )
+        asyncio.create_task(update_key_performance_background(key_id, False, response_time))
+        logger.error(f"SDK stream request failed for key #{key_id}: {str(e)}")
         raise
 
 
@@ -1377,60 +1007,44 @@ def init_anti_detection_config():
 
 
 async def upload_file_to_gemini(file_content: bytes, mime_type: str, filename: str, gemini_key: str) -> Optional[str]:
-    """上传文件到Gemini File API并返回fileUri"""
+    """使用 google-genai SDK 上传文件到Gemini File API并返回fileUri"""
     try:
-        # 构建上传请求
-        url = f"{GEMINI_FILE_API_BASE}?key={gemini_key}"
+        # SDK 不直接支持从 bytes 上传，所以我们先保存为临时文件
+        temp_file_path = os.path.join(UPLOAD_DIR, f"temp_{uuid.uuid4().hex}_{filename}")
+        with open(temp_file_path, "wb") as f:
+            f.write(file_content)
 
-        # 准备multipart/form-data
-        files = {
-            'metadata': (None, json.dumps({
-                'name': f"files/{uuid.uuid4().hex}_{filename}",
-                'displayName': filename
-            }), 'application/json'),
-            'data': (filename, file_content, mime_type)
-        }
+        client = genai.Client(api_key=gemini_key)
+        uploaded_file = client.files.upload(path=temp_file_path, mime_type=mime_type, display_name=filename)
+        
+        # 删除临时文件
+        os.remove(temp_file_path)
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, files=files)
-
-        if response.status_code == 200:
-            result = response.json()
-            file_uri = result.get('uri')
-            if file_uri:
-                logger.info(f"File uploaded to Gemini successfully: {file_uri}")
-                return file_uri
-            else:
-                logger.error(f"No URI returned from Gemini File API: {result}")
-                return None
+        if uploaded_file and uploaded_file.uri:
+            logger.info(f"File uploaded to Gemini successfully: {uploaded_file.uri}")
+            return uploaded_file.uri
         else:
-            logger.error(f"Failed to upload file to Gemini: {response.status_code} - {response.text}")
+            logger.error(f"No URI returned from Gemini File API.")
             return None
-
+            
     except Exception as e:
-        logger.error(f"Error uploading file to Gemini: {str(e)}")
+        logger.error(f"Error uploading file to Gemini with SDK: {str(e)}")
+        # 确保临时文件被删除
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
         return None
 
 
 async def delete_file_from_gemini(file_uri: str, gemini_key: str) -> bool:
-    """从Gemini File API删除文件"""
+    """使用 google-genai SDK 从Gemini File API删除文件"""
     try:
-        # 从URI中提取文件名
         file_name = file_uri.split('/')[-1]
-        url = f"{GEMINI_FILE_API_BASE}/{file_name}?key={gemini_key}"
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.delete(url)
-
-        if response.status_code == 200:
-            logger.info(f"File deleted from Gemini successfully: {file_uri}")
-            return True
-        else:
-            logger.warning(f"Failed to delete file from Gemini: {response.status_code} - {response.text}")
-            return False
-
+        client = genai.Client(api_key=gemini_key)
+        client.files.delete(name=f"files/{file_name}")
+        logger.info(f"File deleted from Gemini successfully: {file_uri}")
+        return True
     except Exception as e:
-        logger.error(f"Error deleting file from Gemini: {str(e)}")
+        logger.error(f"Error deleting file from Gemini with SDK: {str(e)}")
         return False
 
 
@@ -1893,27 +1507,30 @@ def should_apply_anti_detection(request: ChatCompletionRequest, enable_anti_dete
 
 def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool = True) -> Dict:
     """
-    将OpenAI格式转换为Gemini格式
+    将OpenAI格式转换为Gemini SDK格式
     """
     contents = []
+    system_instruction = None
 
     # 检查是否应用防检测
     anti_detection_enabled = should_apply_anti_detection(request, enable_anti_detection)
 
     for msg in request.messages:
         parts = []
+        
+        # 提取系统消息
+        if msg.role == "system":
+            if isinstance(msg.content, str):
+                system_instruction = msg.content
+            elif isinstance(msg.content, list):
+                system_instruction = " ".join([p.get('text', '') for p in msg.content if isinstance(p, dict) and p.get('type') == 'text'])
+            continue # 系统消息不加入contents
 
         if isinstance(msg.content, str):
             text_content = msg.content
-
-            # 应用防检测处理 - 只对用户消息应用，避免影响系统消息
             if anti_detection_enabled and msg.role == 'user':
                 text_content = anti_detection.inject_symbols(text_content)
-
-            if msg.role == "system":
-                parts.append({"text": f"[System]: {text_content}"})
-            else:
-                parts.append({"text": text_content})
+            parts.append(genai_types.Part(text=text_content))
 
         elif isinstance(msg.content, list):
             for item in msg.content:
@@ -1921,47 +1538,52 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
                     text_content = item
                     if anti_detection_enabled and msg.role == 'user':
                         text_content = anti_detection.inject_symbols(text_content)
-                    parts.append({"text": text_content})
-
+                    parts.append(genai_types.Part(text=text_content))
                 elif isinstance(item, dict):
                     if item.get('type') == 'text':
                         text_content = item.get('text', '')
                         if anti_detection_enabled and msg.role == 'user':
                             text_content = anti_detection.inject_symbols(text_content)
-                        parts.append({"text": text_content})
+                        parts.append(genai_types.Part(text=text_content))
                     elif item.get('type') in ['image', 'image_url', 'audio', 'video', 'document']:
                         multimodal_part = process_multimodal_content(item)
                         if multimodal_part:
-                            parts.append(multimodal_part)
+                            if 'inlineData' in multimodal_part:
+                                parts.append(genai_types.Part(inline_data=multimodal_part['inlineData']))
+                            elif 'fileData' in multimodal_part:
+                                parts.append(genai_types.Part(file_data=multimodal_part['fileData']))
 
-        role = "user" if msg.role in ["system", "user"] else "model"
-
+        role = "user" if msg.role == "user" else "model"
         if parts:
-            contents.append({
-                "role": role,
-                "parts": parts
-            })
+            contents.append(genai_types.Content(parts=parts, role=role))
 
-    gemini_request = {
+    # 构建 generation_config
+    generation_config = genai_types.GenerationConfig(
+        temperature=request.temperature,
+        top_p=request.top_p,
+        candidate_count=request.n,
+        max_output_tokens=request.max_tokens,
+        stop_sequences=request.stop,
+    )
+
+    # 处理 thinking_config
+    thinking_config_dict = get_thinking_config(request)
+    if thinking_config_dict:
+        # SDK 不直接在 GenerationConfig 中接受 thinking_config，它是一个顶级参数
+        pass
+
+    sdk_request = {
         "contents": contents,
-        "generationConfig": {
-            "temperature": request.temperature,
-            "topP": request.top_p,
-            "candidateCount": request.n,
-        }
+        "generation_config": generation_config,
+        "system_instruction": system_instruction,
+        "request_options": genai_types.RequestOptions(timeout=60) # 默认超时
     }
+    
+    # thinking_config 是 generate_content 的一个独立参数
+    if thinking_config_dict:
+        sdk_request["thinking_config"] = thinking_config_dict
 
-    thinking_config = get_thinking_config(request)
-    if thinking_config:
-        gemini_request["generationConfig"]["thinkingConfig"] = thinking_config
-
-    if request.max_tokens:
-        gemini_request["generationConfig"]["maxOutputTokens"] = request.max_tokens
-
-    if request.stop:
-        gemini_request["generationConfig"]["stopSequences"] = request.stop
-
-    return gemini_request
+    return sdk_request
 
 
 def extract_thoughts_and_content(gemini_response: Dict, include_thoughts: bool = True) -> tuple[str, str]:
@@ -1987,27 +1609,33 @@ def extract_thoughts_and_content(gemini_response: Dict, include_thoughts: bool =
 
     return thoughts, content
 
-def gemini_to_openai(gemini_response: Dict, request: ChatCompletionRequest, usage_info: Dict = None) -> Dict:
-    """将Gemini响应转换为OpenAI格式"""
+def gemini_to_openai(gemini_response: genai_types.GenerateContentResponse, request: ChatCompletionRequest, usage_info: Dict = None) -> Dict:
+    """将Gemini SDK响应转换为OpenAI格式"""
     choices = []
+    full_content = ""
+    
+    # 拼接所有部分的文本
+    for candidate in gemini_response.candidates:
+        for part in candidate.content.parts:
+            if part.text:
+                full_content += part.text
 
-    include_thoughts = request.thinking_config and request.thinking_config.include_thoughts
-    thoughts, content = extract_thoughts_and_content(gemini_response, include_thoughts)
+    # SDK的响应对象已经处理了思考过程的包含与否，这里直接使用 .text 属性即可
+    message_content = gemini_response.text
 
-    for i, candidate in enumerate(gemini_response.get("candidates", [])):
-        message_content = content if content else ""
+    choices.append({
+        "index": 0,
+        "message": {
+            "role": "assistant",
+            "content": message_content.strip()
+        },
+        "finish_reason": map_finish_reason(gemini_response.candidates[0].finish_reason.name)
+    })
 
-        if thoughts and request.thinking_config and request.thinking_config.include_thoughts:
-            message_content = f"**Thinking:**\n{thoughts}\n\n**Response:**\n{content}"
-
-        choices.append({
-            "index": i,
-            "message": {
-                "role": "assistant",
-                "content": message_content
-            },
-            "finish_reason": map_finish_reason(candidate.get("finishReason", "STOP"))
-        })
+    # 估算 token
+    prompt_tokens = gemini_response.usage_metadata.prompt_token_count
+    completion_tokens = gemini_response.usage_metadata.candidates_token_count
+    total_tokens = gemini_response.usage_metadata.total_token_count
 
     response = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -2015,10 +1643,10 @@ def gemini_to_openai(gemini_response: Dict, request: ChatCompletionRequest, usag
         "created": int(time.time()),
         "model": request.model,
         "choices": choices,
-        "usage": usage_info or {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens
         }
     }
 
@@ -2128,634 +1756,6 @@ async def select_gemini_key_and_check_limits(model_name: str, excluded_keys: set
     }
 
 
-# 传统故障转移函数
-async def make_gemini_request_with_retry(
-        gemini_key: str,
-        key_id: int,
-        gemini_request: Dict,
-        model_name: str,
-        max_retries: int = 3,
-        timeout: float = None
-) -> Dict:
-    """带重试的Gemini API请求，记录性能指标"""
-    if timeout is None:
-        timeout = float(db.get_config('request_timeout', '60'))
-
-    for attempt in range(max_retries):
-        start_time = time.time()
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-
-                response = await client.post(
-                    gemini_url,
-                    json=gemini_request,
-                    headers={"x-goog-api-key": gemini_key}
-                )
-
-                response_time = time.time() - start_time
-
-                if response.status_code == 200:
-                    db.update_key_performance(key_id, True, response_time)
-                    return response.json()
-                else:
-                    db.update_key_performance(key_id, False, response_time)
-                    error_detail = response.json() if response.content else {"error": {"message": "Unknown error"}}
-                    if attempt == max_retries - 1:
-                        raise HTTPException(
-                            status_code=response.status_code,
-                            detail=error_detail.get("error", {}).get("message", "Unknown error")
-                        )
-                    else:
-                        logger.warning(f"Request failed (attempt {attempt + 1}), retrying...")
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-
-        except httpx.TimeoutException as e:
-            response_time = time.time() - start_time
-            db.update_key_performance(key_id, False, response_time)
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=504, detail="Request timeout")
-            else:
-                logger.warning(f"Request timeout (attempt {attempt + 1}), retrying...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-        except Exception as e:
-            response_time = time.time() - start_time
-            db.update_key_performance(key_id, False, response_time)
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=500, detail=str(e))
-            else:
-                logger.warning(f"Request failed (attempt {attempt + 1}): {str(e)}, retrying...")
-                await asyncio.sleep(2 ** attempt)
-                continue
-
-    raise HTTPException(status_code=500, detail="Max retries exceeded")
-
-
-async def make_request_with_failover(
-        gemini_request: Dict,
-        openai_request: ChatCompletionRequest,
-        model_name: str,
-        user_key_info: Dict = None,
-        max_key_attempts: int = None,
-        excluded_keys: set = None
-) -> Dict:
-    """传统请求处理（保留用于兼容）"""
-    if excluded_keys is None:
-        excluded_keys = set()
-
-    available_keys = db.get_available_gemini_keys()
-    available_keys = [k for k in available_keys if k['id'] not in excluded_keys]
-
-    if not available_keys:
-        logger.error("No available keys for failover")
-        raise HTTPException(
-            status_code=503,
-            detail="No available API keys"
-        )
-
-    if max_key_attempts is None:
-        max_key_attempts = len(available_keys)
-    else:
-        max_key_attempts = min(max_key_attempts, len(available_keys))
-
-    logger.info(f"Starting failover with {max_key_attempts} key attempts for model {model_name}")
-
-    # 确定超时时间：工具调用或快速响应模式使用60秒，其他使用配置值
-    has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-    is_fast_failover = await should_use_fast_failover()
-    if has_tool_calls:
-        timeout_seconds = 60.0  # 工具调用强制60秒超时
-        logger.info("Using extended 60s timeout for tool calls in traditional failover")
-    elif is_fast_failover:
-        timeout_seconds = 60.0  # 快速响应模式使用60秒超时
-        logger.info("Using extended 60s timeout for fast response mode in traditional failover")
-    else:
-        timeout_seconds = float(db.get_config('request_timeout', '60'))
-
-    last_error = None
-    failed_keys = []
-
-    for attempt in range(max_key_attempts):
-        try:
-            selection_result = await select_gemini_key_and_check_limits(
-                model_name,
-                excluded_keys=excluded_keys.union(set(failed_keys))
-            )
-
-            if not selection_result:
-                logger.warning(f"No more available keys after {attempt} attempts")
-                break
-
-            key_info = selection_result['key_info']
-            model_config = selection_result['model_config']
-
-            logger.info(f"Attempt {attempt + 1}: Using key #{key_info['id']} for {model_name}")
-
-            try:
-                # 直接从Google API收集完整响应（传统故障转移）
-                logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']} (traditional failover)")
-                
-                # 直接收集响应，避免SSE双重解析
-                response = await collect_gemini_response_directly(
-                    key_info['key'],
-                    key_info['id'],
-                    gemini_request,
-                    openai_request,
-                    model_name
-                )
-
-                logger.info(f"✅ Request successful with key #{key_info['id']} on attempt {attempt + 1}")
-
-                # 从响应中获取token使用量
-                usage = response.get('usage', {})
-                total_tokens = usage.get('completion_tokens', 0)
-
-                if user_key_info:
-                    db.log_usage(
-                        gemini_key_id=key_info['id'],
-                        user_key_id=user_key_info['id'],
-                        model_name=model_name,
-                        requests=1,
-                        tokens=total_tokens
-                    )
-                    logger.info(
-                        f"📊 Logged usage: gemini_key_id={key_info['id']}, user_key_id={user_key_info['id']}, model={model_name}, tokens={total_tokens}")
-
-                await rate_limiter.add_usage(model_name, 1, total_tokens)
-                return response
-
-            except HTTPException as e:
-                failed_keys.append(key_info['id'])
-                last_error = e
-
-                db.update_key_performance(key_info['id'], False, 0.0)
-
-                if user_key_info:
-                    db.log_usage(
-                        gemini_key_id=key_info['id'],
-                        user_key_id=user_key_info['id'],
-                        model_name=model_name,
-                        requests=1,
-                        tokens=0
-                    )
-
-                await rate_limiter.add_usage(model_name, 1, 0)
-
-                logger.warning(f"❌ Key #{key_info['id']} failed with {e.status_code}: {e.detail}")
-
-                if e.status_code < 500:
-                    logger.warning(f"Client error {e.status_code}, stopping failover")
-                    raise e
-
-                continue
-
-        except Exception as e:
-            logger.error(f"Unexpected error during failover attempt {attempt + 1}: {str(e)}")
-            last_error = HTTPException(status_code=500, detail=str(e))
-            continue
-
-    failed_count = len(failed_keys)
-    logger.error(f"❌ All {failed_count} keys failed for {model_name}")
-
-    if last_error:
-        raise last_error
-    else:
-        raise HTTPException(
-            status_code=503,
-            detail=f"All {failed_count} available API keys failed"
-        )
-
-
-async def stream_with_failover(
-        gemini_request: Dict,
-        openai_request: ChatCompletionRequest,
-        model_name: str,
-        user_key_info: Dict = None,
-        max_key_attempts: int = None,
-        excluded_keys: set = None
-) -> AsyncGenerator[bytes, None]:
-    """传统流式响应处理（保留用于兼容）"""
-    if excluded_keys is None:
-        excluded_keys = set()
-
-    available_keys = db.get_available_gemini_keys()
-    available_keys = [k for k in available_keys if k['id'] not in excluded_keys]
-
-    if not available_keys:
-        error_data = {
-            'error': {
-                'message': 'No available API keys',
-                'type': 'service_unavailable',
-                'code': 503
-            }
-        }
-        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
-        yield "data: [DONE]\n\n".encode('utf-8')
-        return
-
-    if max_key_attempts is None:
-        max_key_attempts = len(available_keys)
-    else:
-        max_key_attempts = min(max_key_attempts, len(available_keys))
-
-    logger.info(f"Starting stream failover with {max_key_attempts} key attempts for {model_name}")
-
-    failed_keys = []
-
-    for attempt in range(max_key_attempts):
-        try:
-            selection_result = await select_gemini_key_and_check_limits(
-                model_name,
-                excluded_keys=excluded_keys.union(set(failed_keys))
-            )
-
-            if not selection_result:
-                break
-
-            key_info = selection_result['key_info']
-            logger.info(f"Stream attempt {attempt + 1}: Using key #{key_info['id']}")
-
-            success = False
-            total_tokens = 0
-            try:
-                async for chunk in stream_gemini_response(
-                        key_info['key'],
-                        key_info['id'],
-                        gemini_request,
-                        openai_request,
-                        key_info,
-                        model_name
-                ):
-                    yield chunk
-                    success = True
-
-                if success:
-                    if user_key_info:
-                        db.log_usage(
-                            gemini_key_id=key_info['id'],
-                            user_key_id=user_key_info['id'],
-                            model_name=model_name,
-                            requests=1,
-                            tokens=total_tokens
-                        )
-                        logger.info(
-                            f"📊 Logged stream usage: gemini_key_id={key_info['id']}, user_key_id={user_key_info['id']}, model={model_name}")
-
-                    await rate_limiter.add_usage(model_name, 1, total_tokens)
-                    return
-
-            except Exception as e:
-                failed_keys.append(key_info['id'])
-                logger.warning(f"Stream key #{key_info['id']} failed: {str(e)}")
-
-                db.update_key_performance(key_info['id'], False, 0.0)
-
-                if user_key_info:
-                    db.log_usage(
-                        gemini_key_id=key_info['id'],
-                        user_key_id=user_key_info['id'],
-                        model_name=model_name,
-                        requests=1,
-                        tokens=0
-                    )
-
-                if attempt < max_key_attempts - 1:
-                    retry_msg = {
-                        'error': {
-                            'message': f'Key #{key_info["id"]} failed, trying next key...',
-                            'type': 'retry_info',
-                            'retry_attempt': attempt + 1
-                        }
-                    }
-                    yield f"data: {json.dumps(retry_msg, ensure_ascii=False)}\n\n".encode('utf-8')
-                    continue
-                else:
-                    break
-
-        except Exception as e:
-            logger.error(f"Stream failover error on attempt {attempt + 1}: {str(e)}")
-            continue
-
-    error_data = {
-        'error': {
-            'message': f'All {len(failed_keys)} available API keys failed',
-            'type': 'all_keys_failed',
-            'code': 503,
-            'failed_keys': failed_keys
-        }
-    }
-    yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
-    yield "data: [DONE]\n\n".encode('utf-8')
-
-
-async def stream_gemini_response(
-        gemini_key: str,
-        key_id: int,
-        gemini_request: Dict,
-        openai_request: ChatCompletionRequest,
-        key_info: Dict,
-        model_name: str
-) -> AsyncGenerator[bytes, None]:
-    """处理Gemini的流式响应，记录性能指标"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
-    
-    # 确定超时时间：工具调用或快速响应模式使用60秒，其他使用配置值
-    has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-    is_fast_failover = await should_use_fast_failover()
-    if has_tool_calls:
-        timeout = 60.0  # 工具调用强制60秒超时
-        logger.info("Using extended 60s timeout for tool calls in traditional streaming")
-    elif is_fast_failover:
-        timeout = 60.0  # 快速响应模式使用60秒超时
-        logger.info("Using extended 60s timeout for fast response mode in traditional streaming")
-    else:
-        timeout = float(db.get_config('request_timeout', '60'))
-    
-    max_retries = int(db.get_config('max_retries', '3'))
-
-    logger.info(f"Starting stream request to: {url}")
-
-    start_time = time.time()
-
-    for attempt in range(max_retries):
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                        "POST",
-                        url,
-                        json=gemini_request,
-                        headers={"x-goog-api-key": gemini_key}
-                ) as response:
-                    if response.status_code != 200:
-                        response_time = time.time() - start_time
-                        db.update_key_performance(key_id, False, response_time)
-
-                        # 如果是429错误，则标记为速率受限
-                        if response.status_code == 429:
-                            logger.warning(f"Stream key #{key_id} is rate-limited (429). Marking as 'rate_limited'.")
-                            db.update_gemini_key_status(key_id, 'rate_limited')
-
-                        error_text = await response.aread()
-                        error_msg = error_text.decode() if error_text else "Unknown error"
-                        logger.error(f"Stream request failed with status {response.status_code}: {error_msg}")
-                        yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'api_error', 'code': response.status_code}}, ensure_ascii=False)}\n\n".encode(
-                            'utf-8')
-                        yield "data: [DONE]\n\n".encode('utf-8')
-                        return
-
-                    stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-                    created = int(time.time())
-                    total_tokens = 0
-                    thinking_sent = False
-                    has_content = False
-                    processed_lines = 0
-
-                    logger.info(f"Stream response started, status: {response.status_code}")
-
-                    try:
-                        async for line in response.aiter_lines():
-                            processed_lines += 1
-
-                            if not line:
-                                continue
-
-                            if processed_lines <= 5:
-                                logger.debug(f"Stream line {processed_lines}: {line[:100]}...")
-
-                            if line.startswith("data: "):
-                                json_str = line[6:]
-
-                                if json_str.strip() == "[DONE]":
-                                    logger.info("Received [DONE] signal from stream")
-                                    break
-
-                                if not json_str.strip():
-                                    continue
-
-                                try:
-                                    data = json.loads(json_str)
-
-                                    for candidate in data.get("candidates", []):
-                                        content_data = candidate.get("content", {})
-                                        parts = content_data.get("parts", [])
-
-                                        for part in parts:
-                                            if "text" in part:
-                                                text = part["text"]
-                                                if not text:
-                                                    continue
-
-                                                total_tokens += len(text.split())
-                                                has_content = True
-
-                                                is_thought = part.get("thought", False)
-
-                                                if is_thought and not (openai_request.thinking_config and
-                                                                       openai_request.thinking_config.include_thoughts):
-                                                    continue
-
-                                                if is_thought and not thinking_sent:
-                                                    thinking_header = {
-                                                        "id": stream_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": created,
-                                                        "model": openai_request.model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {"content": "**Thinking Process:**\n"},
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(thinking_header, ensure_ascii=False)}\n\n".encode(
-                                                        'utf-8')
-                                                    thinking_sent = True
-                                                    logger.debug("Sent thinking header")
-                                                elif not is_thought and thinking_sent:
-                                                    response_header = {
-                                                        "id": stream_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": created,
-                                                        "model": openai_request.model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {"content": "\n\n**Response:**\n"},
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(response_header, ensure_ascii=False)}\n\n".encode(
-                                                        'utf-8')
-                                                    thinking_sent = False
-                                                    logger.debug("Sent response header")
-
-                                                chunk_data = {
-                                                    "id": stream_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": created,
-                                                    "model": openai_request.model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {"content": text},
-                                                        "finish_reason": None
-                                                    }]
-                                                }
-                                                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode(
-                                                    'utf-8')
-
-                                        finish_reason = candidate.get("finishReason")
-                                        if finish_reason:
-                                            finish_chunk = {
-                                                "id": stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created,
-                                                "model": openai_request.model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {},
-                                                    "finish_reason": map_finish_reason(finish_reason)
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode(
-                                                'utf-8')
-                                            yield "data: [DONE]\n\n".encode('utf-8')
-
-                                            logger.info(
-                                                f"Stream completed with finish_reason: {finish_reason}, tokens: {total_tokens}")
-
-                                            response_time = time.time() - start_time
-                                            db.update_key_performance(key_id, True, response_time)
-                                            await rate_limiter.add_usage(model_name, 1, total_tokens)
-                                            return
-
-                                except json.JSONDecodeError as e:
-                                    logger.warning(f"JSON decode error: {e}, line: {json_str[:200]}...")
-                                    continue
-
-                            elif line.startswith("event: "):
-                                continue
-                            elif line.startswith("id: ") or line.startswith("retry: "):
-                                continue
-
-                        if has_content:
-                            finish_chunk = {
-                                "id": stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": openai_request.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                            yield "data: [DONE]\n\n".encode('utf-8')
-
-                            logger.info(
-                                f"Stream ended naturally, processed {processed_lines} lines, tokens: {total_tokens}")
-
-                            response_time = time.time() - start_time
-                            db.update_key_performance(key_id, True, response_time)
-
-                        if not has_content:
-                            logger.warning(
-                                f"Stream response had no content after processing {processed_lines} lines, falling back to non-stream")
-                            try:
-                                fallback_response = await make_gemini_request_with_retry(
-                                    gemini_key, key_id, gemini_request, model_name, 1, timeout=timeout
-                                )
-
-                                include_thoughts_fallback = openai_request.thinking_config and openai_request.thinking_config.include_thoughts
-                                thoughts, content = extract_thoughts_and_content(fallback_response, include_thoughts_fallback)
-
-                                if thoughts and openai_request.thinking_config and openai_request.thinking_config.include_thoughts:
-                                    full_content = f"**Thinking Process:**\n{thoughts}\n\n**Response:**\n{content}"
-                                else:
-                                    full_content = content
-
-                                if full_content:
-                                    chunk_data = {
-                                        "id": stream_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": openai_request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": full_content},
-                                            "finish_reason": None
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
-
-                                    finish_chunk = {
-                                        "id": stream_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": openai_request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {},
-                                            "finish_reason": "stop"
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                                    total_tokens = len(full_content.split())
-
-                                    logger.info(f"Fallback completed, tokens: {total_tokens}")
-
-                            except Exception as e:
-                                logger.error(f"Fallback request failed: {e}")
-                                response_time = time.time() - start_time
-                                db.update_key_performance(key_id, False, response_time)
-                                yield f"data: {json.dumps({'error': {'message': 'Failed to get response', 'type': 'server_error'}}, ensure_ascii=False)}\n\n".encode(
-                                    'utf-8')
-
-                        await rate_limiter.add_usage(model_name, 1, total_tokens)
-                        yield "data: [DONE]\n\n".encode('utf-8')
-                        return
-
-                    except (httpx.ReadError, httpx.RemoteProtocolError) as e:
-                        logger.warning(f"Stream connection error (attempt {attempt + 1}): {str(e)}")
-                        response_time = time.time() - start_time
-                        db.update_key_performance(key_id, False, response_time)
-                        if attempt < max_retries - 1:
-                            yield f"data: {json.dumps({'error': {'message': 'Connection interrupted, retrying...', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                                'utf-8')
-                            await asyncio.sleep(1)
-                            continue
-                        else:
-                            yield f"data: {json.dumps({'error': {'message': 'Stream connection failed after retries', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                                'utf-8')
-                            yield "data: [DONE]\n\n".encode('utf-8')
-                            return
-
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
-            logger.warning(f"Connection error (attempt {attempt + 1}): {str(e)}")
-            response_time = time.time() - start_time
-            db.update_key_performance(key_id, False, response_time)
-            if attempt < max_retries - 1:
-                yield f"data: {json.dumps({'error': {'message': f'Connection error, retrying... (attempt {attempt + 1})', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                    'utf-8')
-                await asyncio.sleep(2 ** attempt)
-                continue
-            else:
-                yield f"data: {json.dumps({'error': {'message': 'Connection failed after all retries', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                    'utf-8')
-                yield "data: [DONE]\n\n".encode('utf-8')
-                return
-        except Exception as e:
-            logger.error(f"Unexpected error in stream (attempt {attempt + 1}): {str(e)}")
-            response_time = time.time() - start_time
-            db.update_key_performance(key_id, False, response_time)
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1)
-                continue
-            else:
-                yield f"data: {json.dumps({'error': {'message': 'Unexpected error occurred', 'type': 'server_error'}}, ensure_ascii=False)}\n\n".encode(
-                    'utf-8')
-                yield "data: [DONE]\n\n".encode('utf-8')
-                return
 
 
 # API端点
@@ -3314,51 +2314,22 @@ async def chat_completions(
         logger.info(f"DEBUG: Final should_stream={should_stream}")
 
         if should_stream:
-            if await should_use_fast_failover():
-                return StreamingResponse(
-                    stream_with_fast_failover(
-                        gemini_request,
-                        request,
-                        actual_model_name,
-                        user_key_info=user_key_info,
-
-                    ),
-                    media_type="text/event-stream; charset=utf-8"
-                )
-            else:
-                # 回退到传统故障转移逻辑
-                return StreamingResponse(
-                    stream_with_failover(
-                        gemini_request,
-                        request,
-                        actual_model_name,
-                        user_key_info=user_key_info,
-
-                    ),
-                    media_type="text/event-stream; charset=utf-8"
-                )
+            return StreamingResponse(
+                stream_with_fast_failover(
+                    gemini_request,
+                    request,
+                    actual_model_name,
+                    user_key_info=user_key_info,
+                ),
+                media_type="text/event-stream; charset=utf-8"
+            )
         else:
-            logger.info("DEBUG: Using non-streaming response path")
-            # 使用统一的流式架构（内部收集为完整响应）
-            if await should_use_fast_failover():
-                openai_response = await make_request_with_fast_failover(
-                    gemini_request,
-                    request,
-                    actual_model_name,
-                    user_key_info=user_key_info,
-
-                )
-            else:
-                # 回退到传统故障转移逻辑
-                openai_response = await make_request_with_failover(
-                    gemini_request,
-                    request,
-                    actual_model_name,
-                    user_key_info=user_key_info,
-
-                )
-
-            # 直接返回已经转换好的OpenAI格式响应
+            openai_response = await make_request_with_fast_failover(
+                gemini_request,
+                request,
+                actual_model_name,
+                user_key_info=user_key_info,
+            )
             return JSONResponse(content=openai_response)
 
     except HTTPException:
