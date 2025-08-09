@@ -1768,23 +1768,23 @@ def get_thinking_config(request: ChatCompletionRequest) -> Dict:
     global_include_thoughts = db.get_config('include_thoughts', 'false').lower() == 'true'
 
     if not global_thinking_enabled:
-        return {"thinkingBudget": 0}
+        return {"thinking_budget": 0}
 
     if request.thinking_config:
         if request.thinking_config.thinking_budget is not None:
-            thinking_config["thinkingBudget"] = request.thinking_config.thinking_budget
+            thinking_config["thinking_budget"] = request.thinking_config.thinking_budget
         elif global_thinking_budget >= 0:
-            thinking_config["thinkingBudget"] = global_thinking_budget
+            thinking_config["thinking_budget"] = global_thinking_budget
 
         if request.thinking_config.include_thoughts is not None:
-            thinking_config["includeThoughts"] = request.thinking_config.include_thoughts
+            thinking_config["include_thoughts"] = request.thinking_config.include_thoughts
         elif global_include_thoughts:
-            thinking_config["includeThoughts"] = global_include_thoughts
+            thinking_config["include_thoughts"] = global_include_thoughts
     else:
         if global_thinking_budget >= 0:
-            thinking_config["thinkingBudget"] = global_thinking_budget
+            thinking_config["thinking_budget"] = global_thinking_budget
         if global_include_thoughts:
-            thinking_config["includeThoughts"] = global_include_thoughts
+            thinking_config["include_thoughts"] = global_include_thoughts
 
     return thinking_config
 
@@ -1803,8 +1803,8 @@ def process_multimodal_content(item: Dict) -> Optional[Dict]:
 
             if mime_type and data:
                 return {
-                    "inlineData": {
-                        "mimeType": mime_type,
+                    "inline_data": {
+                        "mime_type": mime_type,
                         "data": data
                     }
                 }
@@ -1815,9 +1815,9 @@ def process_multimodal_content(item: Dict) -> Optional[Dict]:
 
             if mime_type and file_uri:
                 return {
-                    "fileData": {
-                        "mimeType": mime_type,
-                        "fileUri": file_uri
+                    "file_data": {
+                        "mime_type": mime_type,
+                        "file_uri": file_uri
                     }
                 }
 
@@ -1827,29 +1827,29 @@ def process_multimodal_content(item: Dict) -> Optional[Dict]:
             if file_id in file_storage:
                 file_info = file_storage[file_id]
 
-                if file_info.get('format') == 'inlineData':
+                if file_info.get('format') == 'inline_data':
                     return {
-                        "inlineData": {
-                            "mimeType": file_info['mime_type'],
+                        "inline_data": {
+                            "mime_type": file_info['mime_type'],
                             "data": file_info['data']
                         }
                     }
-                elif file_info.get('format') == 'fileData':
+                elif file_info.get('format') == 'file_data':
                     if 'gemini_file_uri' in file_info:
                         # 使用Gemini File API的URI
                         return {
-                            "fileData": {
-                                "mimeType": file_info['mime_type'],
-                                "fileUri": file_info['gemini_file_uri']
+                            "file_data": {
+                                "mime_type": file_info['mime_type'],
+                                "file_uri": file_info['gemini_file_uri']
                             }
                         }
                     elif 'file_uri' in file_info:
                         # 回退到本地文件URI（不推荐，但作为备用）
                         logger.warning(f"Using local file URI for file {file_id}, this may not work with Gemini")
                         return {
-                            "fileData": {
-                                "mimeType": file_info['mime_type'],
-                                "fileUri": file_info['file_uri']
+                            "file_data": {
+                                "mime_type": file_info['mime_type'],
+                                "file_uri": file_info['file_uri']
                             }
                         }
             else:
@@ -1863,8 +1863,8 @@ def process_multimodal_content(item: Dict) -> Optional[Dict]:
                     header, data = image_url.split(',', 1)
                     mime_type = header.split(';')[0].split(':')[1]
                     return {
-                        "inlineData": {
-                            "mimeType": mime_type,
+                        "inline_data": {
+                            "mime_type": mime_type,
                             "data": data
                         }
                     }
@@ -1983,19 +1983,19 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
         "generationConfig": {
             "temperature": request.temperature,
             "top_p": request.top_p,
-            "candidateCount": request.n,
+            "candidate_count": request.n,
         }
     }
 
     thinking_config = get_thinking_config(request)
     if thinking_config:
-        gemini_request["generationConfig"]["thinkingConfig"] = thinking_config
+        gemini_request["generationConfig"]["thinking_config"] = thinking_config
 
     if request.max_tokens:
-        gemini_request["generationConfig"]["maxOutputTokens"] = request.max_tokens
+        gemini_request["generationConfig"]["max_output_tokens"] = request.max_tokens
 
     if request.stop:
-        gemini_request["generationConfig"]["stopSequences"] = request.stop
+        gemini_request["generationConfig"]["stop_sequences"] = request.stop
 
     return gemini_request
 
@@ -3071,7 +3071,7 @@ async def upload_file(
         if validation_result["use_inline"]:
             # 小文件使用内联数据
             file_info["data"] = base64.b64encode(file_content).decode('utf-8')
-            file_info["format"] = "inlineData"
+            file_info["format"] = "inline_data"
         else:
             # 大文件上传到Gemini File API
             # 获取一个可用的Gemini Key用于文件上传
@@ -3085,7 +3085,7 @@ async def upload_file(
             if gemini_file_uri:
                 file_info["gemini_file_uri"] = gemini_file_uri
                 file_info["gemini_key_used"] = gemini_key
-                file_info["format"] = "fileData"
+                file_info["format"] = "file_data"
                 logger.info(f"File uploaded to Gemini File API: {gemini_file_uri}")
             else:
                 # 如果上传到Gemini失败，回退到本地存储
@@ -3094,7 +3094,7 @@ async def upload_file(
                     f.write(file_content)
                 file_info["file_path"] = file_path
                 file_info["file_uri"] = f"file://{os.path.abspath(file_path)}"
-                file_info["format"] = "fileData"
+                file_info["format"] = "file_data"
                 logger.warning(f"Failed to upload to Gemini, using local storage: {file_path}")
 
         file_storage[file_id] = file_info
