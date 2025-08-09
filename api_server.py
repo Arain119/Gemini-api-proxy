@@ -727,9 +727,10 @@ async def collect_gemini_response_directly(
 
 # 辅助类：将同步迭代器包装为异步迭代器
 class AsyncIteratorWrapper:
-    """将同步迭代器包装为异步迭代器"""
-    def __init__(self, sync_iterator):
-        self.sync_iterator = sync_iterator
+    """将同步可迭代对象包装为异步迭代器"""
+    def __init__(self, sync_iterable):
+        # 将传入对象转换为迭代器，支持 list 等仅实现 __iter__ 的对象
+        self.sync_iterator = iter(sync_iterable)
         
     def __aiter__(self):
         return self
