@@ -633,6 +633,10 @@ async def collect_gemini_response_directly(
         
         # 使用流式响应模式
         response_stream = model.generate_content(contents=contents, stream=True)
+        # 防御性检查：若返回对象不可迭代则封装为单元素列表，避免迭代异常
+        if not hasattr(response_stream, "__iter__") and not hasattr(response_stream, "__aiter__"):
+            logger.warning("SDK returned non-iterable response despite stream=True; wrapping into iterable list")
+            response_stream = [response_stream]
         
         try:
             # 处理流式响应
