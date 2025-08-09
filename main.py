@@ -2332,7 +2332,7 @@ elif page == "密钥管理":
         with col2:
             abnormal_keys = [k for k in get_cached_gemini_keys().get('keys', []) if k.get('health_status') != 'healthy'] if get_cached_gemini_keys() and get_cached_gemini_keys().get('success') else []
             if abnormal_keys:
-                if st.button(f"🗑️ 一键删除异常 Key（{len(abnormal_keys)}）", key="bulk_delete_abnormal", type="primary"):
+                if st.button("🗑️ 一键删除异常 Key", key="bulk_delete_abnormal", type="primary"):
                     deleted = 0
                     for k in abnormal_keys:
                         if delete_key('gemini', k['id']):
