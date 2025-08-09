@@ -737,9 +737,8 @@ class AsyncIteratorWrapper:
         
     async def __anext__(self):
         try:
-            # 在事件循环的线程池中运行同步迭代器的next方法
-            item = await asyncio.to_thread(next, self.sync_iterator)
-            return item
+            # 直接调用 next 获取下一个元素，无需线程池
+            return next(self.sync_iterator)
         except StopIteration:
             raise StopAsyncIteration
 
