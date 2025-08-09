@@ -1982,7 +1982,7 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
         "contents": contents,
         "generationConfig": {
             "temperature": request.temperature,
-            "topP": request.top_p,
+            "top_p": request.top_p,
             "candidateCount": request.n,
         }
     }

@@ -2326,10 +2326,23 @@ elif page == "密钥管理":
         st.markdown('<hr style="margin: 2rem 0;">', unsafe_allow_html=True)
 
         # 现有密钥
-        col1, col2, col3 = st.columns([4, 1, 1])
+        col1, col2, col3, col4 = st.columns([4, 1.5, 1, 1])
         with col1:
             st.markdown("#### 现有密钥")
         with col2:
+            abnormal_keys = [k for k in get_cached_gemini_keys().get('keys', []) if k.get('health_status') != 'healthy'] if get_cached_gemini_keys() and get_cached_gemini_keys().get('success') else []
+            if abnormal_keys:
+                if st.button(f"🗑️ 一键删除异常 Key（{len(abnormal_keys)}）", key="bulk_delete_abnormal", type="primary"):
+                    deleted = 0
+                    for k in abnormal_keys:
+                        if delete_key('gemini', k['id']):
+                            deleted += 1
+                    if deleted > 0:
+                        st.success(f"已删除 {deleted} 个异常 Key")
+                        st.cache_data.clear()
+                        time.sleep(1)
+                        st.rerun()
+        with col3:
             if st.button("健康检测", help="检测所有密钥状态", key="health_check_gemini"):
                 with st.spinner("检测中..."):
                     result = check_all_keys_health()
@@ -2338,7 +2351,7 @@ elif page == "密钥管理":
                         st.cache_data.clear()
                         time.sleep(1)
                         st.rerun()
-        with col3:
+        with col4:
             show_full_keys = st.checkbox("显示完整", key="show_gemini_full")
 
         # 获取密钥列表
@@ -2360,17 +2373,7 @@ elif page == "密钥管理":
                 with col2:
                     st.markdown(f'<div style="color: #374151; font-weight: 500;">激活 {active_count} 个</div>', unsafe_allow_html=True)
                 with col3:
-                    if abnormal_keys:
-                        if st.button(f"🗑️ 一键删除异常 Key（{len(abnormal_keys)}）", key="bulk_delete_abnormal", type="primary"):
-                            deleted = 0
-                            for k in abnormal_keys:
-                                if delete_key('gemini', k['id']):
-                                    deleted += 1
-                            if deleted > 0:
-                                st.success(f"已删除 {deleted} 个异常 Key")
-                                st.cache_data.clear()
-                                time.sleep(1)
-                                st.rerun()
+                    st.markdown(f'<div style="color: #ef4444; font-weight: 500;">异常 {len(abnormal_keys)} 个</div>', unsafe_allow_html=True)
                 with col4:
                     st.markdown(f'<div style="color: #059669; font-weight: 500;">正常 {healthy_count} 个</div>', unsafe_allow_html=True)
 
