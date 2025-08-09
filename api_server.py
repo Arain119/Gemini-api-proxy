@@ -622,7 +622,9 @@ async def collect_gemini_response_directly(
         # 设置生成配置
         generation_config = {}
         if "generationConfig" in gemini_request:
-            generation_config = gemini_request["generationConfig"]
+            raw_config = gemini_request["generationConfig"]
+            allowed_keys = {"stop_sequences", "max_output_tokens", "temperature", "top_p", "top_k", "candidate_count", "safety_settings", "response_mime_type"}
+            generation_config = {k: v for k, v in raw_config.items() if k in allowed_keys}
         
         # 获取内容
         contents = gemini_request.get("contents", [])
@@ -757,7 +759,9 @@ async def make_gemini_request_single_attempt(
         genai.configure(api_key=gemini_key)
         
         # 获取生成配置和内容
-        generation_config = gemini_request.get("generationConfig", {})
+        raw_config = gemini_request.get("generationConfig", {})
+        allowed_keys = {"stop_sequences", "max_output_tokens", "temperature", "top_p", "top_k", "candidate_count", "safety_settings", "response_mime_type"}
+        generation_config = {k: v for k, v in raw_config.items() if k in allowed_keys}
         contents = gemini_request.get("contents", [])
         
         # 创建模型实例
@@ -1993,7 +1997,8 @@ def openai_to_gemini(request: ChatCompletionRequest, enable_anti_detection: bool
 
     thinking_config = get_thinking_config(request)
     if thinking_config:
-        gemini_request["generationConfig"]["thinking_config"] = thinking_config
+        # 将思考配置放在根层级，避免作为 GenerationConfig 未知字段
+        gemini_request["thinking_config"] = thinking_config
 
     if request.max_tokens:
         gemini_request["generationConfig"]["max_output_tokens"] = request.max_tokens
@@ -2804,18 +2809,14 @@ async def root():
     """
     **服务根端点**
 
-    返回服务的基本信息、状态和功能列表。
-    可用于快速检查服务是否正在运行。
+    返回服务的基本信息和状态。
+    此端点经过优化，可作为快速健康检查点，不执行任何数据库操作。
     """
     return {
         "service": "Gemini API Proxy",
         "status": "running",
         "version": "1.5",
-        "features": ["Gemini 2.5 Multimodal"],
-        "keep_alive": keep_alive_enabled,
-        "auto_cleanup": db.get_auto_cleanup_config()['enabled'],
-        "anti_detection": db.get_config('anti_detection_enabled', 'true').lower() == 'true',
-        "fast_failover": db.get_failover_config()['fast_failover_enabled'],
+        "message": "Service is active. For detailed status, check /status or /health.",
         "docs": "/docs",
         "health": "/health"
     }
