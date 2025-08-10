@@ -642,7 +642,7 @@ async def collect_gemini_response_directly(
         
         try:
             # 处理流式响应
-            async for chunk in AsyncIteratorWrapper(response_stream):
+            async for chunk in ensure_async_iter(response_stream):
                 processed_lines += 1
                 
                 # 提取文本内容
@@ -743,6 +743,19 @@ class AsyncIteratorWrapper:
             return next(self.sync_iterator)
         except StopIteration:
             raise StopAsyncIteration
+
+# 新增：统一异步迭代器封装，兼容协程/同步/异步迭代器
+async def ensure_async_iter(stream):
+    """确保以异步方式迭代任意 stream 对象，无论其是协程、异步迭代器还是同步迭代器"""
+    from inspect import iscoroutine
+    if iscoroutine(stream):
+        stream = await stream
+    if hasattr(stream, "__aiter__"):
+        async for item in stream:
+            yield item
+    else:
+        for item in stream:
+            yield item
 
 
 async def make_gemini_request_single_attempt(
