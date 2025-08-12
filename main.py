@@ -898,7 +898,7 @@ st.markdown("""
         box-shadow: 
             0 4px 16px rgba(0, 0, 0, 0.06),
             inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
-        -webkit-tap-highlight-color: transparent !important; 
+        -webkit-tap-highlight-color: transparent !important; /* 移除iOS点击高亮 */
     }
 
     /* 移动端导航项调整 */
@@ -2039,7 +2039,7 @@ with st.sidebar:
     <div class="sidebar-footer">
         <div class="sidebar-footer-content">
             <div class="sidebar-footer-item">
-                <span>版本 v1.5</span>
+                <span>版本 v1.3.2</span>
             </div>
             <div class="sidebar-footer-item">
                 <a href="{API_BASE_URL}/docs" target="_blank" class="sidebar-footer-link">API 文档</a>
@@ -2326,23 +2326,10 @@ elif page == "密钥管理":
         st.markdown('<hr style="margin: 2rem 0;">', unsafe_allow_html=True)
 
         # 现有密钥
-        col1, col2, col3, col4 = st.columns([4, 1.5, 1, 1])
+        col1, col2, col3 = st.columns([4, 1, 1])
         with col1:
             st.markdown("#### 现有密钥")
         with col2:
-            abnormal_keys = [k for k in get_cached_gemini_keys().get('keys', []) if k.get('health_status') != 'healthy'] if get_cached_gemini_keys() and get_cached_gemini_keys().get('success') else []
-            if abnormal_keys:
-                if st.button("🗑️ 一键删除异常 Key", key="bulk_delete_abnormal", type="primary"):
-                    deleted = 0
-                    for k in abnormal_keys:
-                        if delete_key('gemini', k['id']):
-                            deleted += 1
-                    if deleted > 0:
-                        st.success(f"已删除 {deleted} 个异常 Key")
-                        st.cache_data.clear()
-                        time.sleep(1)
-                        st.rerun()
-        with col3:
             if st.button("健康检测", help="检测所有密钥状态", key="health_check_gemini"):
                 with st.spinner("检测中..."):
                     result = check_all_keys_health()
@@ -2351,7 +2338,7 @@ elif page == "密钥管理":
                         st.cache_data.clear()
                         time.sleep(1)
                         st.rerun()
-        with col4:
+        with col3:
             show_full_keys = st.checkbox("显示完整", key="show_gemini_full")
 
         # 获取密钥列表
@@ -2365,17 +2352,16 @@ elif page == "密钥管理":
                 healthy_count = len(
                     [k for k in gemini_keys if k.get('status') == 1 and k.get('health_status') == 'healthy'])
 
-                abnormal_keys = [k for k in gemini_keys if k.get('health_status') != 'healthy']
-
-                col1, col2, col3, col4 = st.columns([1, 1, 2, 1])
+                col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.markdown(f'<div style="color: #374151; font-weight: 500;">共 {len(gemini_keys)} 个密钥</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="color: #374151; font-weight: 500;">共 {len(gemini_keys)} 个密钥</div>',
+                                unsafe_allow_html=True)
                 with col2:
-                    st.markdown(f'<div style="color: #374151; font-weight: 500;">激活 {active_count} 个</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="color: #374151; font-weight: 500;">激活 {active_count} 个</div>',
+                                unsafe_allow_html=True)
                 with col3:
-                    st.markdown(f'<div style="color: #ef4444; font-weight: 500;">异常 {len(abnormal_keys)} 个</div>', unsafe_allow_html=True)
-                with col4:
-                    st.markdown(f'<div style="color: #059669; font-weight: 500;">正常 {healthy_count} 个</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="color: #059669; font-weight: 500;">正常 {healthy_count} 个</div>',
+                                unsafe_allow_html=True)
 
                 valid_keys = []
                 invalid_count = 0
@@ -2395,8 +2381,6 @@ elif page == "密钥管理":
                 # 如果有无效数据，给出提示
                 if invalid_count > 0:
                     st.warning(f"发现 {invalid_count} 个数据不完整的密钥，已跳过显示")
-                
-
 
                 # 渲染有效的密钥
                 for key_info in valid_keys:
@@ -2404,10 +2388,8 @@ elif page == "密钥管理":
                         # 创建一个容器来包含整个密钥卡片
                         container = st.container()
                         with container:
-                            # 使用列布局来实现卡片内的元素（移除选择框列）
-                            col1, col2, col3, col4, col5, col6 = st.columns([0.6, 3.0, 0.9, 0.9, 0.8, 0.8])
-                            
-                            key_id = key_info.get('id')
+                            # 使用列布局来实现卡片内的元素
+                            col1, col2, col3, col4, col5, col6 = st.columns([0.5, 3.5, 0.9, 0.9, 0.8, 0.8])
 
                             with col1:
                                 st.markdown(f'<div class="key-id">#{key_info.get("id", "N/A")}</div>',
@@ -2455,7 +2437,6 @@ elif page == "密钥管理":
                                     if st.button("删除", key=f"del_g_{key_id}", use_container_width=True):
                                         if delete_key('gemini', key_id):
                                             st.success("删除成功")
-
                                             st.cache_data.clear()
                                             time.sleep(1)
                                             st.rerun()
@@ -2464,8 +2445,6 @@ elif page == "密钥管理":
                         # 异常时显示错误信息而不是空白
                         st.error(f"渲染密钥 #{key_info.get('id', '?')} 时出错: {str(e)}")
 
-
-                
                 # 如果没有有效密钥
                 if not valid_keys:
                     st.warning("所有密钥数据都不完整，请检查数据源")
@@ -2669,7 +2648,7 @@ elif page == "系统设置":
 
     # 包含故障转移配置的标签页
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "思考模式", "提示词注入", "流式模式", "负载均衡", "故障转移", "自动清理", "防检测", "系统信息"
+        "思考模式", "提示词注入", "流式模式", "负载均衡", "故障转移", "自动清理", "系统信息", "防检测"
     ])
 
     with tab1:
@@ -3015,7 +2994,7 @@ elif page == "系统设置":
             st.markdown(f"**{strategy_options[strategy]}**: {strategy_descriptions[strategy]}")
 
             if st.form_submit_button("保存策略", type="primary", use_container_width=True):
-                result = call_api('/admin/config/load-balance', 'POST', {
+                result = call_api('/admin/config', 'POST', {
                     'load_balance_strategy': strategy
                 })
                 if result and result.get('success'):
@@ -3429,135 +3408,12 @@ elif page == "系统设置":
                 """)
 
     with tab7:
-        st.markdown("#### 防检测配置")
-        st.markdown("管理自动化检测防护功能")
-
-        # 获取防检测配置
-        anti_detection_data = call_api('/admin/config/anti-detection', 'GET')
-        
-        if anti_detection_data:
-            anti_detection_config = anti_detection_data.get('config', {})
-            current_enabled = anti_detection_config.get('anti_detection_enabled', True)
-            current_disable_for_tools = anti_detection_config.get('disable_for_tools', True) 
-            current_token_threshold = anti_detection_config.get('token_threshold', 5000)
-            stats = anti_detection_data.get('statistics', {})
-            
-            # 状态概览卡片
-            status_text = "已启用" if current_enabled else "已禁用"
-            status_color = "#10b981" if current_enabled else "#ef4444"
-            
-            st.markdown(f'''
-            <div style="background: linear-gradient(135deg, rgba(34, 197, 94, 0.1) 0%, rgba(59, 130, 246, 0.1) 100%); 
-                        border: 1px solid rgba(34, 197, 94, 0.2); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <div>
-                        <h5 style="margin: 0; color: #374151; font-size: 1.1rem;">防检测状态</h5>
-                        <p style="margin: 0.5rem 0 0 0; color: #6b7280; font-size: 0.9rem;">
-                            工具调用时: {"禁用" if current_disable_for_tools else "启用"} | 
-                            生效阈值: {current_token_threshold} tokens
-                        </p>
-                    </div>
-                    <div style="background: {status_color}; color: white; padding: 0.5rem 1rem; border-radius: 8px; font-weight: 500;">
-                        {status_text}
-                    </div>
-                </div>
-            </div>
-            ''', unsafe_allow_html=True)
-
-            with st.form("anti_detection_form"):
-                st.markdown("**基础配置**")
-                
-                col1, col2 = st.columns([1, 1])
-                
-                with col1:
-                    enabled = st.checkbox(
-                        "启用防检测功能",
-                        value=current_enabled,
-                        help="开启后将在合适的情况下自动应用防检测处理"
-                    )
-                    
-                with col2:
-                    disable_for_tools = st.checkbox(
-                        "工具调用时禁用防检测",
-                        value=current_disable_for_tools,
-                        help="在进行工具调用时自动禁用防检测，避免影响工具响应"
-                    )
-
-                st.markdown("**高级配置**")
-                token_threshold = st.number_input(
-                    "Token阈值",
-                    min_value=1000,
-                    max_value=50000,
-                    value=current_token_threshold,
-                    step=500,
-                    help="只有当消息token数超过此阈值时才应用防检测处理"
-                )
-
-                # 统计信息
-                if stats:
-                    st.markdown("**使用统计**")
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric(
-                            "处理次数",
-                            stats.get('processed_count', 0),
-                            help="累计应用防检测处理的次数"
-                        )
-                    
-                    with col2:
-                        st.metric(
-                            "符号注入次数", 
-                            stats.get('symbol_injections', 0),
-                            help="累计注入的防检测符号数量"
-                        )
-                    
-                    with col3:
-                        avg_time = stats.get('average_processing_time_ms', 0)
-                        st.metric(
-                            "平均处理时间",
-                            f"{avg_time:.1f}ms",
-                            help="平均防检测处理耗时"
-                        )
-
-                col1, col2 = st.columns([1, 1])
-                
-                with col1:
-                    if st.form_submit_button("保存配置", type="primary", use_container_width=True):
-                        update_data = {
-                            'enabled': enabled,
-                            'disable_for_tools': disable_for_tools,
-                            'token_threshold': token_threshold
-                        }
-                        
-                        result = call_api('/admin/config/anti-detection', 'POST', data=update_data)
-                        if result and result.get('success'):
-                            st.success("防检测配置已更新")
-                            st.cache_data.clear()
-                            st.rerun()
-                        else:
-                            st.error("更新防检测配置失败")
-                
-                with col2:
-                    if st.form_submit_button("测试防检测", use_container_width=True):
-                        test_result = call_api('/admin/test/anti-detection', 'POST')
-                        if test_result and test_result.get('success'):
-                            st.success("防检测功能测试成功")
-                            with st.expander("测试结果详情"):
-                                st.json(test_result)
-                        else:
-                            st.error("防检测功能测试失败")
-
-        else:
-            st.error("无法获取防检测配置数据")
-
-    with tab8:
         st.markdown("#### 系统信息")
         st.markdown("查看系统运行状态和资源使用情况")
 
         # 系统概览
         python_version = status_data.get('python_version', 'Unknown').split()[0]
-        version = status_data.get('version', '1.5')
+        version = status_data.get('version', '1.3.2')
         uptime_hours = status_data.get('uptime_seconds', 0) // 3600
 
         st.markdown(f'''
@@ -3667,13 +3523,136 @@ elif page == "系统设置":
             </a>
             ''', unsafe_allow_html=True)
 
+    with tab8:
+        st.markdown("#### 防检测配置")
+        st.markdown("管理自动化检测防护功能")
+
+        # 获取防检测配置
+        anti_detection_data = call_api('/admin/config/anti-detection', 'GET')
+        
+        if anti_detection_data:
+            anti_detection_config = anti_detection_data.get('config', {})
+            current_enabled = anti_detection_config.get('anti_detection_enabled', True)
+            current_disable_for_tools = anti_detection_config.get('disable_for_tools', True) 
+            current_token_threshold = anti_detection_config.get('token_threshold', 5000)
+            stats = anti_detection_data.get('statistics', {})
+            
+            # 状态概览卡片
+            status_text = "已启用" if current_enabled else "已禁用"
+            status_color = "#10b981" if current_enabled else "#ef4444"
+            
+            st.markdown(f'''
+            <div style="background: linear-gradient(135deg, rgba(34, 197, 94, 0.1) 0%, rgba(59, 130, 246, 0.1) 100%); 
+                        border: 1px solid rgba(34, 197, 94, 0.2); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <h5 style="margin: 0; color: #374151; font-size: 1.1rem;">防检测状态</h5>
+                        <p style="margin: 0.5rem 0 0 0; color: #6b7280; font-size: 0.9rem;">
+                            工具调用时: {"禁用" if current_disable_for_tools else "启用"} | 
+                            生效阈值: {current_token_threshold} tokens
+                        </p>
+                    </div>
+                    <div style="background: {status_color}; color: white; padding: 0.5rem 1rem; border-radius: 8px; font-weight: 500;">
+                        {status_text}
+                    </div>
+                </div>
+            </div>
+            ''', unsafe_allow_html=True)
+
+            with st.form("anti_detection_form"):
+                st.markdown("**基础配置**")
+                
+                col1, col2 = st.columns([1, 1])
+                
+                with col1:
+                    enabled = st.checkbox(
+                        "启用防检测功能",
+                        value=current_enabled,
+                        help="开启后将在合适的情况下自动应用防检测处理"
+                    )
+                    
+                with col2:
+                    disable_for_tools = st.checkbox(
+                        "工具调用时禁用防检测",
+                        value=current_disable_for_tools,
+                        help="在进行工具调用时自动禁用防检测，避免影响工具响应"
+                    )
+
+                st.markdown("**高级配置**")
+                token_threshold = st.number_input(
+                    "Token阈值",
+                    min_value=1000,
+                    max_value=50000,
+                    value=current_token_threshold,
+                    step=500,
+                    help="只有当消息token数超过此阈值时才应用防检测处理"
+                )
+
+                # 统计信息
+                if stats:
+                    st.markdown("**使用统计**")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric(
+                            "处理次数",
+                            stats.get('processed_count', 0),
+                            help="累计应用防检测处理的次数"
+                        )
+                    
+                    with col2:
+                        st.metric(
+                            "符号注入次数", 
+                            stats.get('symbol_injections', 0),
+                            help="累计注入的防检测符号数量"
+                        )
+                    
+                    with col3:
+                        avg_time = stats.get('average_processing_time_ms', 0)
+                        st.metric(
+                            "平均处理时间",
+                            f"{avg_time:.1f}ms",
+                            help="平均防检测处理耗时"
+                        )
+
+                col1, col2 = st.columns([1, 1])
+                
+                with col1:
+                    if st.form_submit_button("保存配置", type="primary", use_container_width=True):
+                        update_data = {
+                            'enabled': enabled,
+                            'disable_for_tools': disable_for_tools,
+                            'token_threshold': token_threshold
+                        }
+                        
+                        result = call_api('/admin/config/anti-detection', 'POST', data=update_data)
+                        if result and result.get('success'):
+                            st.success("防检测配置已更新")
+                            clear_cache()
+                            st.rerun()
+                        else:
+                            st.error("更新防检测配置失败")
+                
+                with col2:
+                    if st.form_submit_button("测试防检测", use_container_width=True):
+                        test_result = call_api('/admin/test/anti-detection', 'POST')
+                        if test_result and test_result.get('success'):
+                            st.success("防检测功能测试成功")
+                            with st.expander("测试结果详情"):
+                                st.json(test_result)
+                        else:
+                            st.error("防检测功能测试失败")
+
+        else:
+            st.error("无法获取防检测配置数据")
+
 # --- 页脚 ---
 st.markdown(
     f"""
     <div style='text-align: center; color: rgba(255, 255, 255, 0.7); font-size: 0.8125rem; margin-top: 4rem; padding: 2rem 0; border-top: 1px solid rgba(255, 255, 255, 0.15); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); background: rgba(255, 255, 255, 0.05); border-radius: 16px 16px 0 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);'>
         <a href='{API_BASE_URL}/health' target='_blank' style='color: rgba(255, 255, 255, 0.8); text-decoration: none; transition: all 0.3s ease; padding: 0.25rem 0.5rem; border-radius: 6px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);' onmouseover='this.style.color="white"; this.style.background="rgba(255, 255, 255, 0.1)"; this.style.textShadow="0 0 8px rgba(255, 255, 255, 0.5)";' onmouseout='this.style.color="rgba(255, 255, 255, 0.8)"; this.style.background="transparent"; this.style.textShadow="none";'>健康检查</a> · 
         <span style='color: rgba(255, 255, 255, 0.6);'>{API_BASE_URL}</span> ·
-        <span style='color: rgba(255, 255, 255, 0.6);'>v1.5</span>
+        <span style='color: rgba(255, 255, 255, 0.6);'>v1.3.2</span>
     </div>
     """,
     unsafe_allow_html=True
