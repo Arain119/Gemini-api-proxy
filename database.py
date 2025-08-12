@@ -805,8 +805,10 @@ class Database:
                 else:
                     consecutive_failures = row['consecutive_failures'] + 1
                     failure_threshold = int(self.get_config('failure_threshold', '3'))
-                    # 只要失败就标记为unhealthy，让用户可以立即感知到问题
-                    health_status = 'unhealthy'
+                    if consecutive_failures >= failure_threshold:
+                        health_status = 'unhealthy'
+                    else:
+                        health_status = 'untested'
 
                 # 更新数据库
                 cursor.execute('''
