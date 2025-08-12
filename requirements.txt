@@ -1,7 +1,7 @@
 # 核心 API 服务依赖
 fastapi==0.108.0
 uvicorn==0.25.0
-httpx>=0.28.1
+aiohttp>=3.9.3  # 替代 httpx
 pydantic>=2.0.0,<3.0.0
 APScheduler==3.10.4
 psutil==5.9.6
@@ -19,4 +19,4 @@ requests==2.31.0
 python-multipart==0.0.6
 
 # Gemini 2.5 多模态支持
-google-genai>=0.3.0
+google-genai>=1.0.0
