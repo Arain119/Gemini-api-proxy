@@ -75,6 +75,7 @@ Branch: main
 访问 `https://gemini-proxy-admin-xxx.onrender.com`
 
 你将看到 Streamlit 管理界面，现在可以开始配置 API 密钥了！
+**配置密钥后，务必点击一下健康检测按钮才能正常使用！**
 
 ---
 
