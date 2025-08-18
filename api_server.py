@@ -11,6 +11,7 @@ import random
 import hashlib
 import io  # 用于 google-genai 文件上传
 import itertools  # 轮询计数器
+import copy  # 用于深拷贝请求对象
 _rr_counter = itertools.count()  # 全局递增计数器
 _rr_lock = asyncio.Lock()  # 轮询锁
 from datetime import datetime, timedelta
@@ -417,7 +418,7 @@ async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, 
         # SDK 默认 httpx 超时较高，这里通过 asyncio.wait_for 施加整体超时
         response = await asyncio.wait_for(
             client.aio.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.5-flash-lite",
                 contents="Hello",
                 config=types.GenerateContentConfig(
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
@@ -606,7 +607,8 @@ async def collect_gemini_response_directly(
         key_id: int,
         gemini_request: Dict,
         openai_request: ChatCompletionRequest,
-        model_name: str
+        model_name: str,
+        use_stream: bool = True
 ) -> Dict:
     """
     从Google API收集完整响应
@@ -630,18 +632,27 @@ async def collect_gemini_response_directly(
     total_tokens = 0
     finish_reason = "stop"
     processed_lines = 0
+
+    # 防截断相关变量
+    anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
+    full_response = ""
+    saw_finish_tag = False
     start_time = time.time()
 
     try:
         client = get_cached_client(gemini_key)
-        # 使用 google-genai 的流式接口
-        async with asyncio.timeout(timeout):
+        if use_stream:
+            # 使用 google-genai 的流式接口，并在每个 chunk 间重置超时计时
             genai_stream = await client.aio.models.generate_content_stream(
                 model=model_name,
                 contents=gemini_request["contents"],
                 config=gemini_request.get("generation_config")
             )
-            async for chunk in genai_stream:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(genai_stream.__anext__(), timeout)
+                except StopAsyncIteration:
+                    break
                 # chunk.candidates 列表结构与 REST 回包保持一致
                 # SDK 对象转为 dict，字段与官方 REST 保持同名，兼容新旧版本 SDK
                 data = chunk.to_dict() if hasattr(chunk, "to_dict") else json.loads(chunk.model_dump_json())
@@ -690,13 +701,81 @@ async def collect_gemini_response_directly(
         )
         raise
 
-    # 检查是否收集到内容
+    else:
+            # 非流式直接调用
+            try:
+                response_obj = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=gemini_request["contents"],
+                    config=gemini_request.get("generation_config")
+                )
+                data = response_obj.to_dict() if hasattr(response_obj, "to_dict") else json.loads(response_obj.model_dump_json())
+                for candidate in data.get("candidates", []):
+                    finish_reason_raw = candidate.get("finishReason", "stop")
+                    finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
+                    for part in candidate.get("content", {}).get("parts", []):
+                        text = part.get("text", "")
+                        if text:
+                            complete_content += text
+                            total_tokens += len(text.split())
+                response_time = time.time() - start_time
+                asyncio.create_task(
+                    update_key_performance_background(key_id, True, response_time)
+                )
+            except Exception as e:
+                response_time = time.time() - start_time
+                asyncio.create_task(
+                    update_key_performance_background(key_id, False, response_time)
+                )
+                raise
+
+        # 检查是否收集到内容
     if not complete_content.strip():
         logger.error(f"No content collected directly. Processed {processed_lines} lines")
         raise HTTPException(
             status_code=502,
             detail="No content received from Google API"
         )
+
+    # Anti-truncation handling for non-stream response
+    anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
+    if anti_trunc_cfg.get('enabled'):
+        max_attempts = anti_trunc_cfg.get('max_attempts', 3)
+        attempt = 0
+        while True:
+            trimmed = complete_content.rstrip()
+            if trimmed.endswith('[finish]'):
+                complete_content = trimmed[:-8].rstrip()
+                break
+            if attempt >= max_attempts:
+                logger.info("Anti-truncation enabled but reached max attempts without [finish].")
+                break
+            attempt += 1
+            logger.info(f"Anti-truncation attempt {attempt}: continue fetching content")
+            # 构造新的请求，在末尾追加继续提示
+            continuation_request = copy.deepcopy(gemini_request)
+            continuation_request['contents'].append({
+                "role": "user",
+                "parts": [{
+                    "text": "继续，请以 [finish] 结尾"
+                }]
+            })
+            try:
+                cont_response = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=continuation_request["contents"],
+                    config=continuation_request.get("generation_config")
+                )
+                data = cont_response.to_dict() if hasattr(cont_response, "to_dict") else json.loads(cont_response.model_dump_json())
+                for candidate in data.get("candidates", []):
+                    for part in candidate.get("content", {}).get("parts", []):
+                        text = part.get("text", "")
+                        if text:
+                            complete_content += text
+                            total_tokens += len(text.split())
+            except Exception as e:
+                logger.warning(f"Anti-truncation continuation attempt failed: {e}")
+                break
 
     # 计算token使用量
     prompt_tokens = len(str(openai_request.messages).split())
@@ -817,6 +896,18 @@ async def make_request_with_fast_failover(
 
             key_info = selection_result['key_info']
             logger.info(f"Fast failover attempt {attempt + 1}: Using key #{key_info['id']}")
+
+            # ====== 计算 should_stream_to_gemini ======
+            stream_to_gemini_mode = db.get_stream_to_gemini_mode_config().get('mode', 'auto')
+            has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+            if has_tool_calls:
+                should_stream_to_gemini = False
+            elif stream_to_gemini_mode == 'stream':
+                should_stream_to_gemini = True
+            elif stream_to_gemini_mode == 'non_stream':
+                should_stream_to_gemini = False
+            else:
+                should_stream_to_gemini = True
 
             try:
                 # 确定超时时间：工具调用或快速响应模式使用60秒，其他使用配置值
@@ -966,6 +1057,10 @@ async def stream_gemini_response_single_attempt(
             thinking_sent = False
             has_content = False
             processed_lines = 0
+            # Anti-truncation related variables
+            anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
+            full_response = ""
+            saw_finish_tag = False
 
             logger.info("Stream response started")
 
@@ -981,6 +1076,17 @@ async def stream_gemini_response_single_attempt(
                                     continue
                                 total_tokens += len(text.split())
                                 has_content = True
+                                # Anti-truncation handling (stream)
+                                if anti_trunc_cfg.get('enabled'):
+                                    idx = text.find('[finish]')
+                                    if idx != -1:
+                                        text_to_send = text[:idx]
+                                        saw_finish_tag = True
+                                    else:
+                                        text_to_send = text
+                                else:
+                                    text_to_send = text
+                                full_response += text_to_send
 
                                 is_thought = getattr(part, "thought", False)
                                 if is_thought and not (openai_request.thinking_config and openai_request.thinking_config.include_thoughts):
@@ -1022,7 +1128,7 @@ async def stream_gemini_response_single_attempt(
                                     "model": openai_request.model,
                                     "choices": [{
                                         "index": 0,
-                                        "delta": {"content": text},
+                                        "delta": {"content": text_to_send},
                                         "finish_reason": None
                                     }]
                                 }
@@ -1143,6 +1249,18 @@ async def stream_with_fast_failover(
             key_info = selection_result['key_info']
             logger.info(f"Stream fast failover attempt {attempt + 1}: Using key #{key_info['id']}")
 
+            # ====== 计算 should_stream_to_gemini ======
+            stream_to_gemini_mode = db.get_stream_to_gemini_mode_config().get('mode', 'auto')
+            has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+            if has_tool_calls:
+                should_stream_to_gemini = False
+            elif stream_to_gemini_mode == 'stream':
+                should_stream_to_gemini = True
+            elif stream_to_gemini_mode == 'non_stream':
+                should_stream_to_gemini = False
+            else:
+                should_stream_to_gemini = True
+
             success = False
             total_tokens = 0
 
@@ -1224,6 +1342,45 @@ async def stream_with_fast_failover(
     yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
     yield "data: [DONE]\n\n".encode('utf-8')
 
+
+async def stream_non_stream_keep_alive(
+        gemini_request: Dict,
+        openai_request: ChatCompletionRequest,
+        model_name: str,
+        user_key_info: Dict = None
+) -> AsyncGenerator[bytes, None]:
+    """向 Gemini 使用非流式接口，但对客户端保持 SSE 流式格式。先发送 keep-alive 空 chunk，再完整返回内容。"""
+    # 立即发送一次空注释保持连接
+    yield b":\n\n"
+
+    try:
+        # 根据是否启用快速故障转移选择请求路径
+        if await should_use_fast_failover():
+            openai_response = await make_request_with_fast_failover(
+                gemini_request,
+                openai_request,
+                model_name,
+                user_key_info=user_key_info
+            )
+        else:
+            openai_response = await make_request_with_failover(
+                gemini_request,
+                openai_request,
+                model_name,
+                user_key_info=user_key_info
+            )
+
+        # 将完整响应再次封装为单次 data 事件
+        yield f"data: {json.dumps(openai_response, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+    except HTTPException as e:
+        error_data = {"error": {"message": e.detail, "code": e.status_code}}
+        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+    except Exception as e:
+        error_data = {"error": {"message": str(e), "code": 500}}
+        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
 
 # 配置管理函数
 async def should_use_fast_failover() -> bool:
@@ -1525,7 +1682,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Gemini API Proxy",
     description="",
-    version="1.4",
+    version="1.4.2",
     lifespan=lifespan
 )
 
@@ -1621,7 +1778,7 @@ def get_actual_model_name(request_model: str) -> str:
         logger.info(f"Using requested model: {request_model}")
         return request_model
 
-    default_model = db.get_config('default_model_name', 'gemini-2.5-flash')
+    default_model = db.get_config('default_model_name', 'gemini-2.5-flash-lite')
     logger.info(f"Unsupported model: {request_model}, using default: {default_model}")
     return default_model
 
@@ -1664,6 +1821,18 @@ def inject_prompt_to_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
                 original_content = new_messages[i].get_text_content()
                 new_content = f"{original_content}\n\n{content}"
                 new_messages[i] = ChatMessage(role='user', content=new_content)
+                break
+
+    # Anti-truncation prompt injection
+    anti_truncation_cfg = db.get_anti_truncation_config()
+    if anti_truncation_cfg.get('enabled'):
+        for i in range(len(new_messages) - 1, -1, -1):
+            if new_messages[i].role == 'user':
+                suffix = "请以 [finish] 结尾"
+                if isinstance(new_messages[i].content, str):
+                    new_messages[i] = ChatMessage(role='user', content=f"{new_messages[i].content}\n\n{suffix}")
+                elif isinstance(new_messages[i].content, list):
+                    new_messages[i].content.append(suffix)
                 break
 
     return new_messages
@@ -2213,6 +2382,18 @@ async def make_request_with_failover(
 
             logger.info(f"Attempt {attempt + 1}: Using key #{key_info['id']} for {model_name}")
 
+            # ====== 计算 should_stream_to_gemini ======
+            stream_to_gemini_mode = db.get_stream_to_gemini_mode_config().get('mode', 'auto')
+            has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+            if has_tool_calls:
+                should_stream_to_gemini = False
+            elif stream_to_gemini_mode == 'stream':
+                should_stream_to_gemini = True
+            elif stream_to_gemini_mode == 'non_stream':
+                should_stream_to_gemini = False
+            else:
+                should_stream_to_gemini = True
+
             try:
                 # 直接从Google API收集完整响应（传统故障转移）
                 logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']} (traditional failover)")
@@ -2454,6 +2635,12 @@ async def stream_gemini_response(
                 total_tokens = 0
                 thinking_sent = False
                 processed_chunks = 0
+                
+                # 防截断相关变量
+                anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
+                full_response = ""
+                continuation_attempted = False
+                saw_finish_tag = False
 
                 async for chunk in genai_stream:
                     processed_chunks += 1
@@ -2561,6 +2748,17 @@ async def stream_gemini_response(
 
                                                 total_tokens += len(text.split())
                                                 has_content = True
+                                                # Anti-truncation handling
+                                                if anti_trunc_cfg.get('enabled'):
+                                                    idx = text.find('[finish]')
+                                                    if idx != -1:
+                                                        text_to_send = text[:idx]
+                                                        saw_finish_tag = True
+                                                    else:
+                                                        text_to_send = text
+                                                else:
+                                                    text_to_send = text
+                                                full_response += text_to_send
 
                                                 is_thought = part.get("thought", False)
 
@@ -2782,7 +2980,7 @@ async def root():
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.4",
+        "version": "1.4.2",
         "features": ["Gemini 2.5 Multimodal"],
         "keep_alive": keep_alive_enabled,
         "auto_cleanup": db.get_auto_cleanup_config()['enabled'],
@@ -2816,7 +3014,7 @@ async def health_check():
         "environment": "render" if os.getenv('RENDER_EXTERNAL_URL') else "local",
         "uptime_seconds": int(uptime),
         "request_count": request_count,
-        "version": "1.4",
+        "version": "1.4.2",
         "multimodal_support": "Gemini 2.5 Optimized",
         "keep_alive_enabled": keep_alive_enabled,
         "auto_cleanup_enabled": db.get_auto_cleanup_config()['enabled'],
@@ -2860,7 +3058,7 @@ async def get_status():
     return {
         "service": "Gemini API Proxy",
         "status": "running",
-        "version": "1.4",
+        "version": "1.4.2",
         "render_url": os.getenv('RENDER_EXTERNAL_URL'),
         "python_version": sys.version,
         "models": db.get_supported_models(),
@@ -2932,7 +3130,7 @@ async def api_v1_info():
 
     return {
         "service": "Gemini API Proxy",
-        "version": "1.4",
+        "version": "1.4.2",
         "api_version": "v1",
         "compatibility": "OpenAI API v1",
         "description": "A high-performance proxy for Gemini API with OpenAI compatibility.",
@@ -3307,6 +3505,10 @@ async def chat_completions(
         # 获取管理者配置的流式模式
         stream_mode_config = db.get_stream_mode_config()
         stream_mode = stream_mode_config.get('mode', 'auto')
+
+        # 获取与 Gemini 通信的流式模式
+        stream_to_gemini_mode_config = db.get_stream_to_gemini_mode_config()
+        stream_to_gemini_mode = stream_to_gemini_mode_config.get('mode', 'auto')
         
         # 检查是否有工具调用
         has_tool_calls = bool(request.tools or request.tool_choice)
@@ -3327,9 +3529,33 @@ async def chat_completions(
             logger.info("Stream mode forced to non-streaming")
         # stream_mode == 'auto' 时保持原有逻辑，跟随用户请求
 
-        logger.info(f"DEBUG: Final should_stream={should_stream}")
+        # ===== 计算向 Gemini 的流式模式 =====
+        should_stream_to_gemini = True  # 默认向 Gemini 使用流式
+        if has_tool_calls:
+            should_stream_to_gemini = False
+            logger.info("Tool calls detected, forcing non-streaming mode to Gemini")
+        elif stream_to_gemini_mode == 'stream':
+            should_stream_to_gemini = True
+            logger.info("Gemini stream mode forced to streaming")
+        elif stream_to_gemini_mode == 'non_stream':
+            should_stream_to_gemini = False
+            logger.info("Gemini stream mode forced to non-streaming")
+        # auto 时保持默认
+
+        logger.info(f"DEBUG: Final should_stream={should_stream}, should_stream_to_gemini={should_stream_to_gemini}")
 
         if should_stream:
+            # 当客户端要求流式，但向 Gemini 使用非流式时，走 keep-alive 兼容路径
+            if not should_stream_to_gemini:
+                return StreamingResponse(
+                    stream_non_stream_keep_alive(
+                        gemini_request,
+                        request,
+                        actual_model_name,
+                        user_key_info=user_key_info
+                    ),
+                    media_type="text/event-stream; charset=utf-8"
+                )
             if await should_use_fast_failover():
                 return StreamingResponse(
                     stream_with_fast_failover(
@@ -3795,6 +4021,45 @@ async def test_anti_detection():
         logger.error(f"Anti-detection test failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# 防截断管理端点
+@app.post("/admin/config/anti-truncation", summary="更新防截断配置", tags=["管理 API：配置"])
+async def update_anti_truncation_config(request: dict):
+    """
+    **更新防截断配置**
+
+    修改防截断功能的状态。
+    - **enabled**: `true` 或 `false`
+    """
+    try:
+        enabled = request.get('enabled')
+        if enabled is None:
+            raise HTTPException(status_code=422, detail="Parameter 'enabled' is required")
+        if db.set_config('anti_truncation_enabled', 'true' if enabled else 'false'):
+            logger.info(f"Anti-truncation enabled: {enabled}")
+            return {"success": True, "message": "Anti-truncation configuration updated successfully", "anti_truncation_enabled": enabled}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update anti-truncation configuration")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update anti-truncation config: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/config/anti-truncation", summary="获取防截断配置", tags=["管理 API：配置"])
+async def get_anti_truncation_config():
+    """
+    **获取防截断配置**
+
+    返回防截断功能的当前状态。
+    """
+    try:
+        enabled = db.get_config('anti_truncation_enabled', 'false').lower() == 'true'
+        return {"success": True, "anti_truncation_enabled": enabled}
+    except Exception as e:
+        logger.error(f"Failed to get anti-truncation config: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # 保活管理端点
 @app.post("/admin/keep-alive/toggle", summary="切换保活状态", tags=["管理 API：配置"])
@@ -4364,6 +4629,35 @@ async def update_stream_mode_config(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+@app.post("/admin/config/stream-to-gemini-mode", summary="更新向 Gemini 流式模式配置", tags=["管理 API：配置"])
+async def update_stream_to_gemini_mode_config(request: dict):
+    """
+    **更新向 Gemini 流式模式配置**
+
+    修改向 Gemini 后端发送请求时的流式行为。
+    - **mode**: 'auto', 'stream', 'non_stream'
+    """
+    try:
+        mode = request.get("mode")
+        success = db.set_stream_to_gemini_mode_config(mode=mode)
+
+        if success:
+            logger.info(f"Updated stream_to_gemini_mode config: mode={mode}")
+            return {
+                "success": True,
+                "message": "Stream-to-Gemini mode configuration updated successfully"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update stream-to-Gemini mode configuration")
+
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to update stream_to_gemini_mode config: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/admin/config/load-balance", summary="更新负载均衡策略", tags=["管理 API：配置"])
 async def update_load_balance_config(request: dict):
     """
@@ -4425,6 +4719,7 @@ async def get_all_config():
             "cleanup_config": cleanup_config,
             "anti_detection_config": anti_detection_config,
             "stream_mode_config": stream_mode_config,
+            "stream_to_gemini_mode_config": db.get_stream_to_gemini_mode_config(),
             "failover_config": failover_config
         }
     except Exception as e:
@@ -4457,6 +4752,7 @@ async def get_admin_stats():
         "anti_detection_enabled": db.get_config('anti_detection_enabled', 'true').lower() == 'true',
         "anti_detection_stats": anti_detection.get_statistics(),
         "stream_mode_config": db.get_stream_mode_config(),
+        "stream_to_gemini_mode_config": db.get_stream_to_gemini_mode_config(),
         "failover_config": db.get_failover_config()
     }
 

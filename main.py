@@ -45,7 +45,7 @@ def call_api(endpoint: str, method: str = 'GET', data: Any = None, timeout: int 
                 response = requests.post(url, json=data, timeout=timeout)
             elif method == 'DELETE':
                 response = requests.delete(url, timeout=timeout)
-            else:
+
                 raise ValueError(f"不支持的方法: {method}")
 
             if response.status_code == 200:
@@ -2023,14 +2023,15 @@ with st.sidebar:
 
     # API密钥状态
     if service_status['online']:
-        st.markdown(f'''
-        <div class="sidebar-status-card">
-            <div class="sidebar-status-title">API 密钥</div>
-            <div class="sidebar-status-content">
-                <div class="sidebar-status-text">{service_status['healthy_keys']} / {service_status['active_keys']} 正常</div>
-            </div>
-        </div>
+        st.markdown(f'''\
+        <div class="sidebar-status-card">\
+            <div class="sidebar-status-title">API 密钥</div>\
+            <div class="sidebar-status-content">\
+                <div class="sidebar-status-text">{service_status['healthy_keys']} / {service_status['active_keys']} 正常</div>\
+            </div>\
+        </div>\
         ''', unsafe_allow_html=True)
+
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2039,7 +2040,7 @@ with st.sidebar:
     <div class="sidebar-footer">
         <div class="sidebar-footer-content">
             <div class="sidebar-footer-item">
-                <span>版本 v1.4</span>
+                <span>版本 v1.4.2</span>
             </div>
             <div class="sidebar-footer-item">
                 <a href="{API_BASE_URL}/docs" target="_blank" class="sidebar-footer-link">API 文档</a>
@@ -2130,8 +2131,8 @@ if page == "控制台":
 
             model_config_data = get_cached_model_config(model)
             if not model_config_data:
-                rpm_limit = 10 if 'flash' in model else 5
-                rpd_limit = 250 if 'flash' in model else 100
+                rpm_limit = 15 if 'flash-lite' in model else (10 if 'flash' in model else 5)
+                rpd_limit = 1000 if 'flash-lite' in model else (250 if 'flash' in model else 100)
             else:
                 rpm_limit = model_config_data.get('total_rpm_limit', 10)
                 rpd_limit = model_config_data.get('total_rpd_limit', 250)
@@ -2169,7 +2170,7 @@ if page == "控制台":
                     marker_line=dict(width=0),
                     hovertemplate='<b>%{x}</b><br>使用率: %{y:.1f}%<br>当前: %{customdata[0]:,}<br>限制: %{customdata[1]:,}<extra></extra>',
                     customdata=df[['RPM Used', 'RPM Limit']].values
-                ))
+))
                 fig_rpm.update_layout(
                     title="每分钟请求数 (RPM)",
                     title_font=dict(size=16, color='#1f2937', family='-apple-system, BlinkMacSystemFont'),
@@ -2196,6 +2197,7 @@ if page == "控制台":
                     'modeBarButtonsToRemove': ['select2d', 'lasso2d', 'zoomIn2d', 'zoomOut2d', 'autoScale2d',
                                                'resetScale2d']
                 })
+
 
             with col2:
                 fig_rpd = go.Figure()
@@ -2302,6 +2304,7 @@ elif page == "密钥管理":
                                     for invalid in result.get('invalid_keys', []):
                                         st.error(f"- {invalid}")
 
+                        # 更新成功后刷新列表
                         st.cache_data.clear()
                         time.sleep(1)
                         st.rerun()
@@ -2321,6 +2324,7 @@ elif page == "密钥管理":
                                 for duplicate in result.get('duplicate_keys', []):
                                     st.write(f"- {duplicate}")
                 else:
+                    st.error(result.get('message', '保存失败'))
                     st.error("网络错误，请重试")
 
         st.markdown('<hr style="margin: 2rem 0;">', unsafe_allow_html=True)
@@ -2333,11 +2337,10 @@ elif page == "密钥管理":
             if st.button("健康检测", help="检测所有密钥状态", key="health_check_gemini"):
                 with st.spinner("检测中..."):
                     result = check_all_keys_health()
-                    if result and result.get('success'):
-                        st.success(result['message'])
-                        st.cache_data.clear()
-                        time.sleep(1)
-                        st.rerun()
+                    st.success(result['message'])
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
         with col3:
             show_full_keys = st.checkbox("显示完整", key="show_gemini_full")
 
@@ -2480,7 +2483,7 @@ client = openai.OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gemini-2.5-flash",
+    model="gemini-2.5-flash-lite",
     messages=[{{"role": "user", "content": "Hello"}}]
 )
                         """, language="python")
@@ -2588,7 +2591,7 @@ elif page == "模型配置":
                 rpm = st.number_input(
                     "RPM (每分钟请求)",
                     min_value=1,
-                    value=current_config.get('single_api_rpm_limit', 10 if 'flash' in model else 5),
+                    value=current_config.get('single_api_rpm_limit', 15 if 'flash-lite' in model else (10 if 'flash' in model else 5)),
                     key=f"rpm_{model}"
                 )
 
@@ -2596,7 +2599,7 @@ elif page == "模型配置":
                 rpd = st.number_input(
                     "RPD (每日请求)",
                     min_value=1,
-                    value=current_config.get('single_api_rpd_limit', 250 if 'flash' in model else 100),
+                    value=current_config.get('single_api_rpd_limit', 1000 if 'flash-lite' in model else (250 if 'flash' in model else 100)),
                     key=f"rpd_{model}"
                 )
 
@@ -2628,12 +2631,12 @@ elif page == "模型配置":
 
                 result = call_api(f'/admin/models/{model}', 'POST', data=update_data)
                 if result and result.get('success'):
-                    st.success("配置已保存")
+
                     st.cache_data.clear()
                     time.sleep(1)
                     st.rerun()
                 else:
-                    st.error("保存失败")
+                    st.error(result.get('message', '保存失败'))
 
 elif page == "系统设置":
     st.title("系统设置")
@@ -2647,8 +2650,8 @@ elif page == "系统设置":
         st.stop()
 
     # 包含故障转移配置的标签页
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "思考模式", "提示词注入", "流式模式", "负载均衡", "故障转移", "自动清理", "防检测", "系统信息"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "思考模式", "提示词注入", "流式模式", "负载均衡", "故障转移", "自动清理", "防检测", "防截断", "系统信息"
     ])
 
     with tab1:
@@ -2867,7 +2870,8 @@ elif page == "系统设置":
             col1, col2 = st.columns([1, 1])
 
             with col1:
-                st.markdown("**模式选择**")
+                st.markdown("**流式输出模式**")
+
                 mode_options = {
                     'auto': '自动模式',
                     'stream': '强制流式',
@@ -2883,37 +2887,56 @@ elif page == "系统设置":
                 )
 
             with col2:
-                st.markdown("**模式说明**")
-                mode_descriptions = {
-                    'auto': "根据用户请求参数决定，提供最佳的兼容性",
-                    'stream': "所有响应都使用流式输出，适合实时交互场景",
-                    'non_stream': "所有响应都等待完整生成，适合批处理场景"
+
+                # 嵌入流式请求模式选择
+                st.markdown("**流式请求模式**")
+
+                gemini_mode_options = {
+                    'stream': '流式',
+                    'non_stream': '非流式'
                 }
-
-                st.info(mode_descriptions[selected_mode])
-
-            # 性能影响说明
-            st.markdown("**性能影响**")
-            if selected_mode == 'stream':
-                st.success("流式模式可以提供更快的首字响应时间，提升用户体验")
-            elif selected_mode == 'non_stream':
-                st.warning("非流式模式会增加响应延迟，但能确保完整的响应内容")
-            else:
-                st.info("自动模式提供最佳的兼容性，推荐在大多数情况下使用")
+                current_stg_mode = stats_data.get('stream_to_gemini_mode_config', {}).get('mode', 'stream')
+                selected_stg_mode = st.selectbox(
+                    "流式请求模式",
+                    options=list(gemini_mode_options.keys()),
+                    format_func=lambda x: gemini_mode_options[x],
+                    index=list(gemini_mode_options.keys()).index(current_stg_mode if current_stg_mode in gemini_mode_options else 'stream'),
+                    help="选择与 Gemini 通信时的流式策略"
+                )
+    
 
             if st.form_submit_button("保存配置", type="primary", use_container_width=True):
-                update_data = {
-                    "mode": selected_mode
-                }
+                update_data_stream = {"mode": selected_mode}
+                update_data_gemini = {"mode": selected_stg_mode}
 
-                result = call_api('/admin/config/stream-mode', 'POST', data=update_data)
-                if result and result.get('success'):
+                res_stream = call_api('/admin/config/stream-mode', 'POST', data=update_data_stream)
+                res_gemini = call_api('/admin/config/stream-to-gemini-mode', 'POST', data=update_data_gemini)
+                if (res_stream and res_stream.get('success')) and (res_gemini and res_gemini.get('success')):
                     st.success("配置已保存")
                     st.cache_data.clear()
                     time.sleep(1)
                     st.rerun()
                 else:
                     st.error("保存失败")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     with tab4:
         st.markdown("#### 负载均衡策略")
@@ -3531,12 +3554,52 @@ elif page == "系统设置":
             st.error("无法获取防检测配置数据")
 
     with tab8:
+        st.markdown("#### 防截断配置")
+        st.markdown("启用或禁用防截断处理功能")
+
+        trunc_conf = call_api('/admin/config/anti-truncation', 'GET')
+        if trunc_conf is not None:
+            current_enabled = trunc_conf.get('anti_truncation_enabled', False)
+            status_text = "已启用" if current_enabled else "已禁用"
+            status_color = "#10b981" if current_enabled else "#ef4444"
+            st.markdown(f'''
+            <div style="background: linear-gradient(135deg, rgba(34, 197, 94, 0.1) 0%, rgba(59, 130, 246, 0.1) 100%); 
+                        border: 1px solid rgba(34, 197, 94, 0.2); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <h5 style="margin: 0; color: #374151; font-size: 1.1rem;">防截断状态</h5>
+                        <p style="margin: 0.5rem 0 0 0; color: #6b7280; font-size: 0.9rem;">
+                            当前状态: {status_text}
+                        </p>
+                    </div>
+                    <div style="background: {status_color}; color: white; padding: 0.5rem 1rem; border-radius: 8px; font-weight: 500;">
+                        {status_text}
+                    </div>
+                </div>
+            </div>
+            ''', unsafe_allow_html=True)
+
+            with st.form("anti_trunc_form"):
+                enable_trunc = st.checkbox("启用防截断功能", value=current_enabled)
+
+                if st.form_submit_button("保存配置", type="primary", use_container_width=True):
+                    res = call_api('/admin/config/anti-truncation', 'POST', data={'enabled': enable_trunc})
+                    if res and res.get('success'):
+                        st.success("防截断配置已更新")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error("更新防截断配置失败")
+        else:
+            st.error("无法获取防截断配置数据")
+
+    with tab9:
         st.markdown("#### 系统信息")
         st.markdown("查看系统运行状态和资源使用情况")
 
         # 系统概览
         python_version = status_data.get('python_version', 'Unknown').split()[0]
-        version = status_data.get('version', '1.4')
+        version = status_data.get('version', '1.4.2')
         uptime_hours = status_data.get('uptime_seconds', 0) // 3600
 
         st.markdown(f'''
@@ -3652,7 +3715,7 @@ st.markdown(
     <div style='text-align: center; color: rgba(255, 255, 255, 0.7); font-size: 0.8125rem; margin-top: 4rem; padding: 2rem 0; border-top: 1px solid rgba(255, 255, 255, 0.15); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); background: rgba(255, 255, 255, 0.05); border-radius: 16px 16px 0 0; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);'>
         <a href='{API_BASE_URL}/health' target='_blank' style='color: rgba(255, 255, 255, 0.8); text-decoration: none; transition: all 0.3s ease; padding: 0.25rem 0.5rem; border-radius: 6px; backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);' onmouseover='this.style.color="white"; this.style.background="rgba(255, 255, 255, 0.1)"; this.style.textShadow="0 0 8px rgba(255, 255, 255, 0.5)";' onmouseout='this.style.color="rgba(255, 255, 255, 0.8)"; this.style.background="transparent"; this.style.textShadow="none";'>健康检查</a> · 
         <span style='color: rgba(255, 255, 255, 0.6);'>{API_BASE_URL}</span> ·
-        <span style='color: rgba(255, 255, 255, 0.6);'>v1.4</span>
+        <span style='color: rgba(255, 255, 255, 0.6);'>v1.4.2</span>
     </div>
     """,
     unsafe_allow_html=True

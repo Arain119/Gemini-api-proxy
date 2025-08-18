@@ -233,7 +233,7 @@ class Database:
     def _init_system_config(self, cursor):
         """初始化系统配置"""
         default_configs = [
-            ('default_model_name', 'gemini-2.5-flash', '默认模型名称'),
+            ('default_model_name', 'gemini-2.5-flash-lite', '默认模型名称'),
             ('max_retries', '3', 'API请求最大重试次数（已废弃，保留兼容性）'),
             ('request_timeout', '60', 'API请求超时时间（秒）'),
             ('load_balance_strategy', 'adaptive', '负载均衡策略: least_used, round_robin, adaptive'),
@@ -267,6 +267,9 @@ class Database:
 
             # 防自动化检测配置
             ('anti_detection_enabled', 'true', '是否启用防自动化检测'),
+
+            # 防截断配置
+            ('anti_truncation_enabled', 'false', '是否启用防截断功能'),
             
             # 流式模式配置
             ('stream_mode', 'auto', '流式模式设置: auto=自动, stream=流式, non_stream=非流式'),
@@ -285,14 +288,19 @@ class Database:
         """初始化模型配置（单个API限制）"""
         default_models = [
             ('gemini-2.5-flash', 10, 250000, 250),  # 单API: RPM, TPM, RPD
+            ('gemini-2.5-flash-lite', 15, 250000, 1000),  # 单API: RPM, TPM, RPD
             ('gemini-2.5-pro', 5, 250000, 100),  # 单API: RPM, TPM, RPD
         ]
 
         for model_name, rpm, tpm, rpd in default_models:
             try:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO model_configs (model_name, single_api_rpm_limit, single_api_tpm_limit, single_api_rpd_limit)
+                    INSERT INTO model_configs (model_name, single_api_rpm_limit, single_api_tpm_limit, single_api_rpd_limit)
                     VALUES (?, ?, ?, ?)
+                    ON CONFLICT(model_name) DO UPDATE SET
+                        single_api_rpm_limit=excluded.single_api_rpm_limit,
+                        single_api_tpm_limit=excluded.single_api_tpm_limit,
+                        single_api_rpd_limit=excluded.single_api_rpd_limit
                 ''', (model_name, rpm, tpm, rpd))
             except Exception as e:
                 logger.error(f"Failed to insert model config {model_name}: {e}")
@@ -455,6 +463,32 @@ class Database:
             logger.error(f"Failed to set stream mode config: {e}")
             return False
 
+    # 与 Gemini 服务通信时的流式模式配置
+    def get_stream_to_gemini_mode_config(self) -> Dict[str, any]:
+        """获取与 Gemini 通信的流式模式配置"""
+        try:
+            return {
+                'mode': self.get_config('stream_to_gemini_mode', 'auto')
+            }
+        except Exception as e:
+            logger.error(f"Failed to get stream_to_gemini_mode config: {e}")
+            return {
+                'mode': 'auto'
+            }
+
+    def set_stream_to_gemini_mode_config(self, mode: str = None) -> bool:
+        """设置与 Gemini 通信的流式模式配置"""
+        try:
+            if mode is not None:
+                if mode not in ['auto', 'stream', 'non_stream']:
+                    raise ValueError("mode must be one of: auto, stream, non_stream")
+                self.set_config('stream_to_gemini_mode', mode)
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set stream_to_gemini_mode config: {e}")
+            return False
+
     # 故障转移配置方法
     def get_failover_config(self) -> Dict[str, any]:
         """获取故障转移配置"""
@@ -520,10 +554,33 @@ class Database:
             logger.error(f"Failed to set anti detection config: {e}")
             return False
 
+    # 防截断配置方法
+    def get_anti_truncation_config(self) -> Dict[str, any]:
+        """获取防截断配置"""
+        try:
+            return {
+                'enabled': self.get_config('anti_truncation_enabled', 'false').lower() == 'true'
+            }
+        except Exception as e:
+            logger.error(f"Failed to get anti truncation config: {e}")
+            return {
+                'enabled': False
+            }
+
+    def set_anti_truncation_config(self, enabled: bool = None) -> bool:
+        """设置防截断配置"""
+        try:
+            if enabled is not None:
+                self.set_config('anti_truncation_enabled', 'true' if enabled else 'false')
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set anti truncation config: {e}")
+            return False
     # 模型配置管理
     def get_supported_models(self) -> List[str]:
         """获取支持的模型列表"""
-        return ['gemini-2.5-flash', 'gemini-2.5-pro']
+        return ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro']
 
     def get_model_config(self, model_name: str) -> Optional[Dict]:
         """获取模型配置（包含计算的总限制）"""

@@ -75,7 +75,6 @@ Branch: main
 访问 `https://gemini-proxy-admin-xxx.onrender.com`
 
 你将看到 Streamlit 管理界面，现在可以开始配置 API 密钥了！
-**配置密钥后，务必点击一下健康检测按钮才能正常使用！**
 
 ---
 
@@ -181,7 +180,7 @@ client = openai.OpenAI(
 
 # 文本 + 图片对话
 response = client.chat.completions.create(
-    model="gemini-2.5-flash",
+    model="gemini-2.5-flash-lite",
     messages=[
         {
             "role": "user",
@@ -248,6 +247,7 @@ print(response.choices[0].message.content)
 ### 系统设置
 - 🧠 思考模式配置
 - 📝 提示词注入
+- ✂️ 防截断功能开关
 - 📋 系统状态监控
 
 ## 🆓 Render 免费层说明
