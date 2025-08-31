@@ -13,7 +13,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, db_queue=None):
+        self.db_queue = db_queue
         # Render 环境下使用持久化路径
         if db_path is None:
             if os.getenv('RENDER_EXTERNAL_URL'):
@@ -72,7 +73,11 @@ class Database:
                     total_requests INTEGER DEFAULT 0,
                     successful_requests INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    breaker_status TEXT DEFAULT 'active' NOT NULL,
+                    last_failure_timestamp INTEGER DEFAULT 0 NOT NULL,
+                    ema_success_rate REAL DEFAULT 1.0 NOT NULL,
+                    ema_response_time REAL DEFAULT 0.0 NOT NULL
                 )
             ''')
 
@@ -99,6 +104,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS model_configs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     model_name TEXT UNIQUE NOT NULL,
+                    display_name TEXT UNIQUE,
                     single_api_rpm_limit INTEGER NOT NULL,
                     single_api_tpm_limit INTEGER NOT NULL,
                     single_api_rpd_limit INTEGER NOT NULL,
@@ -116,7 +122,12 @@ class Database:
                     name TEXT,
                     status INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used TIMESTAMP
+                    last_used TIMESTAMP,
+                    tpm_limit INTEGER DEFAULT -1,
+                    rpd_limit INTEGER DEFAULT -1,
+                    rpm_limit INTEGER DEFAULT -1,
+                    valid_until TIMESTAMP DEFAULT NULL,
+                    max_concurrency INTEGER DEFAULT -1
                 )
             ''')
 
@@ -129,6 +140,7 @@ class Database:
                     model_name TEXT,
                     requests INTEGER DEFAULT 0,
                     tokens INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'success',
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (gemini_key_id) REFERENCES gemini_keys (id),
                     FOREIGN KEY (user_key_id) REFERENCES user_keys (id)
@@ -181,10 +193,43 @@ class Database:
                 cursor.execute("ALTER TABLE gemini_keys ADD COLUMN total_requests INTEGER DEFAULT 0")
             if 'successful_requests' not in columns:
                 cursor.execute("ALTER TABLE gemini_keys ADD COLUMN successful_requests INTEGER DEFAULT 0")
+            if 'breaker_status' not in columns:
+                cursor.execute("ALTER TABLE gemini_keys ADD COLUMN breaker_status TEXT DEFAULT 'active' NOT NULL")
+            if 'last_failure_timestamp' not in columns:
+                cursor.execute("ALTER TABLE gemini_keys ADD COLUMN last_failure_timestamp INTEGER DEFAULT 0 NOT NULL")
+            if 'ema_success_rate' not in columns:
+                cursor.execute("ALTER TABLE gemini_keys ADD COLUMN ema_success_rate REAL DEFAULT 1.0 NOT NULL")
+            if 'ema_response_time' not in columns:
+                cursor.execute("ALTER TABLE gemini_keys ADD COLUMN ema_response_time REAL DEFAULT 0.0 NOT NULL")
+
+            # 检查usage_logs表是否有status字段
+            cursor.execute("PRAGMA table_info(usage_logs)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'status' not in columns:
+                cursor.execute("ALTER TABLE usage_logs ADD COLUMN status TEXT DEFAULT 'success'")
+
+            # 检查user_keys表是否有新字段
+            cursor.execute("PRAGMA table_info(user_keys)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'tpm_limit' not in columns:
+                cursor.execute("ALTER TABLE user_keys ADD COLUMN tpm_limit INTEGER DEFAULT -1")
+            if 'rpd_limit' not in columns:
+                cursor.execute("ALTER TABLE user_keys ADD COLUMN rpd_limit INTEGER DEFAULT -1")
+            if 'rpm_limit' not in columns:
+                cursor.execute("ALTER TABLE user_keys ADD COLUMN rpm_limit INTEGER DEFAULT -1")
+            if 'valid_until' not in columns:
+                cursor.execute("ALTER TABLE user_keys ADD COLUMN valid_until TIMESTAMP DEFAULT NULL")
+            if 'max_concurrency' not in columns:
+                cursor.execute("ALTER TABLE user_keys ADD COLUMN max_concurrency INTEGER DEFAULT -1")
+
 
             # 检查model_configs表结构
             cursor.execute("PRAGMA table_info(model_configs)")
             columns = [column[1] for column in cursor.fetchall()]
+
+            if 'display_name' not in columns:
+                cursor.execute("ALTER TABLE model_configs ADD COLUMN display_name TEXT")
+                cursor.execute("UPDATE model_configs SET display_name = model_name WHERE display_name IS NULL")
 
             if 'rpm_limit' in columns:
                 # 需要迁移到新的单API限制结构
@@ -253,7 +298,7 @@ class Database:
             # 思考功能配置
             ('thinking_enabled', 'true', '是否启用思考功能'),
             ('thinking_budget', '-1', '思考预算（token数）：-1=自动，0=禁用，1-32768=固定预算'),
-            ('include_thoughts', 'false', '是否在响应中包含思考过程'),
+            ('include_thoughts', 'true', '是否在响应中包含思考过程'),
 
             # 注入prompt配置
             ('inject_prompt_enabled', 'false', '是否启用注入prompt'),
@@ -270,9 +315,19 @@ class Database:
 
             # 防截断配置
             ('anti_truncation_enabled', 'false', '是否启用防截断功能'),
+
+            # 响应解密配置
+            ('enable_response_decryption', 'false', '是否启用响应自动解密'),
             
             # 流式模式配置
-            ('stream_mode', 'auto', '流式模式设置: auto=自动, stream=流式, non_stream=非流式'),
+            ('stream_mode', 'auto', 'Stream mode setting: auto, stream, non_stream'),
+            ('deepthink_enabled', 'false', 'Enable DeepThink mode for multi-step reasoning'),
+            ('deepthink_concurrency', '3', 'Default concurrency for DeepThink mode (3-7)'),
+
+            # 搜索功能配置
+            ('search_enabled', 'false', '启用搜索模式进行网页抓取'),
+            ('search_num_queries', '3', '搜索查询次数'),
+            ('search_num_pages_per_query', '3', '每次查询的页面数'),
         ]
 
         for key, value, description in default_configs:
@@ -349,7 +404,7 @@ class Database:
         return {
             'enabled': self.get_config('thinking_enabled', 'true').lower() == 'true',
             'budget': int(self.get_config('thinking_budget', '-1')),
-            'include_thoughts': self.get_config('include_thoughts', 'false').lower() == 'true'
+            'include_thoughts': self.get_config('include_thoughts', 'true').lower() == 'true'
         }
 
     def set_thinking_config(self, enabled: bool = None, budget: int = None, include_thoughts: bool = None) -> bool:
@@ -577,6 +632,84 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to set anti truncation config: {e}")
             return False
+
+    # 响应解密配置方法
+    def get_response_decryption_config(self) -> Dict[str, any]:
+        """获取响应解密配置"""
+        try:
+            return {
+                'enabled': self.get_config('enable_response_decryption', 'false').lower() == 'true'
+            }
+        except Exception as e:
+            logger.error(f"Failed to get response decryption config: {e}")
+            return {'enabled': False}
+
+    def set_response_decryption_config(self, enabled: bool = None) -> bool:
+        """设置响应解密配置"""
+        try:
+            if enabled is not None:
+                self.set_config('enable_response_decryption', 'true' if enabled else 'false')
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set response decryption config: {e}")
+            return False
+
+    # DeepThink配置方法
+    def get_deepthink_config(self) -> Dict[str, any]:
+        """获取DeepThink配置"""
+        try:
+            return {
+                'enabled': self.get_config('deepthink_enabled', 'false').lower() == 'true',
+                'concurrency': int(self.get_config('deepthink_concurrency', '3'))
+            }
+        except Exception as e:
+            logger.error(f"Failed to get deepthink config: {e}")
+            return {'enabled': False, 'concurrency': 3}
+
+    def set_deepthink_config(self, enabled: bool = None, concurrency: int = None) -> bool:
+        """设置DeepThink配置"""
+        try:
+            if enabled is not None:
+                self.set_config('deepthink_enabled', 'true' if enabled else 'false')
+            
+            if concurrency is not None:
+                if not (3 <= concurrency <= 7):
+                    raise ValueError("Concurrency must be between 3 and 7")
+                self.set_config('deepthink_concurrency', str(concurrency))
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set deepthink config: {e}")
+            return False
+
+    # 搜索配置方法
+    def get_search_config(self) -> Dict[str, any]:
+        """获取搜索配置"""
+        try:
+            return {
+                'enabled': self.get_config('search_enabled', 'false').lower() == 'true',
+                'num_queries': int(self.get_config('search_num_queries', '3')),
+                'num_pages_per_query': int(self.get_config('search_num_pages_per_query', '3')),
+            }
+        except Exception as e:
+            logger.error(f"Failed to get search config: {e}")
+            return {'enabled': False, 'num_queries': 3, 'num_pages_per_query': 3}
+
+    def set_search_config(self, enabled: bool = None, num_queries: int = None, num_pages_per_query: int = None) -> bool:
+        """设置搜索配置"""
+        try:
+            if enabled is not None:
+                self.set_config('search_enabled', 'true' if enabled else 'false')
+            if num_queries is not None:
+                self.set_config('search_num_queries', str(num_queries))
+            if num_pages_per_query is not None:
+                self.set_config('search_num_pages_per_query', str(num_pages_per_query))
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set search config: {e}")
+            return False
+            
     # 模型配置管理
     def get_supported_models(self) -> List[str]:
         """获取支持的模型列表"""
@@ -646,7 +779,7 @@ class Database:
     def update_model_config(self, model_name: str, **kwargs) -> bool:
         """更新模型配置"""
         try:
-            allowed_fields = ['single_api_rpm_limit', 'single_api_tpm_limit', 'single_api_rpd_limit', 'status']
+            allowed_fields = ['display_name', 'single_api_rpm_limit', 'single_api_tpm_limit', 'single_api_rpd_limit', 'status']
             fields = []
             values = []
 
@@ -697,7 +830,8 @@ class Database:
         try:
             allowed_fields = ['status', 'health_status', 'consecutive_failures',
                               'last_check_time', 'success_rate', 'avg_response_time',
-                              'total_requests', 'successful_requests']
+                              'total_requests', 'successful_requests', 'breaker_status',
+                              'last_failure_timestamp', 'ema_success_rate', 'ema_response_time']
             fields = []
             values = []
 
@@ -745,25 +879,28 @@ class Database:
             return []
 
     def get_available_gemini_keys(self) -> List[Dict]:
-        """获取所有可用的Gemini Keys"""
+        """获取所有可用的Gemini Keys (排除了熔断的key)"""
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""                SELECT id, key, health_status, success_rate, avg_response_time
-                FROM gemini_keys 
-                WHERE status = 1
-                ORDER BY 
-                    CASE health_status
-                        WHEN 'healthy' THEN 1
-                        WHEN 'untested' THEN 2
-                        WHEN 'rate_limited' THEN 3
-                        ELSE 4
-                    END, 
-                    success_rate DESC, 
-                    avg_response_time ASC
-            """)
-                keys = cursor.fetchall()
-                return [{'id': k[0], 'key': k[1], 'health_status': k[2]} for k in keys]
+                # 增加了 breaker_status != 'tripped' 的过滤条件
+                # 增加了 ema_success_rate 和 ema_response_time 用于排序和返回
+                cursor.execute("""
+                    SELECT id, key, health_status, success_rate, avg_response_time, 
+                           ema_success_rate, ema_response_time, consecutive_failures, last_failure_timestamp
+                    FROM gemini_keys 
+                    WHERE status = 1 AND breaker_status != 'tripped'
+                    ORDER BY 
+                        CASE health_status
+                            WHEN 'healthy' THEN 1
+                            WHEN 'untested' THEN 2
+                            WHEN 'rate_limited' THEN 3
+                            ELSE 4
+                        END, 
+                        ema_success_rate DESC, 
+                        ema_response_time ASC
+                """)
+                return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to get available Gemini keys: {e}")
             return []
@@ -781,6 +918,17 @@ class Database:
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to get healthy Gemini keys: {e}")
+            return []
+
+    def get_unhealthy_gemini_keys(self) -> List[Dict]:
+        """获取所有异常的Gemini Keys"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM gemini_keys WHERE health_status = 'unhealthy' AND status = 1")
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Failed to get unhealthy Gemini keys: {e}")
             return []
 
     def toggle_gemini_key_status(self, key_id: int) -> bool:
@@ -861,11 +1009,7 @@ class Database:
                     health_status = 'healthy'
                 else:
                     consecutive_failures = row['consecutive_failures'] + 1
-                    failure_threshold = int(self.get_config('failure_threshold', '3'))
-                    if consecutive_failures >= failure_threshold:
-                        health_status = 'unhealthy'
-                    else:
-                        health_status = 'untested'
+                    health_status = 'unhealthy'
 
                 # 更新数据库
                 cursor.execute('''
@@ -1217,10 +1361,42 @@ class Database:
             logger.error(f"Failed to get user key {key_id}: {e}")
             return None
 
+    def get_user_key_usage_stats(self, user_key_id: int, time_window: str) -> Dict[str, int]:
+        """获取指定用户密钥在指定时间窗口内的使用统计"""
+        try:
+            time_deltas = {
+                'minute': timedelta(minutes=1),
+                'day': timedelta(days=1)
+            }
+
+            if time_window not in time_deltas:
+                raise ValueError(f"Invalid time window: {time_window}")
+
+            cutoff_time = datetime.now() - time_deltas[time_window]
+
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT
+                        COALESCE(SUM(requests), 0) as total_requests,
+                        COALESCE(SUM(tokens), 0) as total_tokens
+                    FROM usage_logs
+                    WHERE user_key_id = ? AND timestamp > ?
+                ''', (user_key_id, cutoff_time))
+
+                row = cursor.fetchone()
+                return {
+                    'requests': row['total_requests'],
+                    'tokens': row['total_tokens']
+                }
+        except Exception as e:
+            logger.error(f"Failed to get user key usage stats for {user_key_id}: {e}")
+            return {'requests': 0, 'tokens': 0}
+
     def update_user_key(self, key_id: int, **kwargs) -> bool:
         """更新用户Key信息"""
         try:
-            allowed_fields = ['name', 'status']
+            allowed_fields = ['name', 'status', 'tpm_limit', 'rpd_limit', 'rpm_limit', 'valid_until', 'max_concurrency']
             fields = []
             values = []
 
@@ -1286,18 +1462,37 @@ class Database:
             return {'daily_stats': [], 'total_stats': {'total_requests': 0, 'total_tokens': 0}}
 
     # 使用记录管理
-    def log_usage(self, gemini_key_id: int, user_key_id: int, model_name: str, requests: int = 1, tokens: int = 0):
-        """记录使用量（按模型）"""
+    def log_usage(self, gemini_key_id: int, user_key_id: int, model_name: str, status: str = 'success', requests: int = 1, tokens: int = 0):
+        """Asynchronously log usage by putting it in a queue."""
+        if self.db_queue:
+            task = {
+                "gemini_key_id": gemini_key_id,
+                "user_key_id": user_key_id,
+                "model_name": model_name,
+                "status": status,
+                "requests": requests,
+                "tokens": tokens,
+            }
+            try:
+                self.db_queue.put_nowait(("log_usage", task))
+            except asyncio.QueueFull:
+                logger.warning("Database queue is full. Falling back to synchronous logging.")
+                self.log_usage_sync(**task)
+        else:
+            self.log_usage_sync(gemini_key_id, user_key_id, model_name, status, requests, tokens)
+
+    def log_usage_sync(self, gemini_key_id: int, user_key_id: int, model_name: str, status: str = 'success', requests: int = 1, tokens: int = 0):
+        """Synchronously log usage to the database."""
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO usage_logs (gemini_key_id, user_key_id, model_name, requests, tokens)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (gemini_key_id, user_key_id, model_name, requests, tokens))
+                    INSERT INTO usage_logs (gemini_key_id, user_key_id, model_name, status, requests, tokens)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (gemini_key_id, user_key_id, model_name, status, requests, tokens))
                 conn.commit()
         except Exception as e:
-            logger.error(f"Failed to log usage: {e}")
+            logger.error(f"Failed to log usage synchronously: {e}")
 
     def get_usage_stats(self, model_name: str, time_window: str = 'minute') -> Dict[str, int]:
         """获取指定模型在指定时间窗口内的使用统计"""
@@ -1347,6 +1542,49 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to get all usage stats: {e}")
             return {}
+
+    def get_hourly_stats_for_last_24_hours(self) -> List[Dict]:
+        """获取过去24小时每小时的请求统计"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT
+                        strftime('%Y-%m-%d %H:00:00', timestamp) as hour,
+                        COUNT(*) as total_requests,
+                        SUM(CASE WHEN status = 'failure' THEN 1 ELSE 0 END) as failed_requests
+                    FROM usage_logs
+                    WHERE timestamp >= datetime('now', '-24 hours')
+                    GROUP BY hour
+                    ORDER BY hour
+                ''')
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Failed to get hourly stats: {e}")
+            return []
+
+    def get_recent_usage_logs(self, limit: int = 100) -> List[Dict]:
+        """获取最近的使用记录"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT
+                        ul.timestamp,
+                        ul.model_name,
+                        ul.tokens,
+                        ul.status,
+                        uk.name as user_key_name
+                    FROM usage_logs ul
+                    LEFT JOIN user_keys uk ON ul.user_key_id = uk.id
+                    WHERE ul.timestamp >= datetime('now', '-24 hours')
+                    ORDER BY ul.timestamp DESC
+                    LIMIT ?
+                ''', (limit,))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Failed to get recent usage logs: {e}")
+            return []
 
     def get_model_usage_rate(self, model_name: str) -> float:
         """获取模型使用率（基于RPM）"""
@@ -1405,7 +1643,7 @@ class Database:
 
         return stats
 
-    def cleanup_old_logs(self, days: int = 30) -> int:
+    def cleanup_old_logs(self, days: int = 1) -> int:
         """清理旧的使用日志"""
         try:
             cutoff_date = datetime.now() - timedelta(days=days)
@@ -1424,7 +1662,7 @@ class Database:
             logger.error(f"Failed to cleanup old logs: {e}")
             return 0
 
-    def cleanup_old_health_history(self, days: int = 90) -> int:
+    def cleanup_old_health_history(self, days: int = 1) -> int:
         """清理旧的健康检测历史"""
         try:
             cutoff_date = datetime.now() - timedelta(days=days)
