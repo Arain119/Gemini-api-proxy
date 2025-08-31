@@ -1565,7 +1565,7 @@ def render_system_settings_page():
         st.markdown("管理自动化检测防护功能")
         if anti_detection_data:
             anti_detection_config = anti_detection_data.get('config', {})
-            current_enabled = anti_detection_config.get('anti_detection_enabled', False)
+            current_enabled = anti_detection_config.get('anti_detection_enabled', True)
             current_disable_for_tools = anti_detection_config.get('disable_for_tools', True) 
             current_token_threshold = anti_detection_config.get('token_threshold', 5000)
             with st.form("anti_detection_form"):
