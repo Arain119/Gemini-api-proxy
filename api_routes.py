@@ -16,8 +16,8 @@ from fastapi import (APIRouter, Depends, File, Header, HTTPException,
                      UploadFile)
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from api_models import ChatCompletionRequest
-from api_services import (_execute_deepthink_preprocessing, execute_search_flow, make_request_with_failover,
+from api_models import ChatCompletionRequest, EmbeddingRequest, GeminiEmbeddingRequest
+from api_services import (_execute_deepthink_preprocessing, create_embeddings, create_gemini_native_embeddings, execute_search_flow, make_request_with_failover,
                           make_request_with_fast_failover,
                           should_use_fast_failover,
                           stream_non_stream_keep_alive,
@@ -421,6 +421,57 @@ async def list_models(db: Database = Depends(get_db)):
     model_list = [{"id": model, "object": "model", "created": int(time.time()), "owned_by": "google"} for model in models]
     return {"object": "list", "data": model_list}
 
+@router.post("/v1/embeddings", summary="创建嵌入", tags=["用户 API"])
+async def embeddings(
+    request: EmbeddingRequest,
+    authorization: str = Header(None),
+    db: Database = Depends(get_db),
+    rate_limiter: RateLimitCache = Depends(get_rate_limiter)
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    user_key_info = db.validate_user_key(authorization.replace("Bearer ", ""))
+    if not user_key_info:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    try:
+        user_rate_limiter = UserRateLimiter(db, user_key_info)
+        user_rate_limiter.check_rate_limits()
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error during user rate limit check: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during rate limit check")
+
+    response = await create_embeddings(db, rate_limiter, request, user_key_info)
+    return JSONResponse(content=response.dict())
+
+@router.post("/v1/models/{model_name:path}:embedContent", summary="创建原生Gemini嵌入", tags=["用户 API"])
+async def gemini_native_embeddings(
+    model_name: str,
+    request: GeminiEmbeddingRequest,
+    authorization: str = Header(None),
+    db: Database = Depends(get_db),
+    rate_limiter: RateLimitCache = Depends(get_rate_limiter)
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    user_key_info = db.validate_user_key(authorization.replace("Bearer ", ""))
+    if not user_key_info:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    try:
+        user_rate_limiter = UserRateLimiter(db, user_key_info)
+        user_rate_limiter.check_rate_limits()
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error during user rate limit check: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during rate limit check")
+
+    response = await create_gemini_native_embeddings(db, rate_limiter, request, model_name, user_key_info)
+    return JSONResponse(content=response.dict())
+
 # ===============================================================================
 # Admin API Routes
 # ===============================================================================
@@ -679,7 +730,6 @@ async def update_model_config_endpoint(model_name: str, request: dict, db: Datab
 
 @admin_router.get("/config", summary="获取所有系统配置")
 async def get_all_config_endpoint(db: Database = Depends(get_db)):
-    # This is the line that caused the 500 error, now fixed.
     return {
         "success": True,
         "system_configs": db.get_all_configs(),

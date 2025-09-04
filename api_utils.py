@@ -14,6 +14,7 @@ import itertools
 import copy
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, AsyncGenerator, Union, Any
+from functools import lru_cache
 
 from google import genai
 from google.genai import types
@@ -26,15 +27,10 @@ from api_models import ChatCompletionRequest, ChatMessage
 logger = logging.getLogger(__name__)
 
 # GenAI Client 缓存
-_client_cache: Dict[str, genai.Client] = {}
-
+@lru_cache(maxsize=32)
 def get_cached_client(api_key: str) -> genai.Client:
     """按 key 复用 google-genai Client，减小握手 & 日志开销"""
-    client = _client_cache.get(api_key)
-    if client is None:
-        client = genai.Client(api_key=api_key)
-        _client_cache[api_key] = client
-    return client
+    return genai.Client(api_key=api_key)
 
 # 防自动化检测注入器
 class GeminiAntiDetectionInjector:

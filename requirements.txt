@@ -16,6 +16,10 @@ streamlit>=1.29.0
 # HTTP 客户端（用于 Streamlit）
 requests==2.31.0
 
+# 网页解析
+beautifulsoup4==4.12.3
+googlesearch-python==1.2.3
+
 # 文件上传支持
 python-multipart==0.0.6
 

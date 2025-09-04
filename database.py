@@ -27,21 +27,22 @@ class Database:
                 db_path = "gemini_proxy.db"
 
         self.db_path = db_path
-        self.local = threading.local()
 
         # 初始化数据库
         self.init_db()
 
     @contextmanager
     def get_connection(self):
-        if not hasattr(self.local, 'conn'):
-            self.local.conn = sqlite3.connect(self.db_path)
-            self.local.conn.row_factory = sqlite3.Row
-            # 设置WAL模式以提高并发性能
-            self.local.conn.execute("PRAGMA journal_mode=WAL")
-            self.local.conn.execute("PRAGMA synchronous=NORMAL")
-            self.local.conn.execute("PRAGMA cache_size=1000")
-        yield self.local.conn
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        # 设置WAL模式以提高并发性能
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=1000")
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def init_db(self):
         with self.get_connection() as conn:
@@ -345,6 +346,7 @@ class Database:
             ('gemini-2.5-flash', 10, 250000, 250),  # 单API: RPM, TPM, RPD
             ('gemini-2.5-flash-lite', 15, 250000, 1000),  # 单API: RPM, TPM, RPD
             ('gemini-2.5-pro', 5, 250000, 100),  # 单API: RPM, TPM, RPD
+            ('gemini-embedding-001', 100, 30000, 1000), # 单API: RPM, TPM, RPD
         ]
 
         for model_name, rpm, tpm, rpd in default_models:
@@ -713,7 +715,7 @@ class Database:
     # 模型配置管理
     def get_supported_models(self) -> List[str]:
         """获取支持的模型列表"""
-        return ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro']
+        return ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro', 'gemini-embedding-001']
 
     def get_model_config(self, model_name: str) -> Optional[Dict]:
         """获取模型配置（包含计算的总限制）"""

@@ -170,3 +170,48 @@ class ChatCompletionRequest(BaseModel):
             }
             if self.reasoning_effort in budget_map:
                 self.thinking_config = ThinkingConfig(thinking_budget=budget_map[self.reasoning_effort])
+
+# Embedding Models
+class EmbeddingRequest(BaseModel):
+    model: str
+    input: Union[str, List[str]]
+    user: Optional[str] = None
+    task_type: Optional[str] = None
+    output_dimensionality: Optional[int] = None
+
+    class Config:
+        extra = "allow"
+
+class EmbeddingData(BaseModel):
+    object: str = "embedding"
+    embedding: List[float]
+    index: int
+
+class EmbeddingUsage(BaseModel):
+    prompt_tokens: int
+    total_tokens: int
+
+class EmbeddingResponse(BaseModel):
+    object: str = "list"
+    data: List[EmbeddingData]
+    model: str
+    usage: EmbeddingUsage
+
+# Gemini Native Embedding Models
+class EmbedContentConfig(BaseModel):
+    task_type: Optional[str] = None
+    output_dimensionality: Optional[int] = None
+
+class GeminiEmbeddingRequest(BaseModel):
+    contents: Union[str, List[str]]
+    config: Optional[EmbedContentConfig] = None
+    model: Optional[str] = None # Included for routing purposes, not part of official Gemini request body
+
+    class Config:
+        extra = "allow"
+
+class EmbeddingValue(BaseModel):
+    values: List[float]
+
+class GeminiEmbeddingResponse(BaseModel):
+    embeddings: List[EmbeddingValue]

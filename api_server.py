@@ -33,7 +33,7 @@ default_keep_alive = 'true' if os.getenv('RENDER') else 'false'
 keep_alive_enabled = os.getenv('ENABLE_KEEP_ALIVE', default_keep_alive).lower() == 'true'
 
 # Initialize database and anti-detection injector
-db_queue = Queue()
+db_queue = Queue(maxsize=10000)
 db = Database(db_queue=db_queue)
 anti_detection = GeminiAntiDetectionInjector()
 rate_limiter = RateLimitCache()

@@ -17,8 +17,10 @@ from google.genai import types
 from fastapi import HTTPException
 
 from database import Database
-from api_models import ChatCompletionRequest, ChatMessage
+from api_models import (ChatCompletionRequest, ChatMessage, EmbeddingRequest, EmbeddingResponse, EmbeddingData, EmbeddingUsage,
+                          GeminiEmbeddingRequest, GeminiEmbeddingResponse, EmbeddingValue)
 from api_utils import get_cached_client, map_finish_reason, decrypt_response, check_gemini_key_health, RateLimitCache, openai_to_gemini
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -1935,6 +1937,391 @@ async def cleanup_database_records(db: Database):
         logger.error(f"❌ Daily database cleanup failed: {e}")
 
 
+
+
+# Add necessary imports for the new search function
+from bs4 import BeautifulSoup
+
+
+
+async def search_duckduckgo_and_scrape(query: str, num_results: int = 3):
+    """
+    Performs a DuckDuckGo WEB search, scrapes the top results, and returns a formatted string.
+    """
+    logger.info(f"Starting DuckDuckGo WEB search and scrape for query: '{query}'")
+    try:
+        # Use the HTML version of DuckDuckGo for easier parsing
+        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10) as client:
+            # 1. Get the search results page
+            response = await client.get(search_url)
+            response.raise_for_status()
+            
+            # 2. Parse the search results to get URLs
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # Find all result containers. This selector might need adjustment if DDG changes their layout.
+            results_container = soup.find_all('div', class_='web-result')
+            
+            urls = []
+            for res in results_container[:num_results]:
+                url_element = res.find('a', class_='result__url')
+                if url_element and url_element.get('href'):
+                    urls.append(url_element['href'])
+
+            if not urls:
+                logger.warning(f"DuckDuckGo web search for '{query}' returned no URLs.")
+                return ""
+
+            # 3. Concurrently fetch content from the result URLs
+            tasks = [client.get(url) for url in urls]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 4. Parse content from each URL and create snippets
+        results = []
+        for i, resp in enumerate(responses):
+            if isinstance(resp, httpx.Response):
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                title = soup.title.string if soup.title else "No Title"
+                
+                paragraphs = [p.get_text() for p in soup.find_all('p')]
+                snippet = ' '.join(paragraphs[:3]).strip()
+                
+                if snippet:
+                    results.append(f"Source: {urls[i]}\nTitle: {title}\nContent: {snippet}")
+            else:
+                logger.warning(f"Failed to fetch URL {urls[i]}: {resp}")
+        
+        logger.info(f"Successfully scraped {len(results)} pages for query '{query}'.")
+        return "\n\n".join(results)
+
+    except Exception as e:
+        logger.error(f"DuckDuckGo web search and scrape failed for query '{query}': {e}")
+        return ""
+
+
+async def _get_search_plan_from_ai(
+    db: Database,
+    rate_limiter: RateLimitCache,
+    original_request: ChatCompletionRequest,
+    original_user_prompt: str,
+    user_key_info: Dict,
+    anti_detection: Any,
+) -> Optional[Dict]:
+    """
+    Calls the AI to generate a search plan (queries and pages).
+    """
+    logger.info("Getting search plan from AI...")
+    try:
+        # Use the default model for this lightweight task
+        planning_model = db.get_config('default_model_name', 'gemini-2.5-flash-lite')
+
+        # Get current time and format it
+        current_time_str = datetime.now(ZoneInfo("Asia/Shanghai")).strftime('%Y-%m-%d %H:%M:%S')
+        
+        planning_prompt = (
+            f"Current date is {current_time_str}. Based on the user's request, generate a JSON object with optimal search queries and the number of pages to crawl for each. "
+            f"User Request: '{original_user_prompt}'\n\n"
+            "Rules:\n"
+            "- Provide 1 to 3 distinct search queries.\n"
+            "- For each query, specify 'num_pages' between 2 and 5.\n"
+            "- Your response MUST be a valid JSON object in the following format, with no other text or explanations:\n"
+            '```json\n'
+            '{\n'
+            '  "search_tasks": [\n'
+            '    {"query": "keyword1", "num_pages": 3},\n'
+            '    {"query": "keyword2", "num_pages": 4}\n'
+            '  ]\n'
+            '}\n'
+            '```'
+        )
+
+        # Create a new, simple request for the planning step
+        planning_openai_request = ChatCompletionRequest(
+            model=original_request.model,
+            messages=[ChatMessage(role="user", content=planning_prompt)]
+        )
+        
+        planning_gemini_request = openai_to_gemini(db, planning_openai_request, anti_detection, {}, False)
+
+        # Make the internal call. _internal_call=True bypasses some logging/features.
+        response_dict = await make_request_with_fast_failover(
+            db, rate_limiter, planning_gemini_request, planning_openai_request, planning_model, user_key_info, _internal_call=True
+        )
+
+        ai_response_text = response_dict['choices'][0]['message']['content']
+        
+        # Clean up and parse JSON
+        json_str = ai_response_text.strip()
+        if '```json' in json_str:
+            json_str = json_str.split('```json')[1].strip()
+        if '```' in json_str:
+            json_str = json_str.split('```')[0].strip()
+        
+        plan = json.loads(json_str)
+
+        if isinstance(plan, dict) and 'search_tasks' in plan and isinstance(plan['search_tasks'], list):
+            logger.info(f"Successfully received search plan from AI: {plan}")
+            return plan
+        else:
+            logger.warning(f"AI search plan has invalid structure: {plan}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Failed to get or parse search plan from AI: {e}")
+        return None
+
+
+async def execute_search_flow(
+    db: Database,
+    rate_limiter: RateLimitCache,
+    original_request: ChatCompletionRequest,
+    model_name: str,
+    user_key_info: Dict,
+    anti_detection: Any,
+    file_storage: Dict,
+    enable_anti_detection: bool = False
+) -> Dict:
+    """
+    执行搜索流程, 使用 Google 搜索和页面抓取.
+    This version now uses an AI-driven planning step.
+    """
+    original_user_prompt = ""
+    if original_request.messages:
+        last_user_message = next((m.content for m in reversed(original_request.messages) if m.role == 'user'), None)
+        if last_user_message:
+            original_user_prompt = last_user_message.strip()
+
+    if not original_user_prompt:
+        raise HTTPException(status_code=400, detail="User prompt is missing for search.")
+
+    logger.info(f"Starting AI-driven search flow for prompt: '{original_user_prompt}'")
+
+    # 1. Get search plan from AI
+    search_plan = await _get_search_plan_from_ai(db, rate_limiter, original_request, original_user_prompt, user_key_info, anti_detection)
+
+    search_tasks_to_run = []
+    if search_plan and search_plan.get('search_tasks'):
+        logger.info("Executing AI-generated search plan.")
+        for task in search_plan['search_tasks']:
+            query = task.get('query')
+            num_pages = int(task.get('num_pages', 3))
+            if query:
+                search_tasks_to_run.append(search_duckduckgo_and_scrape(query, num_results=num_pages))
+    else:
+        logger.warning("Failed to get AI search plan, falling back to default behavior.")
+        search_config = db.get_search_config()
+        num_pages = search_config.get('num_pages_per_query', 3)
+        search_tasks_to_run.append(
+            search_duckduckgo_and_scrape(original_user_prompt, num_results=num_pages)
+        )
+
+    # 2. Concurrently perform searches and scrape results
+    if not search_tasks_to_run:
+        raise HTTPException(status_code=500, detail="Search plan resulted in no tasks to execute.")
+        
+    logger.info(f"Executing {len(search_tasks_to_run)} search/scrape tasks concurrently.")
+    search_results = await asyncio.gather(*search_tasks_to_run)
+
+    # 3. Aggregate results and build context
+    search_context = "\n\n".join(filter(None, search_results))
+
+    if not search_context.strip():
+        search_context = "No search results found."
+        logger.warning("All search queries returned no usable results.")
+    
+    logger.info(f"Aggregated search context length: {len(search_context)} chars")
+
+    # 4. Build the final prompt for the Gemini model
+    final_prompt = (
+        f"Please provide a comprehensive answer to the user's original request based on the following search results. "
+        f"Synthesize the information from the sources and provide a clear, coherent response. "
+        f"Do not simply list the results. Cite sources using [Source: URL] at the end of relevant sentences if possible.\n\n"
+        f"--- User's Request ---\n{original_user_prompt}\n\n"
+        f"--- Search Results ---\n{search_context}\n--- End of Search Results ---"
+    )
+
+    # 5. Modify the original request to include the new context-aware prompt
+    final_gemini_request = openai_to_gemini(db, original_request, anti_detection, file_storage, enable_anti_detection)
+    
+    if final_gemini_request['contents']:
+        for part in reversed(final_gemini_request['contents']):
+            if part.get('role') == 'user':
+                part['parts'] = [{'text': final_prompt}]
+                break
+
+    return final_gemini_request
+
+            
+
+
+
+async def create_embeddings(
+    db: Database,
+    rate_limiter: RateLimitCache,
+    request: EmbeddingRequest,
+    user_key_info: Dict
+) -> EmbeddingResponse:
+    """
+    Create embeddings for the given input.
+    """
+    model_name = request.model
+    contents = [request.input] if isinstance(request.input, str) else request.input
+    
+    config = {}
+    if request.task_type:
+        config['task_type'] = request.task_type
+    if request.output_dimensionality:
+        config['output_dimensionality'] = request.output_dimensionality
+
+    selection_result = await select_gemini_key_and_check_limits(db, rate_limiter, model_name)
+    if not selection_result:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded or no available keys.")
+
+    key_info = selection_result['key_info']
+    client = get_cached_client(key_info['key'])
+
+    try:
+        start_time = time.time()
+        result = await client.aio.models.embed_content(
+            model=model_name,
+            contents=contents,
+            config=types.EmbedContentConfig(**config) if config else None
+        )
+        response_time = time.time() - start_time
+        
+        asyncio.create_task(update_key_performance_background(db, key_info['id'], True, response_time))
+
+        embeddings = result.embeddings
+        embedding_data = [
+            EmbeddingData(embedding=e.values, index=i)
+            for i, e in enumerate(embeddings)
+        ]
+
+        prompt_tokens = sum(len(c.split()) for c in contents)
+        
+        usage = EmbeddingUsage(
+            prompt_tokens=prompt_tokens,
+            total_tokens=prompt_tokens
+        )
+
+        asyncio.create_task(
+            log_usage_background(
+                db,
+                key_info['id'],
+                user_key_info['id'],
+                model_name,
+                'success',
+                1,
+                prompt_tokens
+            )
+        )
+        await rate_limiter.add_usage(model_name, 1, prompt_tokens)
+
+        return EmbeddingResponse(
+            data=embedding_data,
+            model=model_name,
+            usage=usage
+        )
+
+    except Exception as e:
+        response_time = time.time() - start_time
+        asyncio.create_task(update_key_performance_background(db, key_info['id'], False, response_time, error_type="other"))
+        
+        asyncio.create_task(
+            log_usage_background(
+                db,
+                key_info['id'],
+                user_key_info['id'],
+                model_name,
+                'failure',
+                1,
+                0
+            )
+        )
+        await rate_limiter.add_usage(model_name, 1, 0)
+        
+        logger.error(f"Embedding creation failed for key #{key_info['id']}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def create_gemini_native_embeddings(
+    db: Database,
+    rate_limiter: RateLimitCache,
+    request: GeminiEmbeddingRequest,
+    model_name: str,
+    user_key_info: Dict
+) -> GeminiEmbeddingResponse:
+    """
+    Create embeddings using Gemini's native request and response format.
+    """
+    contents = [request.contents] if isinstance(request.contents, str) else request.contents
+    
+    config_dict = request.config.dict() if request.config else {}
+
+    selection_result = await select_gemini_key_and_check_limits(db, rate_limiter, model_name)
+    if not selection_result:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded or no available keys.")
+
+    key_info = selection_result['key_info']
+    client = get_cached_client(key_info['key'])
+
+    try:
+        start_time = time.time()
+        result = await client.aio.models.embed_content(
+            model=model_name,
+            contents=contents,
+            config=types.EmbedContentConfig(**config_dict) if config_dict else None
+        )
+        response_time = time.time() - start_time
+        
+        asyncio.create_task(update_key_performance_background(db, key_info['id'], True, response_time))
+
+        # Directly use the native response structure
+        embeddings = [EmbeddingValue(values=e.values) for e in result.embeddings]
+        
+        prompt_tokens = sum(len(str(c).split()) for c in contents)
+
+        asyncio.create_task(
+            log_usage_background(
+                db,
+                key_info['id'],
+                user_key_info['id'],
+                model_name,
+                'success',
+                1,
+                prompt_tokens
+            )
+        )
+        await rate_limiter.add_usage(model_name, 1, prompt_tokens)
+
+        return GeminiEmbeddingResponse(embeddings=embeddings)
+
+    except Exception as e:
+        response_time = time.time() - start_time
+        asyncio.create_task(update_key_performance_background(db, key_info['id'], False, response_time, error_type="other"))
+        
+        asyncio.create_task(
+            log_usage_background(
+                db,
+                key_info['id'],
+                user_key_info['id'],
+                model_name,
+                'failure',
+                1,
+                0
+            )
+        )
+        await rate_limiter.add_usage(model_name, 1, 0)
+        
+        logger.error(f"Native embedding creation failed for key #{key_info['id']}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 async def _execute_deepthink_preprocessing(
     db: Database,
     rate_limiter: RateLimitCache,
@@ -1946,172 +2333,144 @@ async def _execute_deepthink_preprocessing(
     file_storage: Dict,
     enable_anti_detection: bool = False
 ) -> Dict:
-    """DeepThink的预处理部分，返回最终的gemini_request"""
+    """
+    执行完整的“反思式DeepThink”流程，返回最终的gemini_request。
+    流程: 探索 -> 初步综合 -> 反思与二次规划 -> 最终综合
+    """
     original_user_prompt = next((m.content for m in original_request.messages if m.role == 'user'), '')
     if not original_user_prompt:
         raise HTTPException(status_code=400, detail="User prompt is missing.")
 
-    # 1. 生成N个新Prompt
-    prompt_generation_request = {
-        "contents": [{
-            "role": "user",
-            "parts": [{
-                "text": f"Based on the user's request, generate {concurrency} distinct and diverse thinking prompts to explore the problem from different angles. Return the prompts as a JSON array of strings. User request: \"{original_user_prompt}\""
-            }]
-        }],
-        "generation_config": { "temperature": 0.5, "maxOutputTokens": 2048, "response_mime_type": "application/json" }
-    }
-    
-    try:
-        temp_request = ChatCompletionRequest(model=original_request.model, messages=[{"role": "user", "content": "generate prompts"}])
-        response = await make_request_with_fast_failover(db, rate_limiter, prompt_generation_request, temp_request, model_name, user_key_info, _internal_call=True)
-        prompts = json.loads(response['choices'][0]['message']['content'])
-        if not isinstance(prompts, list) or len(prompts) != concurrency:
-            raise ValueError(f"Failed to generate {concurrency} valid prompts.")
-    except Exception as e:
-        logger.error(f"DeepThink prompt generation failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate thinking prompts.")
-
-    # 2. 并发执行
-    async def run_prompt(prompt):
-        request_body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generation_config": gemini_request.get("generation_config")}
+    # 内部辅助函数，用于执行子请求
+    async def _execute_sub_request(prompt: str, is_json: bool = False):
         try:
-            temp_req = ChatCompletionRequest(model=original_request.model, messages=[{"role": "user", "content": prompt}])
-            response = await make_request_with_fast_failover(db, rate_limiter, request_body, temp_req, model_name, user_key_info, _internal_call=True)
-            return response['choices'][0]['message']['content']
+            temp_req = ChatCompletionRequest(model=original_request.model, messages=[ChatMessage(role="user", content=prompt)])
+            gemini_req_body = openai_to_gemini(db, temp_req, anti_detection, file_storage, enable_anti_detection)
+            if is_json:
+                # Ensure generation_config exists and is a types.GenerationConfig object
+                if "generation_config" not in gemini_req_body or gemini_req_body["generation_config"] is None:
+                    gemini_req_body["generation_config"] = types.GenerationConfig()
+                # Set the response_mime_type attribute on the GenerationConfig object
+                gemini_req_body["generation_config"].response_mime_type = "application/json"
+
+            response = await make_request_with_fast_failover(db, rate_limiter, gemini_req_body, temp_req, model_name, user_key_info, _internal_call=True)
+            content = response['choices'][0]['message']['content']
+            return json.loads(content) if is_json else content
         except Exception as e:
-            logger.error(f"DeepThink sub-request failed for prompt '{prompt}': {e}")
-            return f"Error processing sub-request: {e}"
+            logger.error(f"DeepThink sub-request failed for prompt '{prompt[:100]}...': {e}")
+            return {"error": str(e)} if is_json else f"Error processing sub-request: {e}"
 
-    tasks = [run_prompt(p) for p in prompts]
-    answers = await asyncio.gather(*tasks)
+    # 内部辅助函数，用于执行搜索或推理
+    async def _run_exploration_prompt(prompt: str):
+        prompt = prompt.strip()
+        if prompt.lower().startswith('[search]'):
+            search_query = prompt[len('[search]'):].strip()
+            logger.info(f"DeepThink is executing a search for: '{search_query}'")
+            try:
+                search_result = await search_duckduckgo_and_scrape(search_query, num_results=3)
+                return f"Search results for '{search_query}':\n{search_result}" if search_result else f"No search results found for '{search_query}'."
+            except Exception as e:
+                logger.error(f"DeepThink sub-search failed for query '{search_query}': {e}")
+                return f"Error during search for '{search_query}': {e}"
+        else:
+            return await _execute_sub_request(prompt)
 
-    # 3. 综合提炼
-    explorations = "\n\n".join([f"Exploration {i+1}:\n\"{answer}\"" for i, answer in enumerate(answers)])
-    synthesis_prompt = f'Original user request: "{original_user_prompt}"\n\nBased on the original request and the following {concurrency} independent explorations, synthesize a final, high-quality answer.\n\n{explorations}\n\nSynthesized Answer:'
+    # --- 阶段一：并行探索 ---
+    logger.info("--- DeepThink Phase 1: Parallel Exploration ---")
+    prompt_gen_prompt = f"Based on the user's request, generate {concurrency} distinct and diverse thinking prompts to explore the problem from different angles. If a prompt requires real-time information or external data, include the keyword `[search]` at the beginning of that prompt string. Return the prompts as a JSON array of strings. User request: \"{original_user_prompt}\""
+    initial_prompts = await _execute_sub_request(prompt_gen_prompt, is_json=True)
+    if isinstance(initial_prompts, dict) and "error" in initial_prompts:
+        raise HTTPException(status_code=500, detail=f"Failed to generate initial prompts: {initial_prompts['error']}")
+    if not isinstance(initial_prompts, list):
+        raise HTTPException(status_code=500, detail="Initial prompt generation did not return a list.")
+
+    exploration_tasks = [_run_exploration_prompt(p) for p in initial_prompts]
+    exploration_results = await asyncio.gather(*exploration_tasks)
+    exploration_context = "\n\n".join([f"Exploration Result {i+1}:\n---\n{result}\n---" for i, result in enumerate(exploration_results)])
+
+    # --- 阶段二：初步综合与自我反思 ---
+    # 2.1 初步综合 (Drafting)
+    logger.info("--- DeepThink Phase 2.1: Initial Synthesis (Drafting) ---")
+    drafting_prompt = f"Original user request: \"{original_user_prompt}\"\n\nBased on the following exploration results, synthesize a comprehensive and well-structured 'preliminary answer draft'.\n\n{exploration_context}\n\nPreliminary Answer Draft:"
+    draft_answer = await _execute_sub_request(drafting_prompt)
+    if "Error processing sub-request" in draft_answer:
+        raise HTTPException(status_code=500, detail="Failed to create initial draft.")
+
+    # 2.2 批判性反思与二次规划 (Self-Correction)
+    logger.info("--- DeepThink Phase 2.2: Critical Reflection & Secondary Planning ---")
+    reflection_prompt = f"""
+    You are a 'Reflector AI'. Your task is to critically analyze a preliminary answer and plan for its improvement.
     
-    # 更新原始请求以包含综合提示
+    User's Original Request: "{original_user_prompt}"
+    
+    Preliminary Answer Draft:
+    ---
+    {draft_answer}
+    ---
+    
+    Your Tasks:
+    1.  **Analyze & Critique**: Evaluate the draft. Is it complete? Does it have logical gaps? Is the information sufficient?
+    2.  **Propose Improvements**: Clearly state what is missing or could be improved.
+    3.  **Plan Secondary Exploration**: Based on your critique, generate exactly 2 new, targeted exploration prompts to gather the missing information. If a prompt needs web search, prefix it with `[search]`.
+    
+    Return your response as a JSON object with three keys: "critique", "improvements", and "new_prompts" (which should be an array of 2 strings).
+    Example: {{ "critique": "...", "improvements": "...", "new_prompts": ["[search] latest market trends for AI", "Explain the technical challenges of..."] }}
+    """
+    reflection_result = await _execute_sub_request(reflection_prompt, is_json=True)
+    if isinstance(reflection_result, dict) and "error" in reflection_result:
+        raise HTTPException(status_code=500, detail=f"Failed during reflection stage: {reflection_result['error']}")
+    if not all(k in reflection_result for k in ["critique", "improvements", "new_prompts"]):
+        raise HTTPException(status_code=500, detail="Reflection stage returned malformed JSON.")
+
+    # --- 阶段三：最终答案生成 ---
+    # 3.1 二次探索
+    logger.info("--- DeepThink Phase 3.1: Secondary Exploration ---")
+    secondary_prompts = reflection_result.get("new_prompts", [])
+    secondary_tasks = [_run_exploration_prompt(p) for p in secondary_prompts]
+    secondary_results = await asyncio.gather(*secondary_tasks)
+    secondary_context = "\n\n".join([f"Secondary Exploration Result {i+1}:\n---\n{result}\n---" for i, result in enumerate(secondary_results)])
+
+    # 3.2 最终综合 (Finalization)
+    logger.info("--- DeepThink Phase 3.2: Final Synthesis ---")
+    final_synthesis_prompt = f"""
+    Your task is to generate a final, high-quality answer by integrating all available information.
+    
+    1.  **User's Original Request**: "{original_user_prompt}"
+    
+    2.  **Preliminary Draft**:
+        ---
+        {draft_answer}
+        ---
+        
+    3.  **Critique and Improvements Suggested**:
+        - Critique: {reflection_result.get('critique')}
+        - Improvements: {reflection_result.get('improvements')}
+        
+    4.  **Additional Information from Secondary Exploration**:
+        ---
+        {secondary_context}
+        ---
+        
+    Instructions:
+    - Revise and enhance the preliminary draft using the critique and the new information.
+    - Ensure the final answer is comprehensive, accurate, and directly addresses the user's original request.
+    - Produce only the final, polished answer without any extra commentary.
+    
+    Final Answer:
+    """
+    
+    # 更新原始请求以包含最终的综合提示
     final_request_messages = copy.deepcopy(original_request.messages)
-    # 替换或追加综合提示
     found_user = False
     for msg in reversed(final_request_messages):
         if msg.role == 'user':
-            msg.content = synthesis_prompt
+            msg.content = final_synthesis_prompt
             found_user = True
             break
     if not found_user:
-         final_request_messages.append({"role": "user", "content": synthesis_prompt})
+         final_request_messages.append(ChatMessage(role="user", content=final_synthesis_prompt))
 
     final_openai_request = original_request.copy(update={"messages": final_request_messages})
     
     # 4. 返回最终的gemini_request
-    return openai_to_gemini(db, final_openai_request, anti_detection, file_storage, enable_anti_detection=enable_anti_detection)
-
-async def execute_search_flow(
-    db: Database,
-    rate_limiter: RateLimitCache,
-    original_request: ChatCompletionRequest,
-    model_name: str,
-    user_key_info: Dict,
-    anti_detection: Any,
-    file_storage: Dict,
-    enable_anti_detection: bool = True
-) -> Dict:
-    """
-    执行由模型驱动的自主搜索流程.
-    """
-    original_user_prompt = next((m.content for m in original_request.messages if m.role == 'user'), '')
-    if not original_user_prompt:
-        raise HTTPException(status_code=400, detail="User prompt is missing for search.")
-
-    logger.info(f"Starting model-driven search flow for prompt: '{original_user_prompt}'")
-
-    # 1. 由模型生成搜索查询
-    search_queries = []
-    try:
-        generation_prompt = f"根据以下用户请求，生成一个或多个简洁有效的搜索查询，以全面回答该请求。以 JSON 数组的形式返回结果。用户请求：'{original_user_prompt}'"
-        query_generation_request = {
-            "contents": [{"role": "user", "parts": [{"text": generation_prompt}]}],
-            "generation_config": {"temperature": 0.5, "maxOutputTokens": 2048, "response_mime_type": "application/json"}
-        }
-        temp_request = ChatCompletionRequest(model=model_name, messages=[{"role": "user", "content": "generate queries"}])
-        response = await make_request_with_fast_failover(db, rate_limiter, query_generation_request, temp_request, model_name, user_key_info, _internal_call=True)
-        
-        queries_str = response['choices'][0]['message']['content']
-        search_queries = json.loads(queries_str)
-        
-        if not isinstance(search_queries, list) or not all(isinstance(q, str) for q in search_queries):
-            raise ValueError("Model did not return a valid JSON array of strings for search queries.")
-        
-        logger.info(f"Model generated {len(search_queries)} search queries: {search_queries}")
-
-    except Exception as e:
-        logger.error(f"Failed to generate search queries by model: {e}. Falling back to user prompt.")
-        search_queries = [original_user_prompt]
-
-    # 2. 并发执行搜索
-    async def search_duckduckgo(query: str):
-        try:
-            async with httpx.AsyncClient() as client:
-                params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
-                headers = {"User-Agent": "GeminiProxy/1.7.0"}
-                response = await client.get("https://api.duckduckgo.com/", params=params, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-                
-                results = []
-                if data.get("AbstractText"):
-                    results.append(f"Source: {data.get('AbstractSource', 'N/A')}\nContent: {data.get('AbstractText')}")
-                
-                related_topics = data.get("RelatedTopics", [])
-                for topic in related_topics:
-                    if "Text" in topic and len(results) < 3: # 每个查询最多补充到3条
-                        results.append(f"Result: {topic['Text']}")
-                
-                return f"--- Results for query '{query}' ---\n" + "\n\n".join(results) if results else ""
-        except Exception as e:
-            logger.warning(f"DuckDuckGo search failed for query '{query}': {e}")
-            return ""
-
-    search_tasks = [search_duckduckgo(query) for query in search_queries]
-    search_results = await asyncio.gather(*search_tasks)
-    
-    # 3. 聚合和格式化结果
-    search_context = "\n\n".join(filter(None, search_results))
-    if not search_context.strip():
-        search_context = "No search results found."
-        logger.warning("All search queries returned no usable results.")
-    else:
-        logger.info(f"Aggregated search context length: {len(search_context)} chars")
-
-    # 4. 构建最终的综合提示
-    beijing_time = datetime.now(ZoneInfo("Asia/Shanghai")).strftime('%Y-%m-%d %H:%M:%S')
-    
-    synthesis_prompt = f"""
-Please provide a comprehensive answer to the user's original request based on the following search results.
-The current Beijing time is {beijing_time}.
-
---- Search Results ---
-{search_context}
---- End of Search Results ---
-
-User's Original Request: "{original_user_prompt}"
-
-Final Answer:
-"""
-    
-    # 5. 更新原始请求的消息并返回最终的gemini_request
-    final_messages = copy.deepcopy(original_request.messages)
-    user_message_found = False
-    for msg in reversed(final_messages):
-        if msg.role == 'user':
-            msg.content = synthesis_prompt
-            user_message_found = True
-            break
-    
-    if not user_message_found:
-        final_messages.append(ChatMessage(role="user", content=synthesis_prompt))
-
-    final_openai_request = original_request.copy(update={"messages": final_messages})
-    
     return openai_to_gemini(db, final_openai_request, anti_detection, file_storage, enable_anti_detection=enable_anti_detection)
