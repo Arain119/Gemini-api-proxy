@@ -1,7 +1,9 @@
+import json
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import time
+import streamlit.components.v1 as components
 from app_utils import (
     API_BASE_URL,
     call_api,
@@ -386,9 +388,20 @@ def render_key_management_page():
 
             if auth_url and st.session_state.get('cli_auth_popup_state') != cli_auth_info.get('state'):
                 st.session_state['cli_auth_popup_state'] = cli_auth_info.get('state')
-                st.markdown(
-                    f"<script>window.open('{auth_url}', '_blank');</script>",
-                    unsafe_allow_html=True,
+                escaped_url = json.dumps(auth_url)
+                components.html(
+                    f"""
+                    <script>
+                    (function() {{
+                        const url = {escaped_url};
+                        const opened = window.open(url, '_blank', 'noopener');
+                        if (!opened) {{
+                            window.location.href = url;
+                        }}
+                    }})();
+                    </script>
+                    """,
+                    height=0,
                 )
 
             if st.button("我已完成授权，清除提示", key="clear_cli_auth", type="secondary"):

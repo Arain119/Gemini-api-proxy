@@ -211,14 +211,14 @@ async def _ensure_cli_account_metadata(
 
     db.touch_cli_account(account_id)
 
+# NOTE: Keep this list aligned with the scopes requested by the official
+# gemini-cli project. Asking for extra scopes (like the deprecated
+# `generative-language.retrieval`) causes Google OAuth to return
+# `invalid_scope` and blocks users from signing in.
 DEFAULT_SCOPES = [
-    "openid",
-    "email",
+    "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/generative-language",
-    "https://www.googleapis.com/auth/generative-language.retrieval",
 ]
 
 
