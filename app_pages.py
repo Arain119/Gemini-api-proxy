@@ -402,14 +402,16 @@ def render_key_management_page():
                                     'POST',
                                     {'credentials_json': credentials_json, 'label': f'Imported {uploaded_file.name}'}
                                 )
-                                if result and result.get('success'):
+
+                                if result and result.get('account_id'):
                                     email = result.get('account_email', '未知账号')
                                     st.success(f"凭证导入成功！已添加账号：{email}")
                                     st.cache_data.clear()
                                     time.sleep(1)
                                     st.rerun()
-                                elif result:  # API call succeeded but operation failed
-                                    st.error(f"导入失败：{result.get('message', '未知错误')}")
+                                elif result:
+                                    error_message = result.get('message') or result.get('detail') or '未知错误'
+                                    st.error(f"导入失败：{error_message}")
                                 # If result is None, call_api has already shown an error.
 
                     except json.JSONDecodeError:
