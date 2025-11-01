@@ -1,7 +1,9 @@
-import streamlit as st
+import os
+import time
+
 import pandas as pd
 import plotly.graph_objects as go
-import time
+import streamlit as st
 from app_utils import (
     API_BASE_URL,
     call_api,
@@ -25,7 +27,8 @@ from app_utils import (
     get_recent_logs,
     get_cached_deepthink_config,
     update_deepthink_config,
-    start_cli_oauth_flow
+    start_cli_oauth_flow,
+    get_cli_oauth_status
 )
 
 def render_dashboard_page():
@@ -163,7 +166,7 @@ def render_dashboard_page():
                     bargap=0.4,
                     margin=dict(l=0, r=0, t=50, b=0)
                 )
-                st.plotly_chart(fig_rpm, use_container_width=True, config={
+                st.plotly_chart(fig_rpm, width="stretch", config={
                     'displayModeBar': False,
                     'staticPlot': True,  # 禁用所有交互
                     'scrollZoom': False,
@@ -203,7 +206,7 @@ def render_dashboard_page():
                     bargap=0.4,
                     margin=dict(l=0, r=0, t=50, b=0)
                 )
-                st.plotly_chart(fig_rpd, use_container_width=True, config={
+                st.plotly_chart(fig_rpd, width="stretch", config={
                     'displayModeBar': False,
                     'staticPlot': True,  # 禁用所有交互
                     'scrollZoom': False,
@@ -220,7 +223,7 @@ def render_dashboard_page():
                 display_df.columns = ['模型', '分钟请求', '分钟限制', '分钟使用率', '日请求', '日限制', '日使用率']
                 display_df['分钟使用率'] = display_df['分钟使用率'].apply(lambda x: f"{x:.1f}%")
                 display_df['日使用率'] = display_df['日使用率'].apply(lambda x: f"{x:.1f}%")
-                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                st.dataframe(display_df, width="stretch", hide_index=True)
     else:
         st.info("暂无使用数据")
 
@@ -310,7 +313,7 @@ def render_dashboard_page():
         ),
         margin=dict(l=0, r=0, t=80, b=0)
     )
-    st.plotly_chart(fig, use_container_width=True, config={'staticPlot': True, 'displayModeBar': False})
+    st.plotly_chart(fig, width="stretch", config={'staticPlot': True, 'displayModeBar': False})
 
     # --- 最近请求记录 ---
     recent_logs_data = get_recent_logs(limit=200)
@@ -336,7 +339,7 @@ def render_dashboard_page():
 
             st.dataframe(
                 df_logs[['时间', '模型', '消耗次数', '状态', '用户']],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
 
@@ -373,29 +376,69 @@ def render_key_management_page():
         cli_auth_info = st.session_state.get('cli_auth_info')
         if cli_auth_info:
             auth_url = cli_auth_info.get('authorization_url')
-            redirect_uri = cli_auth_info.get('redirect_uri')
-            st.info(
-                "1. 浏览器会打开新的 Google 登录窗口\n"
-                "2. 完成授权后页面会自动跳转回管理后台\n"
-                "3. 返回本页面后点击上方刷新按钮，即可看到新的 Gemini CLI 账号"
-            )
+            state = cli_auth_info.get('state')
+            mode = (cli_auth_info.get('mode') or 'loopback').lower()
+            auto_finalize = bool(cli_auth_info.get('auto_finalize'))
+            loopback_host = cli_auth_info.get('loopback_host') or '127.0.0.1'
+            loopback_port = cli_auth_info.get('loopback_port') or 8765
+
+            status_data = get_cli_oauth_status(state) if state else None
+            status_label = (status_data or {}).get('status')
+
+            if mode == 'loopback':
+                callback_hint = f"http://{loopback_host}:{loopback_port}/"
+                st.caption(
+                    "本次授权沿用 Gemini CLI 的本地回调模式。\n"
+                    f"回调地址：`{callback_hint}`\n"
+                    + ("系统在收到回调后会自动写入账号信息并刷新密钥列表。" if auto_finalize else "授权完成后请返回此页面手动刷新。")
+                )
+            else:
+                st.caption("当前使用远程回调模式，授权完成后请返回此页面继续操作。")
+
+            instructions = [
+                "1. 浏览器会打开新的 Google 登录窗口",
+                "2. 完成授权后，Google 页面会提示成功或失败",
+            ]
+            if auto_finalize:
+                instructions.append("3. 授权成功后系统会自动创建新的 CLI 账号")
+            else:
+                instructions.append("3. 授权完成后请点击下方按钮刷新状态")
+            st.info("\n".join(instructions))
+
             if auth_url:
                 st.markdown(f"[👉 点击这里重新打开授权页面]({auth_url})", unsafe_allow_html=True)
-            if redirect_uri:
-                st.caption(f"授权回调地址：{redirect_uri}")
 
-            if auth_url and st.session_state.get('cli_auth_popup_state') != cli_auth_info.get('state'):
-                st.session_state['cli_auth_popup_state'] = cli_auth_info.get('state')
+            if auth_url and st.session_state.get('cli_auth_popup_state') != state:
+                st.session_state['cli_auth_popup_state'] = state
                 st.markdown(
                     f"<script>window.open('{auth_url}', '_blank');</script>",
                     unsafe_allow_html=True,
                 )
 
-            if st.button("我已完成授权，清除提示", key="clear_cli_auth", type="secondary"):
-                st.session_state.pop('cli_auth_info', None)
-                st.session_state.pop('cli_auth_popup_state', None)
-                st.cache_data.clear()
-                st.rerun()
+            if status_label == 'completed':
+                result_info = (status_data or {}).get('result') or {}
+                email = result_info.get('account_email') or status_data.get('account_email') or '账号已成功连接'
+                st.success(f"授权完成，已写入账号：{email}")
+            elif status_label == 'failed':
+                message = (status_data or {}).get('message') or '授权失败，请重试。'
+                st.error(message)
+            elif status_label == 'callback_received':
+                st.warning('已收到授权回调，系统正在写入账号信息…')
+            elif status_label == 'pending':
+                st.info('等待您在新窗口完成 Google 登录…')
+            elif status_label == 'unknown':
+                st.warning('当前无法确定授权状态，如已完成请尝试重新生成授权链接。')
+
+            col_status, col_clear = st.columns([1, 1])
+            with col_status:
+                if st.button('刷新授权状态', key='refresh_cli_auth_status', type='secondary'):
+                    st.experimental_rerun()
+            with col_clear:
+                if st.button("清除提示", key="clear_cli_auth", type="secondary"):
+                    st.session_state.pop('cli_auth_info', None)
+                    st.session_state.pop('cli_auth_popup_state', None)
+                    st.cache_data.clear()
+                    st.rerun()
 
         st.markdown('<hr style="margin: 1.5rem 0;">', unsafe_allow_html=True)
 
@@ -469,7 +512,7 @@ def render_key_management_page():
         with col1:
             st.markdown("#### 现有密钥")
         with col2:
-            if st.button("健康检测", help="检测所有密钥状态", key="health_check_gemini", use_container_width=True):
+            if st.button("健康检测", help="检测所有密钥状态", key="health_check_gemini", width="stretch"):
                 with st.spinner("检测中..."):
                     result = check_all_keys_health()
                     st.success(result['message'])
@@ -477,7 +520,7 @@ def render_key_management_page():
                     time.sleep(1)
                     st.rerun()
         with col3:
-            if st.button("删除异常", help="一键删除所有健康状态为'异常'的密钥", key="delete_unhealthy_gemini", use_container_width=True):
+            if st.button("删除异常", help="一键删除所有健康状态为'异常'的密钥", key="delete_unhealthy_gemini", width="stretch"):
                 with st.spinner("正在删除..."):
                     result = delete_unhealthy_gemini_keys()
                     if result and result.get('success'):
@@ -613,7 +656,7 @@ def render_key_management_page():
                                 status = key_info.get('status', 0)
                                 if key_id is not None:
                                     toggle_text = "禁用" if status == 1 else "激活"
-                                    if st.button(toggle_text, key=f"toggle_g_{key_id}", use_container_width=True):
+                                    if st.button(toggle_text, key=f"toggle_g_{key_id}", width="stretch"):
                                         if toggle_key_status('gemini', key_id):
                                             st.success("状态已更新")
                                             st.cache_data.clear()
@@ -622,7 +665,7 @@ def render_key_management_page():
 
                             with col6:
                                 if key_id is not None:
-                                    if st.button("删除", key=f"del_g_{key_id}", use_container_width=True):
+                                    if st.button("删除", key=f"del_g_{key_id}", width="stretch"):
                                         if delete_key('gemini', key_id):
                                             st.success("删除成功")
                                             st.cache_data.clear()
@@ -724,7 +767,7 @@ response = client.chat.completions.create(
 
                             with col4:
                                 toggle_text = "停用" if key_info['status'] == 1 else "激活"
-                                if st.button(toggle_text, key=f"toggle_u_{key_info['id']}", use_container_width=True):
+                                if st.button(toggle_text, key=f"toggle_u_{key_info['id']}", width="stretch"):
                                     if toggle_key_status('user', key_info['id']):
                                         st.success("状态已更新")
                                         st.cache_data.clear()
@@ -732,7 +775,7 @@ response = client.chat.completions.create(
                                         st.rerun()
 
                             with col5:
-                                if st.button("删除", key=f"del_u_{key_info['id']}", use_container_width=True):
+                                if st.button("删除", key=f"del_u_{key_info['id']}", width="stretch"):
                                     if delete_key('user', key_info['id']):
                                         st.success("删除成功")
                                         st.cache_data.clear()
@@ -838,7 +881,7 @@ def render_model_config_page():
                     key=f"status_{model}"
                 )
 
-            if st.form_submit_button("保存配置", type="primary", use_container_width=True):
+            if st.form_submit_button("保存配置", type="primary", width="stretch"):
                 if not display_name or not display_name.strip():
                     st.error("显示名称不能为空或仅包含空格。")
                 else:
@@ -945,7 +988,7 @@ def render_system_settings_page():
             st.markdown("**配置说明**")
             st.info("思考模式会增加响应时间，但能显著提高复杂问题的回答质量。建议在需要深度分析的场景中启用。")
 
-            if st.form_submit_button("保存配置", type="primary", use_container_width=True):
+            if st.form_submit_button("保存配置", type="primary", width="stretch"):
                 update_data = {
                     "enabled": thinking_enabled,
                     "budget": budget_options[budget_option],
@@ -1042,7 +1085,7 @@ def render_system_settings_page():
             if char_count > 0:
                 st.caption(f"当前字符数: {char_count}")
 
-            if st.form_submit_button("保存配置", type="primary", use_container_width=True):
+            if st.form_submit_button("保存配置", type="primary", width="stretch"):
                 update_data = {
                     "enabled": inject_enabled,
                     "content": content,
@@ -1126,7 +1169,7 @@ def render_system_settings_page():
                 )
     
 
-            if st.form_submit_button("保存配置", type="primary", use_container_width=True):
+            if st.form_submit_button("保存配置", type="primary", width="stretch"):
                 update_data_stream = {"mode": selected_mode}
                 update_data_gemini = {"mode": selected_stg_mode}
 
@@ -1218,7 +1261,7 @@ def render_system_settings_page():
 
             st.markdown(f"**{strategy_options[strategy]}**: {strategy_descriptions[strategy]}")
 
-            if st.form_submit_button("保存策略", type="primary", use_container_width=True):
+            if st.form_submit_button("保存策略", type="primary", width="stretch"):
                 result = call_api('/admin/config/load-balance', 'POST', {
                     'load_balance_strategy': strategy
                 })
@@ -1292,7 +1335,7 @@ def render_system_settings_page():
                 save_config = st.form_submit_button(
                     "保存配置",
                     type="primary",
-                    use_container_width=True
+                    width="stretch"
                 )
 
                 # 处理表单提交
@@ -1504,13 +1547,13 @@ def render_system_settings_page():
                     save_config = st.form_submit_button(
                         "保存配置",
                         type="primary",
-                        use_container_width=True
+                        width="stretch"
                     )
 
                 with col2:
                     manual_cleanup = st.form_submit_button(
                         "立即执行清理",
-                        use_container_width=True
+                        width="stretch"
                     )
 
                 # 处理表单提交
@@ -1645,7 +1688,7 @@ def render_system_settings_page():
                     disable_for_tools = st.checkbox("工具调用时禁用防检测", value=current_disable_for_tools, help="在进行工具调用时自动禁用防检测，避免影响工具响应")
                 st.markdown("**高级配置**")
                 token_threshold = st.number_input("Token阈值", min_value=1000, max_value=50000, value=current_token_threshold, step=500, help="只有当消息token数超过此阈值时才应用防检测处理")
-                if st.form_submit_button("保存防检测配置", type="primary", use_container_width=True):
+                if st.form_submit_button("保存防检测配置", type="primary", width="stretch"):
                     update_data = {'anti_detection_enabled': enabled, 'disable_for_tools': disable_for_tools, 'token_threshold': token_threshold}
                     result = call_api('/admin/config/anti-detection', 'POST', data=update_data)
                     if result and result.get('success'):
@@ -1666,7 +1709,7 @@ def render_system_settings_page():
             current_enabled = trunc_conf.get('anti_truncation_enabled', False)
             with st.form("anti_trunc_form"):
                 enable_trunc = st.checkbox("启用防截断功能", value=current_enabled)
-                if st.form_submit_button("保存防截断配置", type="primary", use_container_width=True):
+                if st.form_submit_button("保存防截断配置", type="primary", width="stretch"):
                     res = call_api('/admin/config/anti-truncation', 'POST', data={'enabled': enable_trunc})
                     if res and res.get('success'):
                         st.success("防截断配置已更新")
@@ -1686,7 +1729,7 @@ def render_system_settings_page():
             st.error("无法获取防审查配置状态")
         with st.form("encryption_form"):
             toggle_encryption = st.checkbox("启用防审查", value=is_encryption_active, help="开启后将注入加密指令并自动解密响应，可能会增加延迟并影响流式输出。")
-            submitted = st.form_submit_button("应用防审查设置", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("应用防审查设置", type="primary", width="stretch")
             if submitted:
                 with st.spinner("正在应用配置..."):
                     if toggle_encryption:
@@ -1723,7 +1766,7 @@ def render_system_settings_page():
             with st.form("deepthink_form"):
                 enabled = st.checkbox("启用 DeepThink 功能", value=current_enabled, help="开启后，包含 [deepthink] 关键词的请求将触发“反思式”多步推理流程")
 
-                if st.form_submit_button("保存 DeepThink 配置", type="primary", use_container_width=True):
+                if st.form_submit_button("保存 DeepThink 配置", type="primary", width="stretch"):
                     update_data = {
                         'enabled': enabled
                     }

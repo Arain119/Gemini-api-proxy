@@ -1,5 +1,5 @@
 from pydantic import BaseModel, validator
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Literal
 
 # 思考配置模型
 class ThinkingConfig(BaseModel):
@@ -235,6 +235,10 @@ class CliAuthStartResponse(BaseModel):
     authorization_url: str
     state: str
     redirect_uri: str
+    mode: Literal["loopback", "remote"]
+    loopback_host: Optional[str] = None
+    loopback_port: Optional[int] = None
+    auto_finalize: bool = False
 
 
 class CliAuthCompleteRequest(BaseModel):
@@ -249,3 +253,12 @@ class CliAuthCompleteResponse(BaseModel):
     gemini_key_id: int
     state: str
     account_email: Optional[str] = None
+
+
+class CliAuthStatusResponse(BaseModel):
+    state: str
+    status: Literal["pending", "callback_received", "completed", "failed", "unknown"]
+    message: Optional[str] = None
+    account_email: Optional[str] = None
+    auto_finalize: bool = False
+    result: Optional[CliAuthCompleteResponse] = None

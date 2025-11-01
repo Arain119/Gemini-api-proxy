@@ -55,7 +55,7 @@ db_queue = Queue(maxsize=10000)
 db = Database(db_queue=db_queue)
 anti_detection = GeminiAntiDetectionInjector()
 rate_limiter = RateLimitCache()
-cli_auth_manager = CliAuthManager()
+cli_auth_manager = CliAuthManager(database_factory=lambda: db)
 
 async def db_writer_worker(queue: Queue, db_instance: Database):
     """A worker that processes database write operations from a queue."""
