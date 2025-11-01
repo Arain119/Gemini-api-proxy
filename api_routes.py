@@ -28,10 +28,9 @@ from api_models import (
     CliAuthCompleteResponse,
 )
 from api_services import (_execute_deepthink_preprocessing, create_embeddings, create_gemini_native_embeddings, execute_search_flow, make_request_with_failover,
-                          make_request_with_fast_failover,
                           should_use_fast_failover,
                           stream_non_stream_keep_alive,
-                          stream_with_failover, stream_with_fast_failover,
+                          stream_with_failover,
                           delete_unhealthy_keys, stream_with_preprocessing,
                           review_prompt_with_flashlite)
 from api_utils import (GeminiAntiDetectionInjector, check_gemini_key_health,
@@ -147,6 +146,12 @@ async def root(
         "docs": "/docs",
         "health": "/health"
     }
+
+@router.get("/healthz", summary="服务存活探针", tags=["通用"], status_code=200)
+async def liveness_probe():
+    """一个简单的、无依赖的健康检查端点，用于确认服务进程是否存活。"""
+    return {"status": "alive"}
+
 
 @router.get("/health", summary="服务健康检查", tags=["通用"])
 async def health_check(
@@ -491,14 +496,14 @@ async def chat_completions(
         )
 
         if request.stream:
-            final_streamer = stream_with_fast_failover if await should_use_fast_failover(db) else stream_with_failover
+            final_streamer = stream_with_failover
             return StreamingResponse(
                 stream_with_preprocessing(preprocessing_coro, final_streamer, db, rate_limiter, request, actual_model_name, user_key_info),
                 media_type="text/event-stream"
             )
         else:
             final_gemini_request = await preprocessing_coro
-            response_func = make_request_with_fast_failover if await should_use_fast_failover(db) else make_request_with_failover
+            response_func = make_request_with_failover
             response = await response_func(db, rate_limiter, final_gemini_request, request, actual_model_name, user_key_info)
             return JSONResponse(content=response)
 
@@ -532,14 +537,14 @@ async def chat_completions(
         )
 
         if request.stream:
-            final_streamer = stream_with_fast_failover if await should_use_fast_failover(db) else stream_with_failover
+            final_streamer = stream_with_failover
             return StreamingResponse(
                 stream_with_preprocessing(preprocessing_coro, final_streamer, db, rate_limiter, request, actual_model_name, user_key_info),
                 media_type="text/event-stream"
             )
         else:
             final_gemini_request = await preprocessing_coro
-            response_func = make_request_with_fast_failover if await should_use_fast_failover(db) else make_request_with_failover
+            response_func = make_request_with_failover
             response = await response_func(db, rate_limiter, final_gemini_request, request, actual_model_name, user_key_info)
             return JSONResponse(content=response)
     
@@ -559,10 +564,10 @@ async def chat_completions(
     elif stream_mode == 'non_stream': should_stream = False
 
     if should_stream:
-        streamer = stream_with_fast_failover if await should_use_fast_failover(db) else stream_with_failover
+        streamer = stream_with_failover
         return StreamingResponse(streamer(db, rate_limiter, gemini_request, request, actual_model_name, user_key_info), media_type="text/event-stream")
     else:
-        requester = make_request_with_fast_failover if await should_use_fast_failover(db) else make_request_with_failover
+        requester = make_request_with_failover
         response = await requester(db, rate_limiter, gemini_request, request, actual_model_name, user_key_info)
         return JSONResponse(content=response)
 
