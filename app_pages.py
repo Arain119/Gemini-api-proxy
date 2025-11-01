@@ -24,9 +24,7 @@ from app_utils import (
     get_hourly_stats,
     get_recent_logs,
     get_cached_deepthink_config,
-    update_deepthink_config,
-    get_cached_search_config,
-    update_search_config
+    update_deepthink_config
 )
 
 def render_dashboard_page():
@@ -1518,7 +1516,6 @@ def render_system_settings_page():
         trunc_conf = call_api('/admin/config/anti-truncation', 'GET')
         decryption_config = call_api('/admin/config/response-decryption')
         deepthink_data = get_cached_deepthink_config()
-        search_data = get_cached_search_config()
         
         # Calculate statuses
         anti_detection_enabled = anti_detection_data.get('anti_detection_enabled', False) if anti_detection_data and anti_detection_data.get('success') else False
@@ -1530,15 +1527,13 @@ def render_system_settings_page():
         is_encryption_active = (inject_config.get('enabled', False) and inject_config.get('content', '') == encryption_prompt and decryption_enabled)
 
         deepthink_enabled = deepthink_data.get('config', {}).get('enabled', False) if deepthink_data and deepthink_data.get('success') else False
-        search_enabled = search_data.get('config', {}).get('enabled', False) if search_data and search_data.get('success') else False
 
         # --- Status Card ---
         experimental_features = {
             "防检测": anti_detection_enabled,
             "防截断": trunc_enabled,
             "防审查": is_encryption_active,
-            "DeepThink": deepthink_enabled,
-            "搜索": search_enabled
+            "DeepThink": deepthink_enabled
         }
         enabled_features = [name for name, is_on in experimental_features.items() if is_on]
         enabled_count = len(enabled_features)
@@ -1668,32 +1663,6 @@ def render_system_settings_page():
                         st.error("更新 DeepThink 配置失败")
         else:
             st.error("无法获取 DeepThink 配置数据")
-
-        st.markdown('<hr style="margin: 2rem 0;">', unsafe_allow_html=True)
-
-        # --- Search ---
-        st.markdown("##### 搜索配置")
-        st.markdown("启用联网搜索以获取实时信息")
-        if search_data and search_data.get('success'):
-            current_config = search_data.get('config', {})
-            current_enabled = current_config.get('enabled', False)
-
-            with st.form("search_form"):
-                enabled = st.checkbox("启用搜索功能", value=current_enabled, help="开启后，包含 [Search] 关键词的请求将触发联网搜索流程")
-
-                if st.form_submit_button("保存搜索配置", type="primary", use_container_width=True):
-                    update_data = {
-                        'enabled': enabled
-                    }
-                    result = update_search_config(update_data)
-                    if result and result.get('success'):
-                        st.success("搜索配置已更新")
-                        st.cache_data.clear()
-                        st.rerun()
-                    else:
-                        st.error("更新搜索配置失败")
-        else:
-            st.error("无法获取搜索配置数据")
 
     with tab8:
         st.markdown("#### 系统信息")

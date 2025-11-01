@@ -7,6 +7,7 @@ import logging
 import os
 import copy
 import itertools
+import re
 from typing import Coroutine, Dict, List, Optional, AsyncGenerator, Any
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -19,8 +20,15 @@ from fastapi import HTTPException
 from database import Database
 from api_models import (ChatCompletionRequest, ChatMessage, EmbeddingRequest, EmbeddingResponse, EmbeddingData, EmbeddingUsage,
                           GeminiEmbeddingRequest, GeminiEmbeddingResponse, EmbeddingValue)
-from api_utils import get_cached_client, map_finish_reason, decrypt_response, check_gemini_key_health, RateLimitCache, openai_to_gemini
-import copy
+from api_utils import (
+    GeminiAntiDetectionInjector,
+    get_cached_client,
+    map_finish_reason,
+    decrypt_response,
+    check_gemini_key_health,
+    RateLimitCache,
+    openai_to_gemini,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +153,125 @@ async def log_usage_background(db: Database, gemini_key_id: int, user_key_id: in
         db.log_usage(gemini_key_id, user_key_id, model_name, status, requests, tokens)
     except Exception as e:
         logger.error(f"Background usage logging failed: {e}")
+
+
+async def review_prompt_with_flashlite(
+        db: Database,
+        rate_limiter: RateLimitCache,
+        original_request: ChatCompletionRequest,
+        user_key_info: Dict,
+        anti_detection: GeminiAntiDetectionInjector,
+) -> Dict[str, Any]:
+    """
+    使用 gemini-2.5-flash-lite 对用户输入进行预审，判断是否需要联网搜索，以及是否应在搜索关键词中附加当前（UTC+08:00）时间。
+    返回结构：{"should_search": bool, "append_current_time": bool, "search_query": Optional[str], "analysis": str}
+    """
+    default_decision = {
+        "should_search": False,
+        "append_current_time": False,
+        "search_query": None,
+        "analysis": ""
+    }
+
+    try:
+        if not original_request.messages:
+            return default_decision
+
+        # 获取最近的对话上下文（最多 6 条）
+        recent_messages = original_request.messages[-6:]
+        conversation_blocks = []
+        last_user_text = ""
+        for msg in recent_messages:
+            text_content = msg.get_text_content() if hasattr(msg, "get_text_content") else str(msg.content)
+            if not text_content:
+                continue
+            if msg.role == "user":
+                last_user_text = text_content
+            conversation_blocks.append(f"{msg.role.upper()}: {text_content}")
+
+        if not last_user_text:
+            return default_decision
+
+        conversation_text = "\n".join(conversation_blocks)
+        current_time_str = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+
+        system_instruction = (
+            "你是一个负责请求前安全审查与策略规划的助手。"
+            "请根据对话内容判断是否需要联网搜索最新信息，以及是否应在搜索关键词中附加当前的北京时间（UTC+08:00）。"
+            "必须输出 JSON，对象字段如下：\n"
+            "- should_search: 布尔值，是否需要触发联网搜索以获取实时资料；\n"
+            "- search_query: 字符串，若需要搜索则给出建议的搜索主题，否则为 null；\n"
+            "- append_current_time: 布尔值，若为 true 表示应在搜索关键词中追加当前北京时间；\n"
+            "- analysis: 字符串，简要说明判断依据。"
+        )
+
+        user_prompt = (
+            f"当前时间（北京时间）为 {current_time_str}。\n"
+            f"以下是最近的对话：\n{conversation_text}\n"
+            "请按照要求返回 JSON。不要添加额外说明或代码块标记。"
+        )
+
+        review_request = ChatCompletionRequest(
+            model="gemini-2.5-flash-lite",
+            messages=[
+                ChatMessage(role="system", content=system_instruction),
+                ChatMessage(role="user", content=user_prompt)
+            ],
+            temperature=0.1,
+            top_p=0.1,
+            max_tokens=256
+        )
+
+        gemini_request = openai_to_gemini(db, review_request, anti_detection, {}, enable_anti_detection=False)
+
+        response = await make_request_with_fast_failover(
+            db,
+            rate_limiter,
+            gemini_request,
+            review_request,
+            "gemini-2.5-flash-lite",
+            user_key_info,
+            _internal_call=True
+        )
+
+        ai_text = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if not ai_text:
+            return default_decision
+
+        json_candidate = ai_text
+        if "```" in json_candidate:
+            # 清除可能的代码块包裹
+            json_candidate = json_candidate.split("```", 1)[1]
+            if "```" in json_candidate:
+                json_candidate = json_candidate.split("```", 1)[0]
+        json_candidate = json_candidate.strip()
+        if not json_candidate.startswith("{"):
+            start = json_candidate.find("{")
+            end = json_candidate.rfind("}")
+            if start != -1 and end != -1:
+                json_candidate = json_candidate[start:end + 1]
+
+        parsed = json.loads(json_candidate)
+        decision = default_decision.copy()
+        decision["should_search"] = bool(parsed.get("should_search"))
+        decision["append_current_time"] = bool(parsed.get("append_current_time"))
+        decision["analysis"] = str(parsed.get("analysis", ""))
+
+        search_query = parsed.get("search_query")
+        if isinstance(search_query, str) and search_query.strip():
+            decision["search_query"] = search_query.strip()
+
+        logger.info(
+            "Pre-input review result: should_search=%s, append_current_time=%s, search_query=%s",
+            decision["should_search"],
+            decision["append_current_time"],
+            decision["search_query"] or ""
+        )
+        return decision
+
+    except Exception as e:
+        logger.error(f"Failed to execute pre-input review: {e}")
+        return default_decision
 
 
 async def collect_gemini_response_directly(
@@ -432,6 +559,8 @@ async def make_request_with_fast_failover(
     failed_keys = []
     last_error = None
 
+    track_usage = bool(user_key_info) and not _internal_call
+
     for attempt in range(max_key_attempts):
         try:
             # 选择下一个可用的key（排除已失败的）
@@ -497,11 +626,16 @@ async def make_request_with_fast_failover(
 
                 # 从响应中获取token使用量
                 usage = response.get('usage', {})
-                total_tokens = usage.get('completion_tokens', 0)
                 prompt_tokens = usage.get('prompt_tokens', 0)
+                completion_tokens = usage.get('completion_tokens', 0)
+                reasoning_tokens = usage.get('reasoning_tokens', 0)
+                total_tokens = usage.get(
+                    'total_tokens',
+                    prompt_tokens + completion_tokens + reasoning_tokens
+                )
 
                 # 记录使用量
-                if user_key_info:
+                if track_usage:
                     # 在后台记录使用量，不阻塞响应
                     asyncio.create_task(
                         log_usage_background(
@@ -516,7 +650,8 @@ async def make_request_with_fast_failover(
                     )
 
                 # 更新速率限制
-                await rate_limiter.add_usage(model_name, 1, total_tokens)
+                if not _internal_call:
+                    await rate_limiter.add_usage(model_name, 1, total_tokens)
                 return response
 
             except HTTPException as e:
@@ -526,7 +661,7 @@ async def make_request_with_fast_failover(
                 logger.warning(f"❌ Key #{key_info['id']} failed: {e.detail}")
 
                 # 记录失败的使用量
-                if user_key_info:
+                if track_usage:
                     asyncio.create_task(
                         log_usage_background(
                             db,
@@ -539,7 +674,8 @@ async def make_request_with_fast_failover(
                         )
                     )
 
-                await rate_limiter.add_usage(model_name, 1, 0)
+                if not _internal_call:
+                    await rate_limiter.add_usage(model_name, 1, 0)
 
                 # 如果是客户端错误（4xx），不继续尝试其他key
                 if 400 <= e.status_code < 500:
@@ -574,7 +710,8 @@ async def stream_gemini_response_single_attempt(
         gemini_request: Dict,
         openai_request: ChatCompletionRequest,
         model_name: str,
-        _internal_call: bool = False
+        _internal_call: bool = False,
+        usage_collector: Optional[Dict[str, int]] = None
 ) -> AsyncGenerator[bytes, None]:
     """
     单次流式请求尝试，失败立即抛出异常，使用 google-genai SDK 实现
@@ -594,6 +731,13 @@ async def stream_gemini_response_single_attempt(
     logger.info(f"Starting single stream request to model: {model_name}")
 
     start_time = time.time()
+
+    prompt_tokens = len(str(openai_request.messages).split())
+    if usage_collector is not None:
+        usage_collector['prompt_tokens'] = prompt_tokens
+        usage_collector['completion_tokens'] = 0
+        usage_collector['reasoning_tokens'] = 0
+        usage_collector['total_tokens'] = prompt_tokens
 
     try:
         client = get_cached_client(gemini_key)
@@ -619,7 +763,8 @@ async def stream_gemini_response_single_attempt(
 
             stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             created = int(time.time())
-            total_tokens = 0
+            completion_tokens = 0
+            reasoning_tokens = 0
             thinking_sent = False
             has_content = False
             processed_lines = 0
@@ -648,9 +793,9 @@ async def stream_gemini_response_single_attempt(
                                 text = part.text
                                 if not text:
                                     continue
-                                total_tokens += len(text.split())
+                                token_count = len(text.split())
                                 has_content = True
-                                
+
                                 # Anti-truncation handling (stream) remains the same
                                 text_to_send = text
                                 if anti_trunc_cfg.get('enabled') and not _internal_call:
@@ -662,8 +807,10 @@ async def stream_gemini_response_single_attempt(
 
                                 is_thought = getattr(part, "thought", False)
                                 if is_thought:
+                                    reasoning_tokens += token_count
                                     delta["reasoning"] = text_to_send
                                 else:
+                                    completion_tokens += token_count
                                     delta["content"] = text_to_send
                             
                             elif hasattr(part, "function_call"):
@@ -712,12 +859,21 @@ async def stream_gemini_response_single_attempt(
                             yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
                             yield "data: [DONE]\n\n".encode('utf-8')
 
+                            total_generated_tokens = completion_tokens + reasoning_tokens
+                            total_with_prompt = total_generated_tokens + prompt_tokens
+                            if usage_collector is not None:
+                                usage_collector['completion_tokens'] = completion_tokens
+                                usage_collector['reasoning_tokens'] = reasoning_tokens
+                                usage_collector['total_tokens'] = total_with_prompt
+
                             logger.info(
-                                f"Stream completed with finish_reason: {finish_reason}, tokens: {total_tokens}")
+                                f"Stream completed with finish_reason: {finish_reason}, tokens: {total_with_prompt}"
+                            )
 
                             response_time = time.time() - start_time
                             asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
-                            await rate_limiter.add_usage(model_name, 1, total_tokens)
+                            if not _internal_call:
+                                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
                             return
 
 
@@ -743,15 +899,30 @@ async def stream_gemini_response_single_attempt(
                 yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
                 yield "data: [DONE]\n\n".encode('utf-8')
 
+                total_generated_tokens = completion_tokens + reasoning_tokens
+                total_with_prompt = total_generated_tokens + prompt_tokens
+                if usage_collector is not None:
+                    usage_collector['completion_tokens'] = completion_tokens
+                    usage_collector['reasoning_tokens'] = reasoning_tokens
+                    usage_collector['total_tokens'] = total_with_prompt
+
                 logger.info(
-                    f"Stream ended naturally, tokens: {total_tokens}")
+                    f"Stream ended naturally, tokens: {total_with_prompt}")
 
                 response_time = time.time() - start_time
                 asyncio.create_task(
                     update_key_performance_background(db, key_id, True, response_time)
                 )
 
-            await rate_limiter.add_usage(model_name, 1, total_tokens)
+            total_generated_tokens = completion_tokens + reasoning_tokens
+            total_with_prompt = total_generated_tokens + prompt_tokens
+            if usage_collector is not None:
+                usage_collector['completion_tokens'] = completion_tokens
+                usage_collector['reasoning_tokens'] = reasoning_tokens
+                usage_collector['total_tokens'] = total_with_prompt
+
+            if not _internal_call:
+                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
 
 
 
@@ -801,6 +972,8 @@ async def stream_with_fast_failover(
 
     failed_keys = []
 
+    track_usage = bool(user_key_info) and not _internal_call
+
     for attempt in range(max_key_attempts):
         try:
             selection_result = await select_gemini_key_and_check_limits(
@@ -829,7 +1002,7 @@ async def stream_with_fast_failover(
                 should_stream_to_gemini = True
 
             success = False
-            total_tokens = 0
+            usage_summary: Dict[str, int] = {}
 
             try:
                 async for chunk in stream_gemini_response_single_attempt(
@@ -840,14 +1013,21 @@ async def stream_with_fast_failover(
                         gemini_request,
                         openai_request,
                         model_name,
-                        _internal_call=_internal_call
+                        _internal_call=_internal_call,
+                        usage_collector=usage_summary
                 ):
                     yield chunk
                     success = True
 
                 if success:
                     # 在后台记录使用量
-                    if user_key_info:
+                    if track_usage:
+                        total_tokens = usage_summary.get('total_tokens')
+                        if total_tokens is None:
+                            prompt_tokens = usage_summary.get('prompt_tokens', 0)
+                            completion_tokens = usage_summary.get('completion_tokens', 0)
+                            reasoning_tokens = usage_summary.get('reasoning_tokens', 0)
+                            total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
                         asyncio.create_task(
                             log_usage_background(
                                 db,
@@ -860,7 +1040,6 @@ async def stream_with_fast_failover(
                             )
                         )
 
-                    await rate_limiter.add_usage(model_name, 1, total_tokens)
                     return
 
             except Exception as e:
@@ -873,7 +1052,7 @@ async def stream_with_fast_failover(
                 )
 
                 # 记录失败的使用量
-                if user_key_info:
+                if track_usage:
                     asyncio.create_task(
                         log_usage_background(
                             db,
@@ -1220,6 +1399,8 @@ async def make_request_with_failover(
     last_error = None
     failed_keys = []
 
+    track_usage = bool(user_key_info) and not _internal_call
+
     for attempt in range(max_key_attempts):
         try:
             selection_result = await select_gemini_key_and_check_limits(
@@ -1269,9 +1450,15 @@ async def make_request_with_failover(
 
                 # 从响应中获取token使用量
                 usage = response.get('usage', {})
-                total_tokens = usage.get('completion_tokens', 0)
+                prompt_tokens = usage.get('prompt_tokens', 0)
+                completion_tokens = usage.get('completion_tokens', 0)
+                reasoning_tokens = usage.get('reasoning_tokens', 0)
+                total_tokens = usage.get(
+                    'total_tokens',
+                    prompt_tokens + completion_tokens + reasoning_tokens
+                )
 
-                if user_key_info:
+                if track_usage:
                     db.log_usage(
                         gemini_key_id=key_info['id'],
                         user_key_id=user_key_info['id'],
@@ -1283,7 +1470,8 @@ async def make_request_with_failover(
                     logger.info(
                         f"📊 Logged usage: gemini_key_id={key_info['id']}, user_key_id={user_key_info['id']}, model={model_name}, tokens={total_tokens}")
 
-                await rate_limiter.add_usage(model_name, 1, total_tokens)
+                if not _internal_call:
+                    await rate_limiter.add_usage(model_name, 1, total_tokens)
                 return response
 
             except HTTPException as e:
@@ -1292,7 +1480,7 @@ async def make_request_with_failover(
 
                 db.update_key_performance(key_info['id'], False, 0.0)
 
-                if user_key_info:
+                if track_usage:
                     db.log_usage(
                         gemini_key_id=key_info['id'],
                         user_key_id=user_key_info['id'],
@@ -1302,7 +1490,8 @@ async def make_request_with_failover(
                         tokens=0
                     )
 
-                await rate_limiter.add_usage(model_name, 1, 0)
+                if not _internal_call:
+                    await rate_limiter.add_usage(model_name, 1, 0)
 
                 logger.warning(f"❌ Key #{key_info['id']} failed with {e.status_code}: {e.detail}")
 
@@ -1368,6 +1557,8 @@ async def stream_with_failover(
 
     failed_keys = []
 
+    track_usage = bool(user_key_info) and not _internal_call
+
     for attempt in range(max_key_attempts):
         try:
             selection_result = await select_gemini_key_and_check_limits(
@@ -1384,7 +1575,7 @@ async def stream_with_failover(
             logger.info(f"Stream attempt {attempt + 1}: Using key #{key_info['id']}")
 
             success = False
-            total_tokens = 0
+            usage_summary: Dict[str, int] = {}
             try:
                 async for chunk in stream_gemini_response(
                         db,
@@ -1395,13 +1586,20 @@ async def stream_with_failover(
                         openai_request,
                         key_info,
                         model_name,
-                        _internal_call=_internal_call
+                        _internal_call=_internal_call,
+                        usage_collector=usage_summary
                 ):
                     yield chunk
                     success = True
 
                 if success:
-                    if user_key_info:
+                    total_tokens = usage_summary.get('total_tokens')
+                    if total_tokens is None:
+                        prompt_tokens = usage_summary.get('prompt_tokens', 0)
+                        completion_tokens = usage_summary.get('completion_tokens', 0)
+                        reasoning_tokens = usage_summary.get('reasoning_tokens', 0)
+                        total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
+                    if track_usage:
                         db.log_usage(
                             gemini_key_id=key_info['id'],
                             user_key_id=user_key_info['id'],
@@ -1412,8 +1610,6 @@ async def stream_with_failover(
                         )
                         logger.info(
                             f"📊 Logged stream usage: gemini_key_id={key_info['id']}, user_key_id={user_key_info['id']}, model={model_name}")
-
-                    await rate_limiter.add_usage(model_name, 1, total_tokens)
                     return
 
             except Exception as e:
@@ -1422,7 +1618,7 @@ async def stream_with_failover(
 
                 db.update_key_performance(key_info['id'], False, 0.0)
 
-                if user_key_info:
+                if track_usage:
                     db.log_usage(
                         gemini_key_id=key_info['id'],
                         user_key_id=user_key_info['id'],
@@ -1470,7 +1666,8 @@ async def stream_gemini_response(
         openai_request: ChatCompletionRequest,
         key_info: Dict,
         model_name: str,
-        _internal_call: bool = False
+        _internal_call: bool = False,
+        usage_collector: Optional[Dict[str, int]] = None
 ) -> AsyncGenerator[bytes, None]:
     """处理Gemini的流式响应，记录性能指标"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
@@ -1492,6 +1689,13 @@ async def stream_gemini_response(
     logger.info(f"Starting stream request to: {url}")
 
     start_time = time.time()
+
+    prompt_tokens = len(str(openai_request.messages).split())
+    if usage_collector is not None:
+        usage_collector['prompt_tokens'] = prompt_tokens
+        usage_collector['completion_tokens'] = 0
+        usage_collector['reasoning_tokens'] = 0
+        usage_collector['total_tokens'] = prompt_tokens
 
     for attempt in range(max_retries):
         try:
@@ -1558,7 +1762,12 @@ async def stream_gemini_response(
 
                             response_time = time.time() - start_time
                             db.update_key_performance(key_id, True, response_time)
-                            await rate_limiter.add_usage(model_name, 1, total_tokens)
+                            total_with_prompt = total_tokens + prompt_tokens
+                            if usage_collector is not None:
+                                usage_collector['completion_tokens'] = total_tokens
+                                usage_collector['total_tokens'] = total_with_prompt
+                            if not _internal_call:
+                                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
                             return
                     if response.status_code != 200:
                         response_time = time.time() - start_time
@@ -1619,7 +1828,8 @@ async def stream_gemini_response(
                                                 if not text:
                                                     continue
 
-                                                total_tokens += len(text.split())
+                                                token_count = len(text.split())
+                                                total_tokens += token_count
                                                 has_content = True
                                                 # Anti-truncation handling
                                                 if anti_trunc_cfg.get('enabled') and not _internal_call:
@@ -1703,12 +1913,16 @@ async def stream_gemini_response(
                                                 'utf-8')
                                             yield "data: [DONE]\n\n".encode('utf-8')
 
-                                            logger.info(
-                                                f"Stream completed with finish_reason: {finish_reason}, tokens: {total_tokens}")
-
                                             response_time = time.time() - start_time
                                             db.update_key_performance(key_id, True, response_time)
-                                            await rate_limiter.add_usage(model_name, 1, total_tokens)
+                                            total_with_prompt = total_tokens + prompt_tokens
+                                            if usage_collector is not None:
+                                                usage_collector['completion_tokens'] = total_tokens
+                                                usage_collector['total_tokens'] = total_with_prompt
+                                            logger.info(
+                                                f"Stream completed with finish_reason: {finish_reason}, tokens: {total_with_prompt}")
+                                            if not _internal_call:
+                                                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
                                             return
 
                                 except json.JSONDecodeError as e:
@@ -1735,11 +1949,14 @@ async def stream_gemini_response(
                             yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
                             yield "data: [DONE]\n\n".encode('utf-8')
 
-                            logger.info(
-                                f"Stream ended naturally, processed {processed_lines} lines, tokens: {total_tokens}")
-
                             response_time = time.time() - start_time
                             db.update_key_performance(key_id, True, response_time)
+                            total_with_prompt = total_tokens + prompt_tokens
+                            if usage_collector is not None:
+                                usage_collector['completion_tokens'] = total_tokens
+                                usage_collector['total_tokens'] = total_with_prompt
+                            logger.info(
+                                f"Stream ended naturally, processed {processed_lines} lines, tokens: {total_with_prompt}")
 
                         if not has_content:
                             logger.warning(
@@ -1785,7 +2002,11 @@ async def stream_gemini_response(
                                     yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
                                     total_tokens = len(full_content.split())
 
-                                    logger.info(f"Fallback completed, tokens: {total_tokens}")
+                                    total_with_prompt = total_tokens + prompt_tokens
+                                    if usage_collector is not None:
+                                        usage_collector['completion_tokens'] = total_tokens
+                                        usage_collector['total_tokens'] = total_with_prompt
+                                    logger.info(f"Fallback completed, tokens: {total_with_prompt}")
 
                             except Exception as e:
                                 logger.error(f"Fallback request failed: {e}")
@@ -1794,7 +2015,12 @@ async def stream_gemini_response(
                                 yield f"data: {json.dumps({'error': {'message': 'Failed to get response', 'type': 'server_error'}}, ensure_ascii=False)}\n\n".encode(
                                     'utf-8')
 
-                        await rate_limiter.add_usage(model_name, 1, total_tokens)
+                        total_with_prompt = total_tokens + prompt_tokens
+                        if usage_collector is not None:
+                            usage_collector['completion_tokens'] = total_tokens
+                            usage_collector['total_tokens'] = total_with_prompt
+                        if not _internal_call:
+                            await rate_limiter.add_usage(model_name, 1, total_with_prompt)
                         yield "data: [DONE]\n\n".encode('utf-8')
                         return
 
@@ -1945,59 +2171,130 @@ from bs4 import BeautifulSoup
 
 
 async def search_duckduckgo_and_scrape(query: str, num_results: int = 3):
-    """
-    Performs a DuckDuckGo WEB search, scrapes the top results, and returns a formatted string.
-    """
+    """Execute a DuckDuckGo HTML search and return enriched snippets for the top results."""
+
     logger.info(f"Starting DuckDuckGo WEB search and scrape for query: '{query}'")
     try:
-        # Use the HTML version of DuckDuckGo for easier parsing
         search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         }
 
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=10) as client:
-            # 1. Get the search results page
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15) as client:
             response = await client.get(search_url)
             response.raise_for_status()
-            
-            # 2. Parse the search results to get URLs
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Find all result containers. This selector might need adjustment if DDG changes their layout.
-            results_container = soup.find_all('div', class_='web-result')
-            
-            urls = []
-            for res in results_container[:num_results]:
-                url_element = res.find('a', class_='result__url')
-                if url_element and url_element.get('href'):
-                    urls.append(url_element['href'])
 
-            if not urls:
+            soup = BeautifulSoup(response.text, "html.parser")
+            results_container = soup.find_all("div", class_="web-result")
+
+            search_entries = []
+            seen_urls = set()
+            for res in results_container:
+                if len(search_entries) >= num_results:
+                    break
+
+                link_element = res.find("a", class_="result__a") or res.find("a", class_="result__url")
+                if not link_element or not link_element.get("href"):
+                    continue
+
+                href = link_element["href"].strip()
+                if not href or href in seen_urls:
+                    continue
+
+                seen_urls.add(href)
+
+                snippet_element = res.find("div", class_="result__snippet")
+                snippet_text = snippet_element.get_text(" ", strip=True) if snippet_element else ""
+
+                title_text = link_element.get_text(" ", strip=True)
+
+                search_entries.append({
+                    "url": href,
+                    "title": title_text,
+                    "serp_snippet": snippet_text,
+                })
+
+            if not search_entries:
                 logger.warning(f"DuckDuckGo web search for '{query}' returned no URLs.")
                 return ""
 
-            # 3. Concurrently fetch content from the result URLs
-            tasks = [client.get(url) for url in urls]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            fetch_tasks = [client.get(entry["url"]) for entry in search_entries]
+            responses = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-        # 4. Parse content from each URL and create snippets
-        results = []
-        for i, resp in enumerate(responses):
-            if isinstance(resp, httpx.Response):
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                title = soup.title.string if soup.title else "No Title"
-                
-                paragraphs = [p.get_text() for p in soup.find_all('p')]
-                snippet = ' '.join(paragraphs[:3]).strip()
-                
-                if snippet:
-                    results.append(f"Source: {urls[i]}\nTitle: {title}\nContent: {snippet}")
-            else:
-                logger.warning(f"Failed to fetch URL {urls[i]}: {resp}")
-        
-        logger.info(f"Successfully scraped {len(results)} pages for query '{query}'.")
-        return "\n\n".join(results)
+        detailed_results = []
+        for entry, resp in zip(search_entries, responses):
+            if not isinstance(resp, httpx.Response):
+                logger.warning(f"Failed to fetch URL {entry['url']}: {resp}")
+                continue
+
+            page_soup = BeautifulSoup(resp.text, "html.parser")
+
+            title = entry["title"] or (page_soup.title.string.strip() if page_soup.title else "No Title")
+
+            meta_desc = ""
+            meta_tag = page_soup.find("meta", attrs={"name": re.compile("^description$", re.IGNORECASE)})
+            if meta_tag and meta_tag.get("content"):
+                meta_desc = meta_tag["content"].strip()
+            if not meta_desc:
+                og_desc = page_soup.find("meta", attrs={"property": "og:description"})
+                if og_desc and og_desc.get("content"):
+                    meta_desc = og_desc["content"].strip()
+
+            paragraphs = [p.get_text(" ", strip=True) for p in page_soup.find_all("p")]
+            paragraphs = [text for text in paragraphs if len(text) > 40]
+
+            list_items = [li.get_text(" ", strip=True) for li in page_soup.find_all("li")]
+            list_items = [text for text in list_items if len(text) > 20][:5]
+
+            combined_text = " ".join(paragraphs)
+            sentences = re.split(r"(?<=[。！？!?\.])\s+", combined_text)
+            key_sentences = []
+            for sentence in sentences:
+                clean_sentence = sentence.strip()
+                if len(clean_sentence) < 30:
+                    continue
+                key_sentences.append(clean_sentence)
+                if len(key_sentences) >= 4:
+                    break
+
+            summary_block = ""
+            if key_sentences:
+                summary_block = "\n".join(f"- {s}" for s in key_sentences)
+            elif paragraphs:
+                summary_candidate = " ".join(paragraphs[:2])
+                if len(summary_candidate) > 600:
+                    summary_candidate = summary_candidate[:600].rstrip() + "…"
+                summary_block = summary_candidate
+            elif entry["serp_snippet"]:
+                summary_block = entry["serp_snippet"]
+
+            bullet_block = ""
+            if list_items:
+                bullet_block = "\n".join(f"- {item}" for item in list_items[:3])
+
+            parts = [f"Source: {entry['url']}"]
+            parts.append(f"Title: {title or 'No Title'}")
+            if entry["serp_snippet"]:
+                parts.append(f"Search Snippet: {entry['serp_snippet']}")
+            if meta_desc:
+                parts.append(f"Meta Description: {meta_desc}")
+            if summary_block:
+                if summary_block.startswith("-"):
+                    parts.append("Key Points:\n" + summary_block)
+                else:
+                    parts.append(f"Summary: {summary_block}")
+            if bullet_block:
+                parts.append("Notable Items:\n" + bullet_block)
+
+            detailed_results.append("\n".join(parts))
+
+        if not detailed_results:
+            logger.warning(f"Failed to extract detailed content for query '{query}'")
+            return ""
+
+        logger.info(f"Successfully scraped {len(detailed_results)} pages for query '{query}'.")
+        return "\n\n".join(detailed_results)
 
     except Exception as e:
         logger.error(f"DuckDuckGo web search and scrape failed for query '{query}': {e}")
@@ -2011,6 +2308,8 @@ async def _get_search_plan_from_ai(
     original_user_prompt: str,
     user_key_info: Dict,
     anti_detection: Any,
+    search_focus: Optional[str] = None,
+    append_current_time: bool = False,
 ) -> Optional[Dict]:
     """
     Calls the AI to generate a search plan (queries and pages).
@@ -2023,11 +2322,21 @@ async def _get_search_plan_from_ai(
         # Get current time and format it
         current_time_str = datetime.now(ZoneInfo("Asia/Shanghai")).strftime('%Y-%m-%d %H:%M:%S')
         
+        planning_target = search_focus or original_user_prompt
+
         planning_prompt = (
             f"Current date is {current_time_str}. Based on the user's request, generate a JSON object with optimal search queries and the number of pages to crawl for each. "
-            f"User Request: '{original_user_prompt}'\n\n"
+            f"User Request: '{planning_target}'\n\n"
             "Rules:\n"
             "- Provide 1 to 3 distinct search queries.\n"
+            "- Design the queries to surface detailed, authoritative sources (official statistics, regulatory filings, primary research, long-form analysis).\n"
+            "- Include modifiers such as 'detailed data', 'comprehensive analysis', 'latest statistics', or domain-specific jargon when it helps retrieve richer information.\n"
+        )
+
+        if append_current_time:
+            planning_prompt += "- When freshness matters, append the exact current Beijing time string to the query.\n"
+
+        planning_prompt += (
             "- For each query, specify 'num_pages' between 2 and 5.\n"
             "- Your response MUST be a valid JSON object in the following format, with no other text or explanations:\n"
             '```json\n'
@@ -2084,7 +2393,9 @@ async def execute_search_flow(
     user_key_info: Dict,
     anti_detection: Any,
     file_storage: Dict,
-    enable_anti_detection: bool = False
+    enable_anti_detection: bool = False,
+    search_focus: Optional[str] = None,
+    append_current_time: bool = False
 ) -> Dict:
     """
     执行搜索流程, 使用 Google 搜索和页面抓取.
@@ -2101,23 +2412,58 @@ async def execute_search_flow(
 
     logger.info(f"Starting AI-driven search flow for prompt: '{original_user_prompt}'")
 
+    search_focus_text = search_focus.strip() if isinstance(search_focus, str) else ""
+
     # 1. Get search plan from AI
-    search_plan = await _get_search_plan_from_ai(db, rate_limiter, original_request, original_user_prompt, user_key_info, anti_detection)
+    search_plan = await _get_search_plan_from_ai(
+        db,
+        rate_limiter,
+        original_request,
+        original_user_prompt,
+        user_key_info,
+        anti_detection,
+        search_focus=search_focus_text or None,
+        append_current_time=append_current_time
+    )
 
     search_tasks_to_run = []
+    time_suffix = None
+    if append_current_time:
+        current_time = datetime.now(ZoneInfo("Asia/Shanghai"))
+        time_suffix = current_time.strftime("%Y-%m-%d %H:%M:%S (UTC+08:00)")
+
+        def _apply_time_suffix(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return value
+            trimmed = value.strip()
+            if not trimmed:
+                return trimmed
+            if time_suffix and time_suffix not in trimmed:
+                return f"{trimmed} {time_suffix}"
+            return trimmed
+    else:
+
+        def _apply_time_suffix(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return value
+            return value.strip()
+
     if search_plan and search_plan.get('search_tasks'):
         logger.info("Executing AI-generated search plan.")
         for task in search_plan['search_tasks']:
             query = task.get('query')
             num_pages = int(task.get('num_pages', 3))
             if query:
-                search_tasks_to_run.append(search_duckduckgo_and_scrape(query, num_results=num_pages))
+                adjusted_query = _apply_time_suffix(query)
+                search_tasks_to_run.append(search_duckduckgo_and_scrape(adjusted_query or query, num_results=num_pages))
     else:
         logger.warning("Failed to get AI search plan, falling back to default behavior.")
         search_config = db.get_search_config()
         num_pages = search_config.get('num_pages_per_query', 3)
+        fallback_query = search_focus_text or original_user_prompt
+        adjusted_fallback = _apply_time_suffix(fallback_query)
         search_tasks_to_run.append(
-            search_duckduckgo_and_scrape(original_user_prompt, num_results=num_pages)
+            search_duckduckgo_and_scrape(adjusted_fallback or original_user_prompt, num_results=num_pages)
         )
 
     # 2. Concurrently perform searches and scrape results

@@ -9,6 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import psutil
 import sys
@@ -16,13 +17,14 @@ from fastapi import (APIRouter, Depends, File, Header, HTTPException,
                      UploadFile)
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from api_models import ChatCompletionRequest, EmbeddingRequest, GeminiEmbeddingRequest
+from api_models import ChatCompletionRequest, ChatMessage, EmbeddingRequest, GeminiEmbeddingRequest
 from api_services import (_execute_deepthink_preprocessing, create_embeddings, create_gemini_native_embeddings, execute_search_flow, make_request_with_failover,
                           make_request_with_fast_failover,
                           should_use_fast_failover,
                           stream_non_stream_keep_alive,
                           stream_with_failover, stream_with_fast_failover,
-                          delete_unhealthy_keys, stream_with_preprocessing)
+                          delete_unhealthy_keys, stream_with_preprocessing,
+                          review_prompt_with_flashlite)
 from api_utils import (GeminiAntiDetectionInjector, check_gemini_key_health,
                        delete_file_from_gemini, get_actual_model_name,
                        inject_prompt_to_messages, openai_to_gemini,
@@ -340,24 +342,86 @@ async def chat_completions(
     # 提前执行提示词注入，以确保在所有模式下都生效
     request.messages = inject_prompt_to_messages(db, request.messages)
 
-    last_user_message = next((m.content for m in reversed(request.messages) if m.role == 'user'), None)
+    original_last_user_message = next(
+        (
+            m.get_text_content() if hasattr(m, 'get_text_content') else str(m.content)
+            for m in reversed(request.messages)
+            if m.role == 'user'
+        ),
+        None
+    )
     actual_model_name = get_actual_model_name(db, request.model)
-    
+
+    review_decision = {
+        "should_search": False,
+        "append_current_time": False,
+        "search_query": None,
+        "analysis": ""
+    }
+    if original_last_user_message:
+        review_decision = await review_prompt_with_flashlite(
+            db,
+            rate_limiter,
+            request,
+            user_key_info,
+            anti_detection
+        )
+
+    manual_search_trigger = False
+    cleaned_last_user_message = original_last_user_message
+    if original_last_user_message and '[search]' in original_last_user_message.lower():
+        manual_search_trigger = True
+        cleaned_last_user_message = re.sub(r'\[search\]', '', original_last_user_message, flags=re.IGNORECASE).strip()
+
+        for msg in request.messages:
+            if msg.role != 'user':
+                continue
+            if isinstance(msg.content, str):
+                msg.content = re.sub(r'\[search\]', '', msg.content, flags=re.IGNORECASE).strip()
+            elif isinstance(msg.content, list):
+                cleaned_parts = []
+                for part in msg.content:
+                    if isinstance(part, str):
+                        cleaned_parts.append(re.sub(r'\[search\]', '', part, flags=re.IGNORECASE).strip())
+                    elif isinstance(part, dict) and 'text' in part:
+                        updated_part = part.copy()
+                        updated_part['text'] = re.sub(r'\[search\]', '', updated_part.get('text', ''), flags=re.IGNORECASE).strip()
+                        cleaned_parts.append(updated_part)
+                    else:
+                        cleaned_parts.append(part)
+                msg.content = cleaned_parts
+
+    last_user_message = cleaned_last_user_message
+    last_user_text = last_user_message.strip() if isinstance(last_user_message, str) else str(last_user_message or "")
+
     # DeepThink Logic
     deepthink_config = db.get_deepthink_config()
-    if deepthink_config.get('enabled') and last_user_message and '[deepthink' in last_user_message.lower():
+    if deepthink_config.get('enabled') and last_user_text and '[deepthink' in last_user_text.lower():
         concurrency = deepthink_config.get('concurrency', 3)
-        match = re.search(r'\[deepthink:(\d+)\]', last_user_message, re.IGNORECASE)
+        match = re.search(r'\[deepthink:(\d+)\]', last_user_text, re.IGNORECASE)
         if match:
             custom_concurrency = int(match.group(1))
-            if 3 <= custom_concurrency <= 7: concurrency = custom_concurrency
+            if 3 <= custom_concurrency <= 7:
+                concurrency = custom_concurrency
             for msg in request.messages:
-                if msg.role == 'user': msg.content = msg.content.replace(match.group(0), '').strip()
+                if msg.role == 'user':
+                    msg.content = msg.content.replace(match.group(0), '').strip()
         else:
             for msg in request.messages:
-                if msg.role == 'user': msg.content = re.sub(r'\[deepthink\]', '', msg.content, flags=re.IGNORECASE).strip()
+                if msg.role == 'user':
+                    msg.content = re.sub(r'\[deepthink\]', '', msg.content, flags=re.IGNORECASE).strip()
 
-        preprocessing_coro = _execute_deepthink_preprocessing(db, rate_limiter, request, actual_model_name, user_key_info, concurrency, anti_detection, file_storage, enable_anti_detection=False)
+        preprocessing_coro = _execute_deepthink_preprocessing(
+            db,
+            rate_limiter,
+            request,
+            actual_model_name,
+            user_key_info,
+            concurrency,
+            anti_detection,
+            file_storage,
+            enable_anti_detection=False
+        )
 
         if request.stream:
             final_streamer = stream_with_fast_failover if await should_use_fast_failover(db) else stream_with_failover
@@ -373,12 +437,32 @@ async def chat_completions(
 
     # Search Logic
     search_config = db.get_search_config()
-    if search_config.get('enabled') and last_user_message and '[search]' in last_user_message.lower():
-        logger.info("Search mode activated")
-        for msg in request.messages:
-            if msg.role == 'user': msg.content = re.sub(r'\[search\]', '', msg.content, flags=re.IGNORECASE).strip()
-        
-        preprocessing_coro = execute_search_flow(db, rate_limiter, request, actual_model_name, user_key_info, anti_detection, file_storage, enable_anti_detection=False)
+    search_focus = review_decision.get('search_query') if isinstance(review_decision.get('search_query'), str) else None
+    if not search_focus and last_user_text:
+        search_focus = last_user_text
+
+    should_execute_search = False
+    if manual_search_trigger and last_user_text:
+        should_execute_search = True
+        search_focus = last_user_text or search_focus
+    elif search_config.get('enabled') and review_decision.get('should_search') and search_focus:
+        should_execute_search = True
+
+    if should_execute_search and last_user_text:
+        logger.info("Search mode activated via pre-input review")
+        search_focus_value = search_focus.strip() if isinstance(search_focus, str) else None
+        preprocessing_coro = execute_search_flow(
+            db,
+            rate_limiter,
+            request,
+            actual_model_name,
+            user_key_info,
+            anti_detection,
+            file_storage,
+            enable_anti_detection=False,
+            search_focus=search_focus_value,
+            append_current_time=bool(review_decision.get('append_current_time'))
+        )
 
         if request.stream:
             final_streamer = stream_with_fast_failover if await should_use_fast_failover(db) else stream_with_failover

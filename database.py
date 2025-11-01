@@ -3,6 +3,7 @@ import json
 import secrets
 import string
 import os
+import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 import threading
@@ -712,6 +713,23 @@ class Database:
             logger.error(f"Failed to set search config: {e}")
             return False
             
+    def _get_effective_active_key_count(self) -> int:
+        """根据当前状态计算可用于容量估算的API Key数量"""
+        try:
+            healthy_count = len(self.get_healthy_gemini_keys())
+            if healthy_count > 0:
+                return healthy_count
+
+            available_count = len(self.get_available_gemini_keys())
+            if available_count > 0:
+                return available_count
+
+            # 最后退回到所有仍处于启用状态的 Key 数量，避免出现配置为 0 的情况
+            return sum(1 for key in self.get_all_gemini_keys() if key.get('status') == 1)
+        except Exception as e:
+            logger.error(f"Failed to calculate effective key count: {e}")
+            return 0
+
     # 模型配置管理
     def get_supported_models(self) -> List[str]:
         """获取支持的模型列表"""
@@ -733,13 +751,12 @@ class Database:
 
                 config = dict(row)
 
-                # 获取健康的API key数量
-                healthy_keys_count = len(self.get_healthy_gemini_keys())
+                effective_keys_count = self._get_effective_active_key_count()
 
                 # 计算总限制
-                config['total_rpm_limit'] = config['single_api_rpm_limit'] * healthy_keys_count
-                config['total_tpm_limit'] = config['single_api_tpm_limit'] * healthy_keys_count
-                config['total_rpd_limit'] = config['single_api_rpd_limit'] * healthy_keys_count
+                config['total_rpm_limit'] = config['single_api_rpm_limit'] * effective_keys_count
+                config['total_tpm_limit'] = config['single_api_tpm_limit'] * effective_keys_count
+                config['total_rpd_limit'] = config['single_api_rpd_limit'] * effective_keys_count
 
                 # 为了兼容原有代码，保留旧字段名
                 config['rpm_limit'] = config['total_rpm_limit']
@@ -759,14 +776,13 @@ class Database:
                 cursor.execute('SELECT * FROM model_configs ORDER BY model_name')
                 configs = [dict(row) for row in cursor.fetchall()]
 
-                # 获取健康的API key数量
-                healthy_keys_count = len(self.get_healthy_gemini_keys())
+                effective_keys_count = self._get_effective_active_key_count()
 
                 # 为每个配置添加总限制
                 for config in configs:
-                    config['total_rpm_limit'] = config['single_api_rpm_limit'] * healthy_keys_count
-                    config['total_tpm_limit'] = config['single_api_tpm_limit'] * healthy_keys_count
-                    config['total_rpd_limit'] = config['single_api_rpd_limit'] * healthy_keys_count
+                    config['total_rpm_limit'] = config['single_api_rpm_limit'] * effective_keys_count
+                    config['total_tpm_limit'] = config['single_api_tpm_limit'] * effective_keys_count
+                    config['total_rpd_limit'] = config['single_api_rpd_limit'] * effective_keys_count
 
                     # 为了兼容原有代码，保留旧字段名
                     config['rpm_limit'] = config['total_rpm_limit']
