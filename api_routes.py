@@ -16,7 +16,7 @@ import psutil
 import sys
 from fastapi import (APIRouter, Depends, File, Header, HTTPException,
                      Request, UploadFile)
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from api_models import (
     ChatCompletionRequest,
@@ -776,6 +776,69 @@ async def ping_keep_alive():
 async def start_cli_oauth(cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager)):
     result = cli_auth_manager.start_authorization()
     return CliAuthStartResponse(**result)
+
+
+@admin_router.get(
+    "/cli-auth/callback",
+    summary="Gemini CLI OAuth 回调",
+    include_in_schema=False,
+)
+async def cli_auth_callback(
+    request: Request,
+    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
+):
+    success, message = cli_auth_manager.handle_remote_callback(str(request.url))
+    status_code = 200 if success else 400
+    html = f"""
+    <!DOCTYPE html>
+    <html lang=\"zh-CN\">
+      <head>
+        <meta charset=\"utf-8\" />
+        <title>Gemini CLI 授权结果</title>
+        <style>
+          body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            margin: 0;
+            padding: 2.5rem 1.5rem;
+            background: #f9fafb;
+            color: #111827;
+            text-align: center;
+          }}
+          .card {{
+            max-width: 420px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #ffffff;
+            border-radius: 18px;
+            box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08);
+          }}
+          .status {{
+            font-size: 1.5rem;
+            margin-bottom: 0.75rem;
+            color: { '#059669' if success else '#dc2626' };
+            font-weight: 600;
+          }}
+          p {{
+            margin: 0.75rem 0;
+            line-height: 1.6;
+          }}
+          .hint {{
+            color: #6b7280;
+            font-size: 0.9rem;
+            margin-top: 1.75rem;
+          }}
+        </style>
+      </head>
+      <body>
+        <div class=\"card\">
+          <div class=\"status\">{ '授权成功' if success else '授权失败' }</div>
+          <p>{message}</p>
+          <p class=\"hint\">您可以关闭此窗口并返回 Gemini 控制台查看授权状态。</p>
+        </div>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=html, status_code=status_code)
 
 
 @admin_router.post(
