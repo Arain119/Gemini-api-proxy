@@ -30,6 +30,3 @@ def get_rate_limiter() -> RateLimitCache:
     raise NotImplementedError("get_rate_limiter dependency must be overridden")
 
 
-def get_cli_auth_manager() -> CliAuthManager:
-    """Dependency for the Gemini CLI auth manager."""
-    raise NotImplementedError("get_cli_auth_manager dependency must be overridden")

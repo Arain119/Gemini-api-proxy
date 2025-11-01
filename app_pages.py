@@ -1,5 +1,6 @@
 import os
 import time
+import json
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -359,114 +360,65 @@ def render_key_management_page():
     with tab1:
         st.markdown("#### 添加新密钥")
 
-        st.markdown("##### 通过 Google 登录 (Gemini CLI)")
-        st.caption("通过引导式配置，使用 Google 账号完成 Gemini CLI 登录，将账号作为新的号池来源。")
+        st.markdown("##### 导入 Google 账号凭证")
+        st.caption("通过上传从官方 Gemini CLI 获取的凭证文件，安全地将您的 Google 账号添加为号池来源。")
 
-        # 步骤状态管理
-        oauth_step = st.session_state.get('oauth_step', 1)
+        # 创建一个容器作为卡片
+        with st.container(border=True):
+            col1, col2 = st.columns([1.2, 0.8])
 
-        # Step 1: 配置引导
-        if oauth_step == 1:
-            st.markdown("###### Step 1: 配置 Google OAuth 凭证")
-            if st.button("开始 Google 登录配置", type="primary"):
-                with st.spinner("正在生成配置信息..."):
-                    result = start_cli_oauth_flow()
-                    if result and result.get('callback_url'):
-                        st.session_state['cli_auth_info'] = result
-                        st.session_state['oauth_step'] = 2
-                        st.rerun()
-                    else:
-                        st.error("未能生成配置信息，请检查后端服务是否正常。")
-            st.info("此过程将引导您在 Google Cloud Console 中完成必要的配置，以确保您的应用实例能够安全地进行身份验证。")
+            with col1:
+                st.markdown("###### 操作指南")
+                st.markdown("1. **安装/更新 Gemini CLI**")
+                st.code("npm install -g @google/gemini-cli", language="bash")
 
-        # Step 2: 执行认证
-        elif oauth_step == 2:
-            st.markdown("###### Step 2: 添加回调 URI 并继续登录")
-            cli_auth_info = st.session_state.get('cli_auth_info')
-            if not cli_auth_info:
-                st.error("配置信息已丢失，请返回上一步重试。")
-                if st.button("返回第一步"):
-                    st.session_state['oauth_step'] = 1
-                    st.rerun()
-                st.stop()
+                st.markdown("2. **执行登录**")
+                st.code("gemini auth login", language="bash")
+                st.caption("运行后，浏览器将打开授权页面，请完成登录。")
 
-            callback_url = cli_auth_info.get('callback_url')
-            auth_url = cli_auth_info.get('authorization_url')
-            state = cli_auth_info.get('state')
-
-            st.markdown("请将以下 **回调 URI** 添加到您在 Google Cloud Console 中的 OAuth 2.0 客户端的“已获授权的重定向 URI”列表中。")
-            st.code(callback_url, language=None)
-            st.markdown(
-                f"[👉 点击这里访问 Google Cloud API 凭据页面](https://console.cloud.google.com/apis/credentials)",
-                unsafe_allow_html=True)
-            st.warning(
-                "**重要提示**：您还需要将您自己的 **客户端ID** 和 **客户端密钥** 配置为服务的环境变量 `GEMINI_CLI_CLIENT_ID` 和 `GEMINI_CLI_CLIENT_SECRET`，然后**重新部署**您的应用。")
-
-            if st.button("我已完成配置，继续登录", type="primary"):
-                st.session_state['oauth_step'] = 3
-                st.rerun()
-
-            if st.button("返回第一步"):
-                st.session_state.pop('cli_auth_info', None)
-                st.session_state['oauth_step'] = 1
-                st.rerun()
-
-        # Step 3: 完成与状态轮询
-        elif oauth_step == 3:
-            st.markdown("###### Step 3: 完成授权")
-            cli_auth_info = st.session_state.get('cli_auth_info')
-            if not cli_auth_info:
-                st.error("授权信息已丢失，请返回第一步重试。")
-                if st.button("返回第一步"):
-                    st.session_state['oauth_step'] = 1
-                    st.rerun()
-                st.stop()
-
-            auth_url = cli_auth_info.get('authorization_url')
-            state = cli_auth_info.get('state')
-
-            # 自动弹出授权窗口
-            if auth_url and st.session_state.get('cli_auth_popup_state') != state:
-                st.session_state['cli_auth_popup_state'] = state
-                st.markdown(
-                    f"<script>window.open('{auth_url}', '_blank');</script>",
-                    unsafe_allow_html=True,
+                st.markdown("3. **找到凭证文件**")
+                st.info(
+                    "**Windows:** `C:\\Users\\<您的用户名>\\.gemini\\credentials.json`\n\n"
+                    "**macOS/Linux:** `~/.gemini/credentials.json`"
                 )
 
-            # 状态检查
-            status_data = get_cli_oauth_status(state) if state else None
-            status_label = (status_data or {}).get('status')
-
-            if status_label == 'completed':
-                result_info = (status_data or {}).get('result') or {}
-                email = result_info.get('account_email') or status_data.get('account_email') or '账号已成功连接'
-                st.success(f"🎉 授权完成！已成功添加账号：{email}")
-            elif status_label == 'failed':
-                message = (status_data or {}).get('message') or '授权失败，请重试。'
-                if "redirect_uri_mismatch" in message:
-                    st.error("错误：`redirect_uri_mismatch`。请确认您已将正确的回调 URI 添加到 Google Cloud Console 并重新部署了应用。")
-                else:
-                    st.error(f"授权失败：{message}")
-            elif status_label == 'callback_received':
-                st.info('已收到授权回调，系统正在后台完成账号同步...')
-            elif status_label == 'pending':
-                st.info('⏳ 等待您在新窗口中完成 Google 登录授权...')
-            else:
-                st.warning('无法确定授权状态，可能已过期或发生错误。')
-
-            st.markdown(f"[👉 点击这里重新打开授权页面]({auth_url})", unsafe_allow_html=True)
-
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button('刷新授权状态', type="secondary"):
-                    st.rerun()
             with col2:
-                if st.button("完成并重置", type="primary"):
-                    st.session_state.pop('cli_auth_info', None)
-                    st.session_state.pop('cli_auth_popup_state', None)
-                    st.session_state['oauth_step'] = 1
-                    st.cache_data.clear()
-                    st.rerun()
+                st.markdown("###### 上传凭证")
+                uploaded_file = st.file_uploader(
+                    "点击或拖拽 `credentials.json` 文件到这里",
+                    type=['json'],
+                    label_visibility="collapsed"
+                )
+
+                if uploaded_file is not None:
+                    try:
+                        credentials_json = uploaded_file.getvalue().decode("utf-8")
+                        # 客户端快速验证
+                        json.loads(credentials_json)
+
+                        if st.button("确认导入凭证", type="primary", use_container_width=True):
+                            with st.spinner("正在导入并验证凭证..."):
+                                result = call_api(
+                                    '/admin/cli-auth/import',
+                                    'POST',
+                                    {'credentials_json': credentials_json, 'label': f'Imported {uploaded_file.name}'}
+                                )
+                                if result and result.get('success'):
+                                    email = result.get('account_email', '未知账号')
+                                    st.success(f"凭证导入成功！已添加账号：{email}")
+                                    st.cache_data.clear()
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error(f"导入失败：{result.get('message', '未知错误')}")
+
+                    except json.JSONDecodeError:
+                        st.error("文件格式无效，请确保上传的是一个有效的 JSON 文件。")
+                    except Exception as e:
+                        st.error(f"处理文件时出错：{e}")
+                else:
+                    # 占位符，使按钮区域高度保持一致
+                    st.button("确认导入凭证", type="primary", use_container_width=True, disabled=True)
 
         st.markdown('<hr style="margin: 1.5rem 0;">', unsafe_allow_html=True)
 

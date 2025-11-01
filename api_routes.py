@@ -43,10 +43,10 @@ from api_utils import (GeminiAntiDetectionInjector, check_gemini_key_health,
 from database import Database
 from api_services import auto_cleanup_failed_keys
 from dependencies import (get_anti_detection, get_db, get_keep_alive_enabled,
-                          get_request_count, get_start_time, get_rate_limiter,
-                          get_cli_auth_manager)
+                          get_request_count, get_start_time, get_rate_limiter)
 from api_utils import RateLimitCache
-from cli_auth import CliAuthManager, finalize_cli_oauth
+from cli_auth import (finalize_cli_oauth,
+                        import_cli_credentials)
 
 
 logger = logging.getLogger(__name__)
@@ -769,130 +769,33 @@ async def ping_keep_alive():
 
 
 @admin_router.post(
-    "/cli-auth/start",
-    summary="启动 Gemini CLI OAuth 登录流程",
-    response_model=CliAuthStartResponse,
-)
-async def start_cli_oauth(cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager)):
-    result = cli_auth_manager.start_authorization()
-    return CliAuthStartResponse(**result)
-
-
-@admin_router.get(
-    "/cli-auth/callback",
-    summary="Gemini CLI OAuth 回调",
-    include_in_schema=False,
-)
-async def cli_auth_callback(
-    request: Request,
-    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
-):
-    success, message = cli_auth_manager.handle_remote_callback(str(request.url))
-    status_code = 200 if success else 400
-    html = f"""
-    <!DOCTYPE html>
-    <html lang=\"zh-CN\">
-      <head>
-        <meta charset=\"utf-8\" />
-        <title>Gemini CLI 授权结果</title>
-        <style>
-          body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-            margin: 0;
-            padding: 2.5rem 1.5rem;
-            background: #f9fafb;
-            color: #111827;
-            text-align: center;
-          }}
-          .card {{
-            max-width: 420px;
-            margin: 0 auto;
-            padding: 2rem;
-            background: #ffffff;
-            border-radius: 18px;
-            box-shadow: 0 20px 45px rgba(15, 23, 42, 0.08);
-          }}
-          .status {{
-            font-size: 1.5rem;
-            margin-bottom: 0.75rem;
-            color: { '#059669' if success else '#dc2626' };
-            font-weight: 600;
-          }}
-          p {{
-            margin: 0.75rem 0;
-            line-height: 1.6;
-          }}
-          .hint {{
-            color: #6b7280;
-            font-size: 0.9rem;
-            margin-top: 1.75rem;
-          }}
-        </style>
-      </head>
-      <body>
-        <div class=\"card\">
-          <div class=\"status\">{ '授权成功' if success else '授权失败' }</div>
-          <p>{message}</p>
-          <p class=\"hint\">您可以关闭此窗口并返回 Gemini 控制台查看授权状态。</p>
-        </div>
-      </body>
-    </html>
-    """
-    return HTMLResponse(content=html, status_code=status_code)
-
-
-@admin_router.post(
-    "/cli-auth/complete",
-    summary="完成 Gemini CLI OAuth 登录并注册密钥",
+    "/cli-auth/import",
+    summary="导入 Gemini CLI 凭证文件",
     response_model=CliAuthCompleteResponse,
 )
-async def complete_cli_oauth(
-    request: CliAuthCompleteRequest,
+async def import_cli_credentials_endpoint(
+    request: dict,
     db: Database = Depends(get_db),
-    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
 ):
-    completed = cli_auth_manager.pop_completed_result(request.state)
-    if completed:
-        error = completed.get("error")
-        if error:
-            raise HTTPException(status_code=400, detail=error)
-        response_data = completed.get("response")
-        if isinstance(response_data, CliAuthCompleteResponse):
-            return response_data
-        return CliAuthCompleteResponse(**response_data)
+    credentials_json = request.get("credentials_json")
+    label = request.get("label")
 
-    if not request.authorization_response and not request.code:
-        status = cli_auth_manager.get_status(request.state)
-        if status.get("status") in {"pending", "callback_received"}:
-            raise HTTPException(status_code=409, detail="Authorization is still pending")
-        raise HTTPException(status_code=400, detail="Either authorization_response or code must be provided")
+    if not credentials_json:
+        raise HTTPException(status_code=400, detail="Missing 'credentials_json' content.")
 
-    credentials = await cli_auth_manager.complete_authorization(
-        request.state,
-        code=request.code,
-        authorization_response=request.authorization_response,
-    )
-    result = await finalize_cli_oauth(
-        db=db,
-        credentials=credentials,
-        label=request.label,
-        state=request.state,
-    )
-    cli_auth_manager.record_completed_result(request.state, result)
-    return result
-
-
-@admin_router.get(
-    "/cli-auth/status/{state}",
-    summary="查询 Gemini CLI OAuth 状态",
-    response_model=CliAuthStatusResponse,
-)
-async def get_cli_oauth_status(
-    state: str,
-    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
-):
-    status = cli_auth_manager.get_status(state)
-    return CliAuthStatusResponse(**status)
+    try:
+        result = await import_cli_credentials(
+            db=db,
+            credentials_json=credentials_json,
+            label=label,
+        )
+        return result
+    except HTTPException as exc:
+        # Re-raise HTTPExceptions to preserve status code and detail
+        raise exc
+    except Exception as exc:
+        logger.error("Failed to import CLI credentials: %s", exc)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {exc}")
 
 
 @admin_router.get("/keys/gemini", summary="获取所有Gemini密钥")

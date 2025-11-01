@@ -251,582 +251,6 @@ DEFAULT_SCOPES = [
 ]
 
 
-class CliAuthManager:
-    """Manage OAuth flows that emulate the Gemini CLI login."""
-
-    def __init__(self, *, database_factory: Optional[Any] = None) -> None:
-        self._lock = threading.RLock()
-        self._sessions: Dict[str, CliAuthSession] = {}
-        self._completed: Dict[str, Dict[str, Any]] = {}
-        self._database_factory = database_factory
-        raw_auto = (os.getenv("GEMINI_CLI_AUTO_FINALIZE") or "true").strip().lower()
-        self._auto_finalize_enabled = bool(database_factory) and raw_auto not in {"0", "false", "no", "off"}
-        self._remote_callback_url = self._resolve_remote_callback_url()
-        self._callback_mode = self._determine_callback_mode()
-
-    # ------------------------------------------------------------------
-    # OAuth flow setup helpers
-    # ------------------------------------------------------------------
-
-    def _determine_callback_mode(self) -> str:
-        forced_mode = (os.getenv("GEMINI_CLI_AUTH_MODE") or "").strip().lower()
-
-        if forced_mode == "loopback":
-            if self._remote_callback_url:
-                logger.info("GEMINI_CLI_AUTH_MODE 强制启用 loopback，忽略远程回调地址")
-            self._remote_callback_url = None
-            return "loopback"
-
-        remote_url = self._remote_callback_url
-        if forced_mode in {"remote", "hosted", "render"}:
-            if not remote_url:
-                remote_url = self._resolve_remote_callback_url()
-                if not remote_url:
-                    logger.warning(
-                        "远程回调模式已启用但缺少 GEMINI_CLI_CALLBACK_URL/GEMINI_CLI_CALLBACK_BASE_URL，"
-                        "将回退至 loopback 模式"
-                    )
-                    return "loopback"
-                self._remote_callback_url = remote_url
-            return "remote"
-
-        if remote_url:
-            return "remote"
-
-        return "loopback"
-
-    def _resolve_remote_callback_url(self) -> Optional[str]:
-        explicit_url = (os.getenv("GEMINI_CLI_CALLBACK_URL") or "").strip()
-        if explicit_url:
-            return explicit_url
-
-        base_url = (os.getenv("GEMINI_CLI_CALLBACK_BASE_URL") or "").strip()
-        if base_url:
-            return self._compose_callback_url(base_url)
-
-        render_external = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
-        if render_external:
-            return self._compose_callback_url(render_external)
-
-        api_base_url = (os.getenv("API_BASE_URL") or "").strip()
-        if api_base_url:
-            parsed = urlparse(api_base_url)
-            if parsed.scheme in {"http", "https"}:
-                hostname = (parsed.hostname or "").lower()
-                if hostname and not self._is_loopback_host(hostname):
-                    return self._compose_callback_url(api_base_url)
-
-        return None
-
-    @staticmethod
-    def _compose_callback_url(base_url: str) -> str:
-        normalized = base_url.strip()
-        if not normalized:
-            return ""
-        if normalized.endswith("/"):
-            normalized = normalized[:-1]
-        return f"{normalized}{CLI_REMOTE_CALLBACK_PATH}"
-
-    @staticmethod
-    def _is_loopback_host(hostname: str) -> bool:
-        """Return True if the hostname refers to a local development address."""
-
-        loopback_hosts = {"localhost", "127.0.0.1", "::1"}
-        if hostname in loopback_hosts:
-            return True
-        return hostname.endswith(".local")
-
-    def _build_client_config(self, redirect_uri: str) -> Dict[str, Any]:
-        client_id = (os.getenv("GEMINI_CLI_CLIENT_ID") or CLI_DEFAULT_CLIENT_ID).strip()
-        client_secret = (os.getenv("GEMINI_CLI_CLIENT_SECRET") or CLI_DEFAULT_CLIENT_SECRET).strip()
-
-        if not client_id:
-            client_id = CLI_DEFAULT_CLIENT_ID
-        if not client_secret:
-            client_secret = CLI_DEFAULT_CLIENT_SECRET
-
-        return {
-            "web": {
-                "client_id": client_id,
-                "project_id": "gemini-cli-proxy",
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "client_secret": client_secret,
-                "redirect_uris": [redirect_uri],
-            }
-        }
-
-    def start_authorization(self) -> Dict[str, Any]:
-        """Initialise the OAuth flow and return the authorization URL."""
-
-        if self._callback_mode == "remote":
-            return self._start_remote_authorization()
-        return self._start_loopback_authorization()
-
-    def _start_remote_authorization(self) -> Dict[str, Any]:
-        callback_url = self._remote_callback_url
-        if not callback_url:
-            raise HTTPException(status_code=500, detail="Remote callback URL is not configured")
-
-        client_config = self._build_client_config(callback_url)
-        flow = Flow.from_client_config(
-            client_config,
-            scopes=DEFAULT_SCOPES,
-            redirect_uri=callback_url,
-        )
-
-        auth_url, state = flow.authorization_url(
-            access_type="offline",
-            include_granted_scopes="true",
-            prompt="consent",
-        )
-
-        loop = asyncio.get_running_loop()
-        session = CliAuthSession(
-            flow=flow,
-            redirect_uri=callback_url,
-            mode="remote",
-            loop=loop,
-            callback_url=callback_url,
-        )
-
-        with self._lock:
-            self._sessions[state] = session
-
-        logger.info(
-            "Started Gemini CLI OAuth flow in remote mode with state %s and callback %s",
-            state,
-            callback_url,
-        )
-
-        return {
-            "authorization_url": auth_url,
-            "state": state,
-            "redirect_uri": callback_url,
-            "mode": "remote",
-            "callback_url": callback_url,
-            "auto_finalize": self._auto_finalize_enabled,
-        }
-
-    def _start_loopback_authorization(self) -> Dict[str, Any]:
-        host = (os.getenv("GEMINI_CLI_LOOPBACK_HOST") or CLI_LOOPBACK_DEFAULT_HOST).strip() or CLI_LOOPBACK_DEFAULT_HOST
-
-        port_candidates = []
-        env_port = os.getenv("GEMINI_CLI_LOOPBACK_PORT")
-        if env_port:
-            try:
-                parsed = int(env_port)
-                if 0 <= parsed <= 65535:
-                    port_candidates.append(parsed)
-            except ValueError:
-                logger.warning("Invalid GEMINI_CLI_LOOPBACK_PORT value '%s' - falling back to defaults", env_port)
-
-        if CLI_LOOPBACK_DEFAULT_PORT not in port_candidates:
-            port_candidates.append(CLI_LOOPBACK_DEFAULT_PORT)
-        port_candidates.append(0)
-
-        handler_cls = self._create_loopback_handler()
-        server: Optional[ThreadingHTTPServer] = None
-        bound_port: Optional[int] = None
-
-        for candidate in port_candidates:
-            try:
-                server = ThreadingHTTPServer((host, candidate), handler_cls)
-            except OSError as exc:
-                logger.warning("Failed to bind loopback server on %s:%s (%s)", host, candidate, exc)
-                continue
-            else:
-                bound_port = server.server_address[1]
-                break
-
-        if not server or bound_port is None:
-            raise HTTPException(status_code=500, detail="Failed to start loopback callback server")
-
-        redirect_path = CLI_LOOPBACK_REDIRECT_PATH
-        redirect_uri = f"http://{host}:{bound_port}{redirect_path}"
-        client_config = self._build_client_config(redirect_uri)
-        flow = Flow.from_client_config(
-            client_config,
-            scopes=DEFAULT_SCOPES,
-            redirect_uri=redirect_uri,
-        )
-
-        auth_url, state = flow.authorization_url(
-            access_type="offline",
-            include_granted_scopes="true",
-            prompt="consent",
-        )
-
-        loop = asyncio.get_running_loop()
-        session = CliAuthSession(
-            flow=flow,
-            redirect_uri=redirect_uri,
-            mode="loopback",
-            loop=loop,
-            loopback_host=host,
-            loopback_port=bound_port,
-            loopback_server=server,
-        )
-
-        server.expected_state = state  # type: ignore[attr-defined]
-        server.redirect_path = redirect_path  # type: ignore[attr-defined]
-
-        with self._lock:
-            self._sessions[state] = session
-
-        thread = threading.Thread(target=self._serve_loopback, args=(state, session), daemon=True)
-        session.loopback_thread = thread
-        thread.start()
-
-        logger.info(
-            "Started Gemini CLI OAuth flow in loopback mode with state %s on %s:%s",
-            state,
-            host,
-            bound_port,
-        )
-
-        return {
-            "authorization_url": auth_url,
-            "state": state,
-            "redirect_uri": redirect_uri,
-            "mode": "loopback",
-            "loopback_host": host,
-            "loopback_port": bound_port,
-            "auto_finalize": self._auto_finalize_enabled,
-        }
-
-    def _create_loopback_handler(self):
-        manager = self
-
-        class LoopbackHandler(BaseHTTPRequestHandler):
-            def log_message(self, format: str, *args: Any) -> None:  # pragma: no cover - reduce noise
-                logger.debug("Loopback OAuth callback: " + format, *args)
-
-            def do_GET(self) -> None:  # noqa: N802
-                state = getattr(self.server, "expected_state", None)  # type: ignore[attr-defined]
-                manager._process_loopback_request(self, state)
-
-        return LoopbackHandler
-
-    def _serve_loopback(self, state: str, session: CliAuthSession) -> None:
-        server = session.loopback_server
-        if not server:
-            return
-
-        try:
-            server.serve_forever(poll_interval=0.5)
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Loopback server error for state %s: %s", state, exc)
-        finally:
-            try:
-                server.server_close()
-            except Exception:  # pragma: no cover - best effort cleanup
-                pass
-
-    def _process_loopback_request(self, handler: BaseHTTPRequestHandler, state: Optional[str]) -> None:
-        if not state:
-            self._redirect_loopback(handler, success=False)
-            return
-
-        parsed = urlparse(handler.path)
-        params = parse_qs(parsed.query)
-        error = params.get("error", [None])[0]
-        error_description = params.get("error_description", [None])[0]
-
-        expected_path = getattr(handler.server, "redirect_path", CLI_LOOPBACK_REDIRECT_PATH)  # type: ignore[attr-defined]
-        if parsed.path != expected_path:
-            message = f"OAuth callback not received on expected path: {parsed.path}"
-            logger.error(message)
-            self._register_loopback_error(state, message)
-            self._redirect_loopback(handler, success=False)
-            return
-
-        host_header = handler.headers.get("Host")
-        if not host_header:
-            server_address = handler.server.server_address  # type: ignore[attr-defined]
-            host_header = f"{server_address[0]}:{server_address[1]}"
-        authorization_response = f"http://{host_header}{handler.path}"
-
-        if error:
-            message = error_description or "Google OAuth 返回错误"
-            self._register_loopback_error(state, message)
-            self._redirect_loopback(handler, success=False)
-            return
-
-        if self._register_loopback_response(state, authorization_response):
-            self._redirect_loopback(handler, success=True)
-        else:
-            logger.warning("Received OAuth callback for expired or unknown state %s", state)
-            self._redirect_loopback(handler, success=False)
-
-    def _redirect_loopback(
-        self,
-        handler: BaseHTTPRequestHandler,
-        *,
-        success: bool,
-    ) -> None:
-        location = SIGN_IN_SUCCESS_URL if success else SIGN_IN_FAILURE_URL
-        handler.send_response(301)
-        handler.send_header("Location", location)
-        handler.end_headers()
-
-    def _register_loopback_response(self, state: str, authorization_response: str) -> bool:
-        return self._register_authorization_response(
-            state,
-            authorization_response,
-            expected_mode="loopback",
-        )
-
-    def _register_loopback_error(self, state: str, message: str) -> None:
-        self._register_error(state, message, expected_mode="loopback")
-
-    def _register_authorization_response(
-        self,
-        state: str,
-        authorization_response: str,
-        *,
-        expected_mode: str,
-    ) -> bool:
-        with self._lock:
-            session = self._sessions.get(state)
-
-        if not session or session.mode != expected_mode:
-            return False
-
-        session.authorization_response = authorization_response
-        session.error = None
-        session.event.set()
-
-        server = session.loopback_server
-        if server:
-            threading.Thread(target=server.shutdown, daemon=True).start()
-
-        logger.info(
-            "Received %s OAuth callback for state %s",
-            expected_mode,
-            state,
-        )
-
-        if self._auto_finalize_enabled and self._database_factory:
-            self._schedule_auto_finalize(state, session)
-
-        return True
-
-    def _register_error(
-        self,
-        state: str,
-        message: str,
-        *,
-        expected_mode: Optional[str] = None,
-    ) -> None:
-        with self._lock:
-            session = self._sessions.get(state)
-
-        if session and (expected_mode is None or session.mode == expected_mode):
-            session.error = message
-            session.event.set()
-            server = session.loopback_server
-            if server:
-                threading.Thread(target=server.shutdown, daemon=True).start()
-
-        logger.error(
-            "OAuth callback failed for state %s (%s): %s",
-            state,
-            session.mode if session else expected_mode or "unknown",
-            message,
-        )
-        self._store_completed_result(state, error=message)
-
-    def handle_remote_callback(self, full_url: str) -> Tuple[bool, str]:
-        if self._callback_mode != "remote":
-            return False, "服务器未启用远程回调模式，请刷新后重试"
-
-        parsed = urlparse(full_url)
-        params = parse_qs(parsed.query)
-
-        state = params.get("state", [None])[0]
-        if not state:
-            return False, "缺少 state 参数，无法完成授权"
-
-        error = params.get("error", [None])[0]
-        error_description = params.get("error_description", [None])[0]
-
-        if error:
-            message = error_description or "Google OAuth 返回错误"
-            self._register_error(state, message, expected_mode="remote")
-            return False, message
-
-        if self._register_authorization_response(state, full_url, expected_mode="remote"):
-            return True, "授权成功，系统正在同步 CLI 账号。"
-
-        message = "授权状态已过期或不存在，请返回控制台重新发起登录。"
-        return False, message
-
-    def _schedule_auto_finalize(self, state: str, session: CliAuthSession) -> None:
-        if not self._auto_finalize_enabled or not self._database_factory or not session.loop:
-            return
-
-        try:
-            asyncio.run_coroutine_threadsafe(self._auto_finalize(state), session.loop)
-        except RuntimeError as exc:  # pragma: no cover - event loop closed
-            logger.warning("Failed to schedule auto-finalization for state %s: %s", state, exc)
-
-    async def _auto_finalize(self, state: str) -> None:
-        try:
-            credentials = await self.complete_authorization(state)
-        except HTTPException as exc:
-            self._store_completed_result(state, error=str(exc.detail))
-            return
-        except Exception as exc:  # pragma: no cover - defensive logging
-            self._store_completed_result(state, error=str(exc))
-            return
-
-        db = self._database_factory() if callable(self._database_factory) else self._database_factory
-        if not db:
-            self._store_completed_result(state, error="数据库不可用，无法自动完成授权")
-            return
-
-        try:
-            response = await finalize_cli_oauth(db=db, credentials=credentials, label=None, state=state)
-        except HTTPException as exc:
-            self._store_completed_result(state, error=str(exc.detail))
-        except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Failed to auto-finalize CLI OAuth for state %s: %s", state, exc)
-            self._store_completed_result(state, error=str(exc))
-        else:
-            self._store_completed_result(state, response=response)
-
-    def _store_completed_result(
-        self,
-        state: str,
-        *,
-        response: Optional[CliAuthCompleteResponse] = None,
-        error: Optional[str] = None,
-    ) -> None:
-        if not response and not error:
-            return
-
-        with self._lock:
-            if response:
-                self._completed[state] = {"response": response}
-            else:
-                self._completed[state] = {"error": error}
-
-    def record_completed_result(self, state: str, response: CliAuthCompleteResponse) -> None:
-        """Expose completion storage for manual flows."""
-
-        self._store_completed_result(state, response=response)
-
-    def get_status(self, state: str) -> Dict[str, Any]:
-        with self._lock:
-            completed = self._completed.get(state)
-            if completed:
-                if completed.get("response"):
-                    response: CliAuthCompleteResponse = completed["response"]
-                    return {
-                        "state": state,
-                        "status": "completed",
-                        "account_email": response.account_email,
-                        "auto_finalize": self._auto_finalize_enabled,
-                        "result": response.dict(),
-                    }
-                return {
-                    "state": state,
-                    "status": "failed",
-                    "message": completed.get("error"),
-                    "auto_finalize": self._auto_finalize_enabled,
-                }
-
-            session = self._sessions.get(state)
-            if not session:
-                return {"state": state, "status": "unknown", "auto_finalize": self._auto_finalize_enabled}
-
-            if session.error:
-                return {
-                    "state": state,
-                    "status": "failed",
-                    "message": session.error,
-                    "auto_finalize": self._auto_finalize_enabled,
-                }
-
-            if session.authorization_response:
-                return {
-                    "state": state,
-                    "status": "callback_received",
-                    "auto_finalize": self._auto_finalize_enabled,
-                }
-
-            return {
-                "state": state,
-                "status": "pending",
-                "auto_finalize": self._auto_finalize_enabled,
-            }
-
-    def pop_completed_result(self, state: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self._completed.pop(state, None)
-
-    async def complete_authorization(
-        self,
-        state: str,
-        *,
-        code: Optional[str] = None,
-        authorization_response: Optional[str] = None,
-    ) -> google_credentials.Credentials:
-        """Complete the OAuth flow and return Google credentials."""
-
-        with self._lock:
-            session = self._sessions.get(state)
-
-        if not session:
-            completed = self._completed.get(state)
-            if completed and completed.get("response"):
-                raise HTTPException(status_code=409, detail="Authorization already completed")
-            raise HTTPException(status_code=400, detail="Invalid or expired authorization state")
-
-        if not authorization_response and session.authorization_response:
-            authorization_response = session.authorization_response
-
-        def _fetch_token() -> None:
-            if authorization_response:
-                session.flow.fetch_token(authorization_response=authorization_response)
-            elif code:
-                session.flow.fetch_token(code=code)
-            else:
-                raise ValueError("Either authorization_response or code must be provided")
-
-        try:
-            await asyncio.to_thread(_fetch_token)
-        except Exception as exc:  # pragma: no cover - pass through detailed errors
-            logger.error("OAuth token exchange failed for state %s: %s", state, exc)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        credentials = session.flow.credentials
-        if not credentials:
-            raise HTTPException(status_code=500, detail="OAuth flow did not return credentials")
-
-        with self._lock:
-            self._sessions.pop(state, None)
-
-        self._cleanup_session(session)
-
-        logger.info("Completed Gemini CLI OAuth flow for state %s", state)
-        return credentials
-
-    def _cleanup_session(self, session: CliAuthSession) -> None:
-        server = session.loopback_server
-        if server:
-            try:
-                threading.Thread(target=server.shutdown, daemon=True).start()
-            except Exception:  # pragma: no cover - best effort cleanup
-                pass
-
-        thread = session.loopback_thread
-        if thread and thread.is_alive():
-            thread.join(timeout=1.0)
-
-
 async def fetch_account_email(access_token: str) -> Optional[str]:
     """Fetch the authenticated account's email using Google UserInfo API."""
 
@@ -900,6 +324,78 @@ async def finalize_cli_oauth(
         account_id=account_id,
         gemini_key_id=key_entry["id"],
         state=state,
+        account_email=email,
+    )
+
+
+async def import_cli_credentials(
+    *,
+    db: Database,
+    credentials_json: str,
+    label: Optional[str],
+) -> CliAuthCompleteResponse:
+    """Store imported CLI OAuth credentials and register a corresponding Gemini key."""
+
+    try:
+        info = json.loads(credentials_json)
+        # Basic validation
+        if not all(k in info for k in ["client_id", "client_secret", "refresh_token"]):
+             raise ValueError("Invalid credentials format. Missing required keys (client_id, client_secret, refresh_token).")
+        credentials = _load_credentials(credentials_json)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid credentials JSON: {exc}") from exc
+
+    # We must refresh to verify the credentials and get a valid access token.
+    if not credentials.refresh_token:
+        raise HTTPException(status_code=400, detail="Credentials must include a refresh_token.")
+
+    try:
+        # Run refresh in a thread to avoid blocking the event loop
+        await asyncio.to_thread(credentials.refresh, GoogleRequest())
+    except Exception as exc:
+        logger.error("Failed to refresh imported CLI credentials: %s", exc)
+        raise HTTPException(status_code=401, detail=f"Failed to refresh imported credentials. They might be expired or invalid: {exc}") from exc
+
+    access_token = getattr(credentials, "token", None)
+    email = await fetch_account_email(access_token) if access_token else None
+    
+    # Use the refreshed credentials JSON for storage
+    refreshed_credentials_json = credentials.to_json()
+
+    try:
+        account_id = db.create_cli_account(refreshed_credentials_json, email, label)
+    except Exception as exc:
+        logger.error("Failed to store imported CLI OAuth credentials: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store CLI credentials") from exc
+
+    metadata = {"cli_account_id": account_id}
+    if email:
+        metadata["account_email"] = email
+    key_value = f"cli-account-{account_id}"
+
+    if not db.add_gemini_key(key_value, source_type="cli_oauth", metadata=metadata):
+        key_entry = db.get_gemini_key_by_value(key_value)
+        if not key_entry:
+            raise HTTPException(status_code=500, detail="Failed to register CLI-backed Gemini key after import")
+    else:
+        key_entry = db.get_gemini_key_by_value(key_value)
+
+    if not key_entry:
+        raise HTTPException(status_code=500, detail="Failed to load CLI-backed Gemini key after import")
+
+    existing_metadata = dict(key_entry.get("metadata") or {})
+    merged_metadata = {**existing_metadata, **metadata}
+    if merged_metadata != existing_metadata:
+        db.update_gemini_key(key_entry["id"], metadata=merged_metadata)
+        key_entry = db.get_gemini_key_by_value(key_value)
+
+    if email:
+        db.update_cli_account_credentials(account_id, refreshed_credentials_json, email)
+
+    return CliAuthCompleteResponse(
+        account_id=account_id,
+        gemini_key_id=key_entry["id"],
+        state="imported",
         account_email=email,
     )
 

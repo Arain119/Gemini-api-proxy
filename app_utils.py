@@ -229,17 +229,6 @@ def delete_unhealthy_gemini_keys() -> Optional[Dict]:
     return result
 
 
-def start_cli_oauth_flow() -> Optional[Dict]:
-    """启动 Gemini CLI OAuth 流程"""
-    return call_api('/admin/cli-auth/start', 'POST', data={})
-
-
-def get_cli_oauth_status(state: str) -> Optional[Dict]:
-    """查询 Gemini CLI OAuth 登录状态"""
-    endpoint = f'/admin/cli-auth/status/{state}'
-    return call_api(endpoint, 'GET')
-
-
 def get_health_status_color(health_status: str) -> str:
     """获取健康状态颜色"""
     status_colors = {
