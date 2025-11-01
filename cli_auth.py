@@ -211,14 +211,14 @@ async def _ensure_cli_account_metadata(
 
     db.touch_cli_account(account_id)
 
+# NOTE: Keep this list aligned with the scopes requested by the official
+# gemini-cli project. Asking for extra scopes (like the deprecated
+# `generative-language.retrieval`) causes Google OAuth to return
+# `invalid_scope` and blocks users from signing in.
 DEFAULT_SCOPES = [
-    "openid",
-    "email",
+    "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/generative-language",
-    "https://www.googleapis.com/auth/generative-language.retrieval",
 ]
 
 
@@ -237,6 +237,21 @@ class CliAuthManager:
         base_url = os.getenv("EXTERNAL_BASE_URL")
         if base_url:
             return base_url.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
+
+        render_external_url = os.getenv("RENDER_EXTERNAL_URL")
+        if render_external_url:
+            return render_external_url.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
+
+        render_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        if render_hostname:
+            hostname = render_hostname.strip()
+            if not hostname:
+                return f"http://localhost:8765{CLI_DEFAULT_REDIRECT_PATH}"
+            if "://" in hostname:
+                base = hostname
+            else:
+                base = f"https://{hostname}"
+            return base.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
 
         return f"http://localhost:8765{CLI_DEFAULT_REDIRECT_PATH}"
 
