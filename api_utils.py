@@ -648,10 +648,12 @@ def openai_to_gemini(db: Database, request: ChatCompletionRequest, anti_detectio
     thinking_cfg_obj = types.ThinkingConfig(**thinking_config) if thinking_config else None
     
     generation_config = types.GenerateContentConfig(
-        temperature=request.temperature, top_p=request.top_p, candidate_count=request.n,
-        thinking_config=thinking_cfg_obj, max_output_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        candidate_count=request.n,
+        thinking_config=thinking_cfg_obj,
+        max_output_tokens=request.max_tokens,
         stop_sequences=request.stop,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
     )
     
     gemini_request = {
