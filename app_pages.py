@@ -28,8 +28,6 @@ from app_utils import (
     get_recent_logs,
     get_cached_deepthink_config,
     update_deepthink_config,
-    start_cli_oauth_flow,
-    get_cli_oauth_status,
 )
 
 def render_dashboard_page():
