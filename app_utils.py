@@ -38,10 +38,27 @@ def call_api(endpoint: str, method: str = 'GET', data: Any = None, timeout: int 
             else:
                 raise ValueError(f"不支持的方法: {method}")
 
-            if response.status_code == 200:
+            if 200 <= response.status_code < 300:
                 return response.json()
             else:
-                st.error(f"API错误: {response.status_code}")
+                error_message = f"API错误: {response.status_code}"
+                detail = None
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        detail = payload.get("detail") or payload.get("message")
+                except ValueError:
+                    payload = None
+
+                if not detail and response.text:
+                    text_detail = response.text.strip()
+                    if text_detail and text_detail != str(response.status_code):
+                        detail = text_detail[:200]
+
+                if detail:
+                    error_message = f"{error_message} - {detail}"
+
+                st.error(error_message)
                 return None
 
     except requests.exceptions.Timeout:

@@ -1,9 +1,11 @@
+import json
 import os
 import time
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from app_utils import (
     API_BASE_URL,
     call_api,
@@ -378,28 +380,51 @@ def render_key_management_page():
             auth_url = cli_auth_info.get('authorization_url')
             state = cli_auth_info.get('state')
             mode = (cli_auth_info.get('mode') or 'loopback').lower()
-            loopback_host = cli_auth_info.get('loopback_host') or '127.0.0.1'
-            loopback_port = cli_auth_info.get('loopback_port') or 8765
-            redirect_uri = cli_auth_info.get('redirect_uri') or f'http://{loopback_host}:{loopback_port}/oauth2callback'
+            loopback_host = cli_auth_info.get('loopback_host')
+            loopback_port = cli_auth_info.get('loopback_port')
+            redirect_uri = cli_auth_info.get('redirect_uri')
+            callback_url = cli_auth_info.get('callback_url') or redirect_uri
+            loopback_hint = redirect_uri
+            if not loopback_hint and loopback_host and loopback_port:
+                loopback_hint = f'http://{loopback_host}:{loopback_port}/oauth2callback'
 
             status_data = get_cli_oauth_status(state) if state else None
             status_label = (status_data or {}).get('status')
 
             if mode == 'loopback':
-                callback_hint = redirect_uri
+                callback_hint = loopback_hint or 'http://127.0.0.1:8765/oauth2callback'
                 st.caption(
                     "本次授权沿用 Gemini CLI 的本地回调模式。\n"
                     f"回调地址：`{callback_hint}`\n"
                     + "授权完成后系统会自动创建新的 CLI 账号。"
                 )
+                instructions = [
+                    "1. 浏览器会打开新的 Google 登录窗口",
+                    "2. 完成授权后，Google 页面会提示成功或失败",
+                    "3. 授权成功后系统会自动创建新的 CLI 账号",
+                ]
+            elif mode == 'remote':
+                st.caption(
+                    "当前部署启用了云端回调模式，Google 登录会直接跳回服务器完成授权同步。"
+                )
+                st.caption(
+                    f"检测到的 API 基础地址：`{API_BASE_URL}`"
+                )
+                if callback_url:
+                    st.caption(f"回调地址：`{callback_url}`")
+                instructions = [
+                    "1. 浏览器会打开新的 Google 登录窗口",
+                    "2. 完成授权后，Google 页面会自动跳转回服务器并显示授权结果",
+                    "3. 返回此控制台点击“刷新授权状态”以同步新的 CLI 账号",
+                    "4. 首次部署时，请确保在 Google Cloud Console 的 OAuth 客户端中加入上述回调地址",
+                ]
             else:
-                st.caption("当前使用本地回调模式，授权完成后系统会自动同步。")
-
-            instructions = [
-                "1. 浏览器会打开新的 Google 登录窗口",
-                "2. 完成授权后，Google 页面会提示成功或失败",
-                "3. 授权成功后系统会自动创建新的 CLI 账号",
-            ]
+                st.caption("当前授权模式未知，如遇问题请重新生成授权链接。")
+                instructions = [
+                    "1. 浏览器会打开新的 Google 登录窗口",
+                    "2. 完成授权后，Google 页面会提示成功或失败",
+                    "3. 授权成功后系统会自动创建新的 CLI 账号",
+                ]
             st.info("\n".join(instructions))
 
             if auth_url:
@@ -407,9 +432,23 @@ def render_key_management_page():
 
             if auth_url and st.session_state.get('cli_auth_popup_state') != state:
                 st.session_state['cli_auth_popup_state'] = state
-                st.markdown(
-                    f"<script>window.open('{auth_url}', '_blank');</script>",
-                    unsafe_allow_html=True,
+                components.html(
+                    f"""
+                    <script>
+                      const authUrl = {json.dumps(auth_url)};
+                      const popup = window.open(authUrl, '_blank', 'noopener,noreferrer');
+                      if (!popup) {{
+                        const link = document.createElement('a');
+                        link.href = authUrl;
+                        link.target = '_blank';
+                        link.rel = 'noopener noreferrer';
+                        document.body.appendChild(link);
+                        link.click();
+                        link.remove();
+                      }}
+                    </script>
+                    """,
+                    height=0,
                 )
 
             if status_label == 'completed':
@@ -429,7 +468,7 @@ def render_key_management_page():
             col_status, col_clear = st.columns([1, 1])
             with col_status:
                 if st.button('刷新授权状态', key='refresh_cli_auth_status', type='secondary'):
-                    st.experimental_rerun()
+                    st.rerun()
             with col_clear:
                 if st.button("清除提示", key="clear_cli_auth", type="secondary"):
                     st.session_state.pop('cli_auth_info', None)
