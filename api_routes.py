@@ -704,12 +704,37 @@ async def update_response_decryption_config_endpoint(request: dict, db: Database
 
 @admin_router.get("/keep-alive/status", summary="获取 Keep-Alive 状态")
 async def get_keep_alive_status(db: Database = Depends(get_db)):
-    return {"success": True, "config": db.get_keep_alive_config()}
+    import api_server
+
+    config = db.get_keep_alive_config()
+    config['runtime_enabled'] = api_server.keep_alive_enabled
+    return {"success": True, "config": config}
 
 @admin_router.post("/keep-alive/toggle", summary="切换 Keep-Alive 状态")
 async def toggle_keep_alive(request: dict, db: Database = Depends(get_db)):
-    db.set_keep_alive_config(enabled=request.get('enabled'))
-    return {"success": True, "message": "Keep-Alive status updated"}
+    if 'enabled' not in request:
+        raise HTTPException(status_code=400, detail="Missing 'enabled' field")
+
+    raw_value = request.get('enabled')
+    if isinstance(raw_value, bool):
+        desired_state = raw_value
+    elif isinstance(raw_value, str):
+        desired_state = raw_value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    elif isinstance(raw_value, (int, float)):
+        desired_state = bool(raw_value)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid value for 'enabled'")
+
+    db.set_keep_alive_config(enabled=desired_state)
+
+    import api_server
+
+    await api_server.update_keep_alive_state(desired_state)
+
+    config = db.get_keep_alive_config()
+    config['runtime_enabled'] = api_server.keep_alive_enabled
+
+    return {"success": True, "message": "Keep-Alive status updated", "config": config}
 
 @admin_router.post("/keep-alive/ping", summary="手动触发 Keep-Alive")
 async def ping_keep_alive():
