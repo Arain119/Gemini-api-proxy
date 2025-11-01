@@ -2206,6 +2206,38 @@ async def create_gemini_native_embeddings(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def stream_with_preprocessing(
+    preprocessing_coro: Coroutine,
+    final_streamer: Coroutine,
+    db: Database,
+    rate_limiter: RateLimitCache,
+    request: ChatCompletionRequest,
+    model_name: str,
+    user_key_info: Dict
+) -> AsyncGenerator[bytes, None]:
+    """
+    一个包装器，首先执行异步预处理，然后将结果传递给最终的流式处理函数。
+    """
+    try:
+        # 1. 等待预处理协程完成，获取最终的 gemini_request
+        final_gemini_request = await preprocessing_coro
+        
+        # 2. 使用预处理后的请求，调用并迭代最终的流式处理函数
+        async for chunk in final_streamer(db, rate_limiter, final_gemini_request, request, model_name, user_key_info):
+            yield chunk
+            
+    except HTTPException as e:
+        # 捕获预处理或流式处理中的HTTP异常，并以流式错误格式返回
+        error_data = {"error": {"message": e.detail, "code": e.status_code}}
+        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+    except Exception as e:
+        # 捕获其他未知异常
+        logger.error(f"Error in stream_with_preprocessing: {e}")
+        error_data = {"error": {"message": str(e), "code": 500}}
+        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+
 async def _execute_deepthink_preprocessing(
     db: Database,
     rate_limiter: RateLimitCache,
