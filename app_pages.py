@@ -376,14 +376,15 @@ def render_key_management_page():
 
                 st.markdown("3. **找到凭证文件**")
                 st.info(
-                    "**Windows:** `C:\\Users\\<您的用户名>\\.gemini\\credentials.json`\n\n"
-                    "**macOS/Linux:** `~/.gemini/credentials.json`"
+                    "登录成功后，CLI 会在您的用户主目录中创建一个凭证文件。\n\n"
+                    "**Windows:** `C:\\Users\\<您的用户名>\\.gemini\\oauth_creds.json`\n\n"
+                    "**macOS/Linux:** `~/.gemini/oauth_creds.json`"
                 )
 
             with col2:
                 st.markdown("###### 上传凭证")
                 uploaded_file = st.file_uploader(
-                    "点击或拖拽 `credentials.json` 文件到这里",
+                    "点击或拖拽 `oauth_creds.json` 文件到这里",
                     type=['json'],
                     label_visibility="collapsed"
                 )
@@ -407,8 +408,9 @@ def render_key_management_page():
                                     st.cache_data.clear()
                                     time.sleep(1)
                                     st.rerun()
-                                else:
+                                elif result:  # API call succeeded but operation failed
                                     st.error(f"导入失败：{result.get('message', '未知错误')}")
+                                # If result is None, call_api has already shown an error.
 
                     except json.JSONDecodeError:
                         st.error("文件格式无效，请确保上传的是一个有效的 JSON 文件。")
