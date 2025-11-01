@@ -143,6 +143,16 @@ Key 3: AIzaSyZZZZZZZZZZZZZZZZZZZZZZ
    - **2.5flash最大思考预算 (24k)**：快速响应
    - **2.5pro最大思考预算 (32k)**：深度思考
 
+### 5. 在 Render 上完成 Gemini CLI 登录
+
+Gemini CLI 登录支持两种模式：本地 loopback（默认）与远程回调。若你按照 `render.yaml` 同时部署了 FastAPI 后端和 Streamlit 管理台，只需完成下列配置即可自动启用远程模式：
+
+1. 在 **前端（Streamlit）服务** 的环境变量中设置 `API_BASE_URL=https://<你的后端服务>.onrender.com`。
+2. 后端服务会依次检查 `GEMINI_CLI_CALLBACK_URL`、`GEMINI_CLI_CALLBACK_BASE_URL`、Render 注入的 `RENDER_EXTERNAL_URL`，最后回退到 `API_BASE_URL`。只要该地址不是 `localhost`，`CliAuthManager` 会判定为云端部署并生成 `https://<后端>/admin/cli-auth/callback` 作为 Google OAuth 回调地址。【F:cli_auth.py†L298-L329】
+3. 管理台的「通过 Google 登录」卡片会根据返回的 `mode` 显示“云端回调模式”，同时在提示中展示检测到的 `API_BASE_URL` 与具体回调 URL，方便确认配置是否生效。【F:app_pages.py†L360-L417】
+
+完成授权后，Google 会直接重定向至后端的 `/admin/cli-auth/callback`，服务会保存授权结果并自动为号池创建新的 CLI 账号。你只需返回管理台点击“刷新授权状态”即可看到新账号同步成功。
+
 ## 📡 使用 API
 
 配置完成后，你就可以使用 OpenAI SDK 访问轮询代理了。系统会自动在多个 Gemini Key 之间进行轮询，提供更高的请求限制和稳定性。
