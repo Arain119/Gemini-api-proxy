@@ -1,5 +1,4 @@
 import asyncio
-import asyncio
 import json
 import logging
 import os
@@ -29,6 +28,7 @@ CLI_DEFAULT_CLIENT_SECRET = "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"
 CLI_LOOPBACK_DEFAULT_HOST = "127.0.0.1"
 CLI_LOOPBACK_DEFAULT_PORT = 8765
 CLI_LOOPBACK_REDIRECT_PATH = "/oauth2callback"
+CLI_REMOTE_CALLBACK_PATH = "/admin/cli-auth/callback"
 
 SIGN_IN_SUCCESS_URL = "https://developers.google.com/gemini-code-assist/auth_success_gemini"
 SIGN_IN_FAILURE_URL = "https://developers.google.com/gemini-code-assist/auth_failure_gemini"
@@ -48,6 +48,7 @@ class CliAuthSession:
     redirect_uri: str
     mode: str
     loop: Optional[asyncio.AbstractEventLoop] = None
+    callback_url: Optional[str] = None
     loopback_host: Optional[str] = None
     loopback_port: Optional[int] = None
     loopback_server: Optional[ThreadingHTTPServer] = None
@@ -260,10 +261,80 @@ class CliAuthManager:
         self._database_factory = database_factory
         raw_auto = (os.getenv("GEMINI_CLI_AUTO_FINALIZE") or "true").strip().lower()
         self._auto_finalize_enabled = bool(database_factory) and raw_auto not in {"0", "false", "no", "off"}
+        self._remote_callback_url = self._resolve_remote_callback_url()
+        self._callback_mode = self._determine_callback_mode()
 
     # ------------------------------------------------------------------
     # OAuth flow setup helpers
     # ------------------------------------------------------------------
+
+    def _determine_callback_mode(self) -> str:
+        forced_mode = (os.getenv("GEMINI_CLI_AUTH_MODE") or "").strip().lower()
+
+        if forced_mode == "loopback":
+            if self._remote_callback_url:
+                logger.info("GEMINI_CLI_AUTH_MODE 强制启用 loopback，忽略远程回调地址")
+            self._remote_callback_url = None
+            return "loopback"
+
+        remote_url = self._remote_callback_url
+        if forced_mode in {"remote", "hosted", "render"}:
+            if not remote_url:
+                remote_url = self._resolve_remote_callback_url()
+                if not remote_url:
+                    logger.warning(
+                        "远程回调模式已启用但缺少 GEMINI_CLI_CALLBACK_URL/GEMINI_CLI_CALLBACK_BASE_URL，"
+                        "将回退至 loopback 模式"
+                    )
+                    return "loopback"
+                self._remote_callback_url = remote_url
+            return "remote"
+
+        if remote_url:
+            return "remote"
+
+        return "loopback"
+
+    def _resolve_remote_callback_url(self) -> Optional[str]:
+        explicit_url = (os.getenv("GEMINI_CLI_CALLBACK_URL") or "").strip()
+        if explicit_url:
+            return explicit_url
+
+        base_url = (os.getenv("GEMINI_CLI_CALLBACK_BASE_URL") or "").strip()
+        if base_url:
+            return self._compose_callback_url(base_url)
+
+        render_external = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+        if render_external:
+            return self._compose_callback_url(render_external)
+
+        api_base_url = (os.getenv("API_BASE_URL") or "").strip()
+        if api_base_url:
+            parsed = urlparse(api_base_url)
+            if parsed.scheme in {"http", "https"}:
+                hostname = (parsed.hostname or "").lower()
+                if hostname and not self._is_loopback_host(hostname):
+                    return self._compose_callback_url(api_base_url)
+
+        return None
+
+    @staticmethod
+    def _compose_callback_url(base_url: str) -> str:
+        normalized = base_url.strip()
+        if not normalized:
+            return ""
+        if normalized.endswith("/"):
+            normalized = normalized[:-1]
+        return f"{normalized}{CLI_REMOTE_CALLBACK_PATH}"
+
+    @staticmethod
+    def _is_loopback_host(hostname: str) -> bool:
+        """Return True if the hostname refers to a local development address."""
+
+        loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+        if hostname in loopback_hosts:
+            return True
+        return hostname.endswith(".local")
 
     def _build_client_config(self, redirect_uri: str) -> Dict[str, Any]:
         client_id = (os.getenv("GEMINI_CLI_CLIENT_ID") or CLI_DEFAULT_CLIENT_ID).strip()
@@ -289,7 +360,54 @@ class CliAuthManager:
     def start_authorization(self) -> Dict[str, Any]:
         """Initialise the OAuth flow and return the authorization URL."""
 
+        if self._callback_mode == "remote":
+            return self._start_remote_authorization()
         return self._start_loopback_authorization()
+
+    def _start_remote_authorization(self) -> Dict[str, Any]:
+        callback_url = self._remote_callback_url
+        if not callback_url:
+            raise HTTPException(status_code=500, detail="Remote callback URL is not configured")
+
+        client_config = self._build_client_config(callback_url)
+        flow = Flow.from_client_config(
+            client_config,
+            scopes=DEFAULT_SCOPES,
+            redirect_uri=callback_url,
+        )
+
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+
+        loop = asyncio.get_running_loop()
+        session = CliAuthSession(
+            flow=flow,
+            redirect_uri=callback_url,
+            mode="remote",
+            loop=loop,
+            callback_url=callback_url,
+        )
+
+        with self._lock:
+            self._sessions[state] = session
+
+        logger.info(
+            "Started Gemini CLI OAuth flow in remote mode with state %s and callback %s",
+            state,
+            callback_url,
+        )
+
+        return {
+            "authorization_url": auth_url,
+            "state": state,
+            "redirect_uri": callback_url,
+            "mode": "remote",
+            "callback_url": callback_url,
+            "auto_finalize": self._auto_finalize_enabled,
+        }
 
     def _start_loopback_authorization(self) -> Dict[str, Any]:
         host = (os.getenv("GEMINI_CLI_LOOPBACK_HOST") or CLI_LOOPBACK_DEFAULT_HOST).strip() or CLI_LOOPBACK_DEFAULT_HOST
@@ -454,10 +572,26 @@ class CliAuthManager:
         handler.end_headers()
 
     def _register_loopback_response(self, state: str, authorization_response: str) -> bool:
+        return self._register_authorization_response(
+            state,
+            authorization_response,
+            expected_mode="loopback",
+        )
+
+    def _register_loopback_error(self, state: str, message: str) -> None:
+        self._register_error(state, message, expected_mode="loopback")
+
+    def _register_authorization_response(
+        self,
+        state: str,
+        authorization_response: str,
+        *,
+        expected_mode: str,
+    ) -> bool:
         with self._lock:
             session = self._sessions.get(state)
 
-        if not session or session.mode != "loopback":
+        if not session or session.mode != expected_mode:
             return False
 
         session.authorization_response = authorization_response
@@ -468,26 +602,66 @@ class CliAuthManager:
         if server:
             threading.Thread(target=server.shutdown, daemon=True).start()
 
-        logger.info("Received loopback OAuth callback for state %s", state)
+        logger.info(
+            "Received %s OAuth callback for state %s",
+            expected_mode,
+            state,
+        )
 
         if self._auto_finalize_enabled and self._database_factory:
             self._schedule_auto_finalize(state, session)
 
         return True
 
-    def _register_loopback_error(self, state: str, message: str) -> None:
+    def _register_error(
+        self,
+        state: str,
+        message: str,
+        *,
+        expected_mode: Optional[str] = None,
+    ) -> None:
         with self._lock:
             session = self._sessions.get(state)
 
-        if session:
+        if session and (expected_mode is None or session.mode == expected_mode):
             session.error = message
             session.event.set()
             server = session.loopback_server
             if server:
                 threading.Thread(target=server.shutdown, daemon=True).start()
 
-        logger.error("Loopback OAuth callback failed for state %s: %s", state, message)
+        logger.error(
+            "OAuth callback failed for state %s (%s): %s",
+            state,
+            session.mode if session else expected_mode or "unknown",
+            message,
+        )
         self._store_completed_result(state, error=message)
+
+    def handle_remote_callback(self, full_url: str) -> Tuple[bool, str]:
+        if self._callback_mode != "remote":
+            return False, "服务器未启用远程回调模式，请刷新后重试"
+
+        parsed = urlparse(full_url)
+        params = parse_qs(parsed.query)
+
+        state = params.get("state", [None])[0]
+        if not state:
+            return False, "缺少 state 参数，无法完成授权"
+
+        error = params.get("error", [None])[0]
+        error_description = params.get("error_description", [None])[0]
+
+        if error:
+            message = error_description or "Google OAuth 返回错误"
+            self._register_error(state, message, expected_mode="remote")
+            return False, message
+
+        if self._register_authorization_response(state, full_url, expected_mode="remote"):
+            return True, "授权成功，系统正在同步 CLI 账号。"
+
+        message = "授权状态已过期或不存在，请返回控制台重新发起登录。"
+        return False, message
 
     def _schedule_auto_finalize(self, state: str, session: CliAuthSession) -> None:
         if not self._auto_finalize_enabled or not self._database_factory or not session.loop:
