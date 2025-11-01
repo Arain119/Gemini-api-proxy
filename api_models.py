@@ -235,11 +235,10 @@ class CliAuthStartResponse(BaseModel):
     authorization_url: str
     state: str
     redirect_uri: str
-    mode: Literal["loopback", "remote"]
-    loopback_host: Optional[str] = None
-    loopback_port: Optional[int] = None
-    auto_finalize: bool = False
-    requires_manual_return: bool = False
+    mode: Literal["loopback"] = "loopback"
+    loopback_host: str
+    loopback_port: int
+    auto_finalize: bool = True
 
 
 class CliAuthCompleteRequest(BaseModel):
