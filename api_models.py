@@ -239,6 +239,7 @@ class CliAuthStartResponse(BaseModel):
     loopback_host: Optional[str] = None
     loopback_port: Optional[int] = None
     auto_finalize: bool = False
+    requires_manual_return: bool = False
 
 
 class CliAuthCompleteRequest(BaseModel):

@@ -257,6 +257,8 @@ class CliAuthManager:
         self._database_factory = database_factory
         raw_mode = (os.getenv("GEMINI_CLI_CALLBACK_MODE") or "loopback").strip().lower()
         self._callback_mode = raw_mode if raw_mode in {"loopback", "remote"} else "loopback"
+        raw_auto = (os.getenv("GEMINI_CLI_AUTO_FINALIZE") or "false").strip().lower()
+        self._auto_finalize_enabled = bool(database_factory) and raw_auto in {"1", "true", "yes", "on"}
 
     # ------------------------------------------------------------------
     # OAuth flow setup helpers
@@ -367,7 +369,8 @@ class CliAuthManager:
             "state": state,
             "redirect_uri": redirect_uri,
             "mode": "remote",
-            "auto_finalize": False,
+            "auto_finalize": self._auto_finalize_enabled,
+            "requires_manual_return": False,
         }
 
     def _start_loopback_authorization(self) -> Dict[str, Any]:
@@ -452,7 +455,8 @@ class CliAuthManager:
             "mode": "loopback",
             "loopback_host": host,
             "loopback_port": bound_port,
-            "auto_finalize": bool(self._database_factory),
+            "auto_finalize": self._auto_finalize_enabled,
+            "requires_manual_return": not self._auto_finalize_enabled,
         }
 
     def _create_loopback_handler(self):
@@ -563,7 +567,7 @@ class CliAuthManager:
 
         logger.info("Received loopback OAuth callback for state %s", state)
 
-        if self._database_factory:
+        if self._auto_finalize_enabled and self._database_factory:
             self._schedule_auto_finalize(state, session)
 
         return True
@@ -583,7 +587,7 @@ class CliAuthManager:
         self._store_completed_result(state, error=message)
 
     def _schedule_auto_finalize(self, state: str, session: CliAuthSession) -> None:
-        if not self._database_factory or not session.loop:
+        if not self._auto_finalize_enabled or not self._database_factory or not session.loop:
             return
 
         try:
@@ -647,39 +651,39 @@ class CliAuthManager:
                         "state": state,
                         "status": "completed",
                         "account_email": response.account_email,
-                        "auto_finalize": True,
+                        "auto_finalize": self._auto_finalize_enabled,
                         "result": response.dict(),
                     }
                 return {
                     "state": state,
                     "status": "failed",
                     "message": completed.get("error"),
-                    "auto_finalize": True,
+                    "auto_finalize": self._auto_finalize_enabled,
                 }
 
             session = self._sessions.get(state)
             if not session:
-                return {"state": state, "status": "unknown", "auto_finalize": bool(self._database_factory)}
+                return {"state": state, "status": "unknown", "auto_finalize": self._auto_finalize_enabled}
 
             if session.error:
                 return {
                     "state": state,
                     "status": "failed",
                     "message": session.error,
-                    "auto_finalize": bool(self._database_factory),
+                    "auto_finalize": self._auto_finalize_enabled,
                 }
 
             if session.authorization_response:
                 return {
                     "state": state,
                     "status": "callback_received",
-                    "auto_finalize": bool(self._database_factory),
+                    "auto_finalize": self._auto_finalize_enabled,
                 }
 
             return {
                 "state": state,
                 "status": "pending",
-                "auto_finalize": bool(self._database_factory),
+                "auto_finalize": self._auto_finalize_enabled,
             }
 
     def pop_completed_result(self, state: str) -> Optional[Dict[str, Any]]:

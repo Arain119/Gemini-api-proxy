@@ -28,7 +28,8 @@ from app_utils import (
     get_cached_deepthink_config,
     update_deepthink_config,
     start_cli_oauth_flow,
-    get_cli_oauth_status
+    get_cli_oauth_status,
+    complete_cli_oauth_flow
 )
 
 def render_dashboard_page():
@@ -379,6 +380,9 @@ def render_key_management_page():
             state = cli_auth_info.get('state')
             mode = (cli_auth_info.get('mode') or 'loopback').lower()
             auto_finalize = bool(cli_auth_info.get('auto_finalize'))
+            requires_manual = cli_auth_info.get('requires_manual_return')
+            if requires_manual is None:
+                requires_manual = not auto_finalize
             loopback_host = cli_auth_info.get('loopback_host') or '127.0.0.1'
             loopback_port = cli_auth_info.get('loopback_port') or 8765
 
@@ -390,7 +394,11 @@ def render_key_management_page():
                 st.caption(
                     "本次授权沿用 Gemini CLI 的本地回调模式。\n"
                     f"回调地址：`{callback_hint}`\n"
-                    + ("系统在收到回调后会自动写入账号信息并刷新密钥列表。" if auto_finalize else "授权完成后请返回此页面手动刷新。")
+                    + (
+                        "授权完成后系统会自动创建新的 CLI 账号。"
+                        if auto_finalize
+                        else "完成登录后请关闭授权窗口并返回此页面同步结果。"
+                    )
                 )
             else:
                 st.caption("当前使用远程回调模式，授权完成后请返回此页面继续操作。")
@@ -399,10 +407,10 @@ def render_key_management_page():
                 "1. 浏览器会打开新的 Google 登录窗口",
                 "2. 完成授权后，Google 页面会提示成功或失败",
             ]
-            if auto_finalize:
-                instructions.append("3. 授权成功后系统会自动创建新的 CLI 账号")
+            if requires_manual:
+                instructions.append("3. 返回此页面点击下方“同步 CLI 登录结果”按钮")
             else:
-                instructions.append("3. 授权完成后请点击下方按钮刷新状态")
+                instructions.append("3. 授权成功后系统会自动创建新的 CLI 账号")
             st.info("\n".join(instructions))
 
             if auth_url:
@@ -423,16 +431,36 @@ def render_key_management_page():
                 message = (status_data or {}).get('message') or '授权失败，请重试。'
                 st.error(message)
             elif status_label == 'callback_received':
-                st.warning('已收到授权回调，系统正在写入账号信息…')
+                if requires_manual:
+                    st.warning('已收到授权回调，请点击下方按钮同步账号。')
+                else:
+                    st.warning('已收到授权回调，系统正在写入账号信息…')
             elif status_label == 'pending':
                 st.info('等待您在新窗口完成 Google 登录…')
             elif status_label == 'unknown':
                 st.warning('当前无法确定授权状态，如已完成请尝试重新生成授权链接。')
 
-            col_status, col_clear = st.columns([1, 1])
+            col_status, col_action, col_clear = st.columns([1, 1, 1])
             with col_status:
                 if st.button('刷新授权状态', key='refresh_cli_auth_status', type='secondary'):
                     st.experimental_rerun()
+            with col_action:
+                if requires_manual and st.button('同步 CLI 登录结果', key='sync_cli_auth', type='primary'):
+                    if status_label != 'callback_received':
+                        st.warning('尚未收到 Google 回调，请完成登录后再试。')
+                    elif not state:
+                        st.error('未找到授权状态，请重新发起登录。')
+                    else:
+                        result = complete_cli_oauth_flow(state)
+                        if result:
+                            email = result.get('account_email') or '账号已成功连接'
+                            st.success(f'同步成功，已写入账号：{email}')
+                            st.session_state.pop('cli_auth_info', None)
+                            st.session_state.pop('cli_auth_popup_state', None)
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error('同步登录结果失败，请稍后重试。')
             with col_clear:
                 if st.button("清除提示", key="clear_cli_auth", type="secondary"):
                     st.session_state.pop('cli_auth_info', None)
