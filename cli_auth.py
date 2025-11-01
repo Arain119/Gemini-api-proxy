@@ -26,9 +26,12 @@ CLI_DEFAULT_CLIENT_ID = (
     "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
 )
 CLI_DEFAULT_CLIENT_SECRET = "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"
-CLI_DEFAULT_REDIRECT_PATH = "/admin/cli-auth/callback"
 CLI_LOOPBACK_DEFAULT_HOST = "127.0.0.1"
 CLI_LOOPBACK_DEFAULT_PORT = 8765
+CLI_LOOPBACK_REDIRECT_PATH = "/oauth2callback"
+
+SIGN_IN_SUCCESS_URL = "https://developers.google.com/gemini-code-assist/auth_success_gemini"
+SIGN_IN_FAILURE_URL = "https://developers.google.com/gemini-code-assist/auth_failure_gemini"
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
 _MODEL_PREFIXES = ("models/", "tunedModels/", "cachedContents/")
@@ -255,10 +258,8 @@ class CliAuthManager:
         self._sessions: Dict[str, CliAuthSession] = {}
         self._completed: Dict[str, Dict[str, Any]] = {}
         self._database_factory = database_factory
-        raw_mode = (os.getenv("GEMINI_CLI_CALLBACK_MODE") or "loopback").strip().lower()
-        self._callback_mode = raw_mode if raw_mode in {"loopback", "remote"} else "loopback"
-        raw_auto = (os.getenv("GEMINI_CLI_AUTO_FINALIZE") or "false").strip().lower()
-        self._auto_finalize_enabled = bool(database_factory) and raw_auto in {"1", "true", "yes", "on"}
+        raw_auto = (os.getenv("GEMINI_CLI_AUTO_FINALIZE") or "true").strip().lower()
+        self._auto_finalize_enabled = bool(database_factory) and raw_auto not in {"0", "false", "no", "off"}
 
     # ------------------------------------------------------------------
     # OAuth flow setup helpers
@@ -285,93 +286,10 @@ class CliAuthManager:
             }
         }
 
-    def _resolve_remote_redirect_uri(self) -> str:
-        explicit_redirect = os.getenv("GEMINI_CLI_REDIRECT_URI")
-        if explicit_redirect:
-            explicit_redirect = explicit_redirect.strip()
-        if explicit_redirect:
-            return explicit_redirect
-
-        raw_client_id = os.getenv("GEMINI_CLI_CLIENT_ID")
-        raw_client_secret = os.getenv("GEMINI_CLI_CLIENT_SECRET")
-
-        client_id = (raw_client_id or CLI_DEFAULT_CLIENT_ID).strip()
-        client_secret = (raw_client_secret or CLI_DEFAULT_CLIENT_SECRET).strip()
-
-        if not client_id:
-            client_id = CLI_DEFAULT_CLIENT_ID
-        if not client_secret:
-            client_secret = CLI_DEFAULT_CLIENT_SECRET
-        using_default_client = (
-            client_id == CLI_DEFAULT_CLIENT_ID and client_secret == CLI_DEFAULT_CLIENT_SECRET
-        )
-
-        if using_default_client:
-            return f"http://localhost:8765{CLI_DEFAULT_REDIRECT_PATH}"
-
-        base_url = os.getenv("EXTERNAL_BASE_URL")
-        if base_url:
-            return base_url.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
-
-        render_external_url = os.getenv("RENDER_EXTERNAL_URL")
-        if render_external_url:
-            return render_external_url.strip().rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
-
-        render_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
-        if render_hostname:
-            hostname = render_hostname.strip()
-            if not hostname:
-                return f"http://localhost:8765{CLI_DEFAULT_REDIRECT_PATH}"
-            if "://" in hostname:
-                base = hostname
-            else:
-                base = f"https://{hostname}"
-            return base.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
-
-        return f"http://localhost:8765{CLI_DEFAULT_REDIRECT_PATH}"
-
     def start_authorization(self) -> Dict[str, Any]:
         """Initialise the OAuth flow and return the authorization URL."""
 
-        mode = (os.getenv("GEMINI_CLI_CALLBACK_MODE") or self._callback_mode).strip().lower()
-        if mode not in {"loopback", "remote"}:
-            mode = "loopback"
-        self._callback_mode = mode
-
-        if mode == "remote":
-            return self._start_remote_authorization()
         return self._start_loopback_authorization()
-
-    def _start_remote_authorization(self) -> Dict[str, Any]:
-        redirect_uri = self._resolve_remote_redirect_uri()
-        client_config = self._build_client_config(redirect_uri)
-
-        flow = Flow.from_client_config(
-            client_config,
-            scopes=DEFAULT_SCOPES,
-            redirect_uri=redirect_uri,
-        )
-
-        auth_url, state = flow.authorization_url(
-            access_type="offline",
-            include_granted_scopes="true",
-            prompt="consent",
-        )
-
-        session = CliAuthSession(flow=flow, redirect_uri=redirect_uri, mode="remote")
-
-        with self._lock:
-            self._sessions[state] = session
-
-        logger.info("Started Gemini CLI OAuth flow in remote mode with state %s", state)
-        return {
-            "authorization_url": auth_url,
-            "state": state,
-            "redirect_uri": redirect_uri,
-            "mode": "remote",
-            "auto_finalize": self._auto_finalize_enabled,
-            "requires_manual_return": False,
-        }
 
     def _start_loopback_authorization(self) -> Dict[str, Any]:
         host = (os.getenv("GEMINI_CLI_LOOPBACK_HOST") or CLI_LOOPBACK_DEFAULT_HOST).strip() or CLI_LOOPBACK_DEFAULT_HOST
@@ -407,7 +325,8 @@ class CliAuthManager:
         if not server or bound_port is None:
             raise HTTPException(status_code=500, detail="Failed to start loopback callback server")
 
-        redirect_uri = f"http://{host}:{bound_port}/"
+        redirect_path = CLI_LOOPBACK_REDIRECT_PATH
+        redirect_uri = f"http://{host}:{bound_port}{redirect_path}"
         client_config = self._build_client_config(redirect_uri)
         flow = Flow.from_client_config(
             client_config,
@@ -433,6 +352,7 @@ class CliAuthManager:
         )
 
         server.expected_state = state  # type: ignore[attr-defined]
+        server.redirect_path = redirect_path  # type: ignore[attr-defined]
 
         with self._lock:
             self._sessions[state] = session
@@ -456,7 +376,6 @@ class CliAuthManager:
             "loopback_host": host,
             "loopback_port": bound_port,
             "auto_finalize": self._auto_finalize_enabled,
-            "requires_manual_return": not self._auto_finalize_enabled,
         }
 
     def _create_loopback_handler(self):
@@ -489,13 +408,21 @@ class CliAuthManager:
 
     def _process_loopback_request(self, handler: BaseHTTPRequestHandler, state: Optional[str]) -> None:
         if not state:
-            self._send_loopback_response(handler, success=False, message="无法识别的授权会话。")
+            self._redirect_loopback(handler, success=False)
             return
 
         parsed = urlparse(handler.path)
         params = parse_qs(parsed.query)
         error = params.get("error", [None])[0]
         error_description = params.get("error_description", [None])[0]
+
+        expected_path = getattr(handler.server, "redirect_path", CLI_LOOPBACK_REDIRECT_PATH)  # type: ignore[attr-defined]
+        if parsed.path != expected_path:
+            message = f"OAuth callback not received on expected path: {parsed.path}"
+            logger.error(message)
+            self._register_loopback_error(state, message)
+            self._redirect_loopback(handler, success=False)
+            return
 
         host_header = handler.headers.get("Host")
         if not host_header:
@@ -506,49 +433,25 @@ class CliAuthManager:
         if error:
             message = error_description or "Google OAuth 返回错误"
             self._register_loopback_error(state, message)
-            self._send_loopback_response(handler, success=False, message=message, error_code=error)
+            self._redirect_loopback(handler, success=False)
             return
 
         if self._register_loopback_response(state, authorization_response):
-            self._send_loopback_response(handler, success=True, message="授权成功，您可以关闭此窗口。")
+            self._redirect_loopback(handler, success=True)
         else:
-            self._send_loopback_response(handler, success=False, message="授权会话已过期或不存在。")
+            logger.warning("Received OAuth callback for expired or unknown state %s", state)
+            self._redirect_loopback(handler, success=False)
 
-    def _send_loopback_response(
+    def _redirect_loopback(
         self,
         handler: BaseHTTPRequestHandler,
         *,
         success: bool,
-        message: str,
-        error_code: Optional[str] = None,
     ) -> None:
-        status = 200 if success else 400
-        title = "Gemini CLI 登录成功" if success else "Gemini CLI 登录失败"
-        detail = f"错误代码：{error_code}" if error_code else ""
-        html = f"""
-        <!DOCTYPE html>
-        <html lang=\"zh-CN\">
-            <head>
-                <meta charset=\"utf-8\">
-                <title>{title}</title>
-                <style>
-                    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 2rem; }}
-                    h1 {{ color: {'#059669' if success else '#dc2626'}; }}
-                </style>
-            </head>
-            <body>
-                <h1>{title}</h1>
-                <p>{message}</p>
-                {f'<p>{detail}</p>' if detail else ''}
-                <p>此页面可以关闭。</p>
-            </body>
-        </html>
-        """
-
-        handler.send_response(status)
-        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        location = SIGN_IN_SUCCESS_URL if success else SIGN_IN_FAILURE_URL
+        handler.send_response(301)
+        handler.send_header("Location", location)
         handler.end_headers()
-        handler.wfile.write(html.encode("utf-8"))
 
     def _register_loopback_response(self, state: str, authorization_response: str) -> bool:
         with self._lock:

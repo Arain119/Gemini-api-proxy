@@ -16,7 +16,7 @@ import psutil
 import sys
 from fastapi import (APIRouter, Depends, File, Header, HTTPException,
                      Request, UploadFile)
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from api_models import (
     ChatCompletionRequest,
@@ -831,89 +831,6 @@ async def get_cli_oauth_status(
     status = cli_auth_manager.get_status(state)
     return CliAuthStatusResponse(**status)
 
-
-@admin_router.get(
-    "/cli-auth/callback",
-    summary="Gemini CLI OAuth 回调",
-    include_in_schema=False,
-    response_class=HTMLResponse,
-)
-async def cli_oauth_callback(
-    request: Request,
-    state: str,
-    code: Optional[str] = None,
-    error: Optional[str] = None,
-    error_description: Optional[str] = None,
-    db: Database = Depends(get_db),
-    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
-):
-    if error:
-        message = error_description or "Google OAuth returned an error."
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="zh-CN">
-            <head>
-                <meta charset="utf-8">
-                <title>Gemini CLI 登录失败</title>
-            </head>
-            <body>
-                <h1>Gemini CLI 登录失败</h1>
-                <p>Google OAuth 错误：{error}</p>
-                <p>{message}</p>
-                <p>请关闭此页面并返回控制台。</p>
-            </body>
-        </html>
-        """
-        return HTMLResponse(content=html, status_code=400)
-
-    authorization_response = str(request.url)
-    try:
-        credentials = await cli_auth_manager.complete_authorization(
-            state,
-            authorization_response=authorization_response,
-            code=code,
-        )
-        result = await finalize_cli_oauth(
-            db=db,
-            credentials=credentials,
-            label=None,
-            state=state,
-        )
-        cli_auth_manager.record_completed_result(state, result)
-    except HTTPException as exc:
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="zh-CN">
-            <head>
-                <meta charset="utf-8">
-                <title>Gemini CLI 登录失败</title>
-            </head>
-            <body>
-                <h1>Gemini CLI 登录失败</h1>
-                <p>{exc.detail}</p>
-                <p>请关闭此页面并返回控制台。</p>
-            </body>
-        </html>
-        """
-        return HTMLResponse(content=html, status_code=exc.status_code)
-
-    email_text = result.account_email or "账号已成功连接"
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-        <head>
-            <meta charset="utf-8">
-            <title>Gemini CLI 登录成功</title>
-        </head>
-        <body>
-            <h1>Gemini CLI 登录成功</h1>
-            <p>Google 账号：{email_text}</p>
-            <p>请返回控制台刷新页面查看结果。</p>
-            <p>此页面可以关闭。</p>
-        </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
 
 @admin_router.get("/keys/gemini", summary="获取所有Gemini密钥")
 async def get_gemini_keys_endpoint(db: Database = Depends(get_db)):

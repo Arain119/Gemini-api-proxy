@@ -234,19 +234,6 @@ def start_cli_oauth_flow() -> Optional[Dict]:
     return call_api('/admin/cli-auth/start', 'POST', data={})
 
 
-def complete_cli_oauth_flow(state: str, *, code: Optional[str] = None, authorization_response: Optional[str] = None,
-                            label: Optional[str] = None) -> Optional[Dict]:
-    """用于手动完成 Gemini CLI OAuth 流程"""
-    payload = {'state': state}
-    if code:
-        payload['code'] = code
-    if authorization_response:
-        payload['authorization_response'] = authorization_response
-    if label:
-        payload['label'] = label
-    return call_api('/admin/cli-auth/complete', 'POST', data=payload)
-
-
 def get_cli_oauth_status(state: str) -> Optional[Dict]:
     """查询 Gemini CLI OAuth 登录状态"""
     endpoint = f'/admin/cli-auth/status/{state}'
