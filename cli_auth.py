@@ -238,6 +238,21 @@ class CliAuthManager:
         if base_url:
             return base_url.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
 
+        render_external_url = os.getenv("RENDER_EXTERNAL_URL")
+        if render_external_url:
+            return render_external_url.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
+
+        render_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        if render_hostname:
+            hostname = render_hostname.strip()
+            if not hostname:
+                return f"http://localhost:8765{CLI_DEFAULT_REDIRECT_PATH}"
+            if "://" in hostname:
+                base = hostname
+            else:
+                base = f"https://{hostname}"
+            return base.rstrip("/") + CLI_DEFAULT_REDIRECT_PATH
+
         return f"http://localhost:8765{CLI_DEFAULT_REDIRECT_PATH}"
 
     def _build_client_config(self) -> Dict[str, Any]:
