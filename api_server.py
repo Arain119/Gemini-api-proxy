@@ -6,7 +6,7 @@ import sys
 from contextlib import asynccontextmanager
 from asyncio import Queue
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -128,6 +128,19 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+
+@app.middleware("http")
+async def increment_request_counter(request: Request, call_next):
+    global request_count
+    try:
+        response = await call_next(request)
+    except Exception:
+        request_count += 1
+        raise
+    else:
+        request_count += 1
+        return response
 
 # Configure CORS middleware
 app.add_middleware(
