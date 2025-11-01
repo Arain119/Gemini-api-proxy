@@ -28,9 +28,18 @@ logger = logging.getLogger(__name__)
 request_count = 0
 start_time = time.time()
 scheduler = None
-# In Render environment, default to 'true', otherwise default to 'false'
-default_keep_alive = 'true' if os.getenv('RENDER') else 'false'
-keep_alive_enabled = os.getenv('ENABLE_KEEP_ALIVE', default_keep_alive).lower() == 'true'
+
+
+def _get_env_keep_alive_default() -> str:
+    """Return the keep-alive default derived from environment variables."""
+    value = os.getenv('ENABLE_KEEP_ALIVE')
+    if value is None:
+        value = 'true' if os.getenv('RENDER') else 'false'
+    return str(value).lower()
+
+
+ENV_KEEP_ALIVE_DEFAULT = _get_env_keep_alive_default()
+keep_alive_enabled = False
 
 # Initialize database and anti-detection injector
 db_queue = Queue(maxsize=10000)
@@ -58,61 +67,90 @@ async def db_writer_worker(queue: Queue, db_instance: Database):
         except Exception as e:
             logger.error(f"Error in db_writer_worker: {e}")
 
+def _build_scheduler(db_instance: Database):
+    """Create and configure the APScheduler instance used for keep-alive tasks."""
+    scheduler_instance = AsyncIOScheduler()
+    keep_alive_interval = int(os.getenv('KEEP_ALIVE_INTERVAL', '10'))
+
+    scheduler_instance.add_job(
+        keep_alive_ping, 'interval', minutes=keep_alive_interval,
+        id='keep_alive', max_instances=1, coalesce=True, misfire_grace_time=30
+    )
+
+    scheduler_instance.add_job(
+        record_hourly_health_check, 'interval', hours=1,
+        id='hourly_health_check', max_instances=1, coalesce=True,
+        kwargs={'db': db_instance}
+    )
+
+    scheduler_instance.add_job(
+        auto_cleanup_failed_keys, 'cron', hour=2, minute=0,
+        id='daily_cleanup', max_instances=1, coalesce=True,
+        kwargs={'db': db_instance}
+    )
+
+    scheduler_instance.add_job(
+        cleanup_database_records, 'cron', hour=3, minute=0,
+        id='daily_db_cleanup', max_instances=1, coalesce=True,
+        kwargs={'db': db_instance}
+    )
+
+    return scheduler_instance, keep_alive_interval
+
+
+async def update_keep_alive_state(enabled: bool) -> None:
+    """Enable or disable keep-alive background tasks at runtime."""
+    global scheduler, keep_alive_enabled
+
+    if enabled == keep_alive_enabled:
+        logger.info(
+            "Keep-alive is already %s.",
+            "enabled" if keep_alive_enabled else "disabled"
+        )
+        return
+
+    if enabled:
+        if scheduler and scheduler.running:
+            scheduler.shutdown(wait=False)
+
+        scheduler, interval = _build_scheduler(db)
+        scheduler.start()
+        keep_alive_enabled = True
+        logger.info(f"🟢 Keep-alive enabled (interval: {interval} minutes)")
+
+        # Perform an initial ping in the background
+        asyncio.create_task(keep_alive_ping())
+    else:
+        if scheduler and scheduler.running:
+            scheduler.shutdown(wait=False)
+            logger.info("Scheduler shut down.")
+
+        scheduler = None
+        keep_alive_enabled = False
+        logger.info("🔴 Keep-alive disabled")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Application lifespan manager.
     Handles startup and shutdown events.
     """
-    global scheduler, keep_alive_enabled
     logger.info("🚀 Service starting up...")
 
     # Start the database writer worker
     db_worker_task = asyncio.create_task(db_writer_worker(db_queue, db))
 
-    # Initialize and start the scheduler on startup if keep-alive is enabled
-    if keep_alive_enabled:
-        scheduler = AsyncIOScheduler()
-        
-        keep_alive_interval = int(os.getenv('KEEP_ALIVE_INTERVAL', '10'))
-        scheduler.add_job(
-            keep_alive_ping, 'interval', minutes=keep_alive_interval,
-            id='keep_alive', max_instances=1, coalesce=True, misfire_grace_time=30
-        )
-        
-        scheduler.add_job(
-            record_hourly_health_check, 'interval', hours=1,
-            id='hourly_health_check', max_instances=1, coalesce=True,
-            kwargs={'db': db}
-        )
-        
-        scheduler.add_job(
-            auto_cleanup_failed_keys, 'cron', hour=2, minute=0,
-            id='daily_cleanup', max_instances=1, coalesce=True,
-            kwargs={'db': db}
-        )
-        
-        scheduler.add_job(
-            cleanup_database_records, 'cron', hour=3, minute=0,
-            id='daily_db_cleanup', max_instances=1, coalesce=True,
-            kwargs={'db': db}
-        )
-        
-        scheduler.start()
-        logger.info(f"🟢 Keep-alive enabled (interval: {keep_alive_interval} minutes)")
-        
-        # Perform an initial ping
-        asyncio.create_task(keep_alive_ping())
-    else:
-        logger.info("🔴 Keep-alive disabled")
+    desired_keep_alive_state = str(
+        db.get_config('keep_alive_enabled', ENV_KEEP_ALIVE_DEFAULT)
+    ).lower() == 'true'
+    await update_keep_alive_state(desired_keep_alive_state)
 
     yield
 
-    # Shutdown the scheduler on application exit
-    if scheduler and scheduler.running:
-        scheduler.shutdown(wait=False)
-        logger.info("Scheduler shut down.")
-    
+    # Shutdown the scheduler and related background tasks
+    await update_keep_alive_state(False)
+
     # Stop the database writer worker
     await db_queue.put(None)
     await db_worker_task

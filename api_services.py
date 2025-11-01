@@ -100,7 +100,11 @@ async def update_key_performance_background(db: Database, key_id: int, success: 
                 update_data["health_status"] = "unhealthy"
 
             # 安排后台健康检查以实现自动恢复
-            asyncio.create_task(schedule_health_check(db, key_id))
+            failover_config = db.get_failover_config()
+            if not failover_config.get('background_health_check', True):
+                logger.info("Background health check disabled, skipping schedule")
+            else:
+                asyncio.create_task(schedule_health_check(db, key_id, failover_config))
 
         db.update_gemini_key(key_id, **update_data)
 
@@ -108,13 +112,17 @@ async def update_key_performance_background(db: Database, key_id: int, success: 
         logger.error(f"Background performance update failed for key {key_id}: {e}")
 
 
-async def schedule_health_check(db: Database, key_id: int):
+async def schedule_health_check(db: Database, key_id: int, failover_config: Optional[Dict[str, Any]] = None):
     """
     调度后台健康检测任务
     """
     try:
         # 获取配置中的延迟时间
-        config = db.get_failover_config()
+        config = failover_config or db.get_failover_config()
+        if not config.get('background_health_check', True):
+            logger.info("Background health check disabled, aborting scheduled task")
+            return
+
         delay = config.get('health_check_delay', 5)
 
         # 延迟指定时间后执行健康检测，避免立即重复检测
@@ -282,6 +290,7 @@ async def collect_gemini_response_directly(
         openai_request: ChatCompletionRequest,
         model_name: str,
         use_stream: bool = True,
+        timeout_seconds: Optional[float] = None,
         _internal_call: bool = False
 ) -> Dict:
     """
@@ -290,14 +299,17 @@ async def collect_gemini_response_directly(
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
     
     # 确定超时时间
-    has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-    is_fast_failover = await should_use_fast_failover(db)
-    if has_tool_calls:
-        timeout = 60.0
-    elif is_fast_failover:
-        timeout = 60.0
+    if timeout_seconds is None:
+        has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+        is_fast_failover = await should_use_fast_failover(db)
+        if has_tool_calls:
+            timeout = 60.0
+        elif is_fast_failover:
+            timeout = 60.0
+        else:
+            timeout = float(db.get_config('request_timeout', '60'))
     else:
-        timeout = float(db.get_config('request_timeout', '60'))
+        timeout = timeout_seconds
 
     logger.info(f"Starting direct collection from: {url}")
     
@@ -306,6 +318,42 @@ async def collect_gemini_response_directly(
     total_tokens = 0
     finish_reason = "stop"
     processed_lines = 0
+    tool_calls: List[Dict[str, Any]] = []
+
+    def _process_part(part: Dict[str, Any]) -> None:
+        nonlocal complete_content, thinking_content, total_tokens, tool_calls
+
+        text = part.get("text", "")
+        if text:
+            total_tokens += len(text.split())
+            if part.get("thought", False):
+                thinking_content += text
+            else:
+                complete_content += text
+            return
+
+        function_call = part.get("functionCall") or part.get("function_call")
+        if function_call:
+            arguments = function_call.get("args")
+            if arguments is None:
+                arguments = function_call.get("arguments")
+
+            if isinstance(arguments, (dict, list)):
+                try:
+                    arguments_str = json.dumps(arguments, ensure_ascii=False)
+                except Exception:
+                    arguments_str = str(arguments)
+            else:
+                arguments_str = str(arguments) if arguments is not None else "{}"
+
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": function_call.get("name", ""),
+                    "arguments": arguments_str or "{}"
+                }
+            })
 
     # 防截断相关变量
     anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
@@ -317,46 +365,39 @@ async def collect_gemini_response_directly(
     try:
         if use_stream:
             # 使用 google-genai 的流式接口
-            genai_stream = await client.aio.models.generate_content_stream(
-                model=model_name,
-                contents=gemini_request["contents"],
-                config=gemini_request.get("generation_config")
-            )
-            async for chunk in genai_stream:
-                data = chunk.to_dict() if hasattr(chunk, "to_dict") else json.loads(chunk.model_dump_json())
-                for candidate in data.get("candidates", []):
-                    content_data = candidate.get("content", {})
-                    parts = content_data.get("parts", [])
-                    for part in parts:
-                        text = part.get("text", "")
-                        if not text: continue
-                        total_tokens += len(text.split())
-                        is_thought = part.get("thought", False)
-                        if is_thought:
-                            thinking_content += text
-                        else:
-                            complete_content += text
-                    finish_reason_raw = candidate.get("finishReason", "stop")
-                    finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
-                    processed_lines += 1
+            async with asyncio.timeout(timeout):
+                genai_stream = await client.aio.models.generate_content_stream(
+                    model=model_name,
+                    contents=gemini_request["contents"],
+                    config=gemini_request.get("generation_config")
+                )
+                async for chunk in genai_stream:
+                    data = chunk.to_dict() if hasattr(chunk, "to_dict") else json.loads(chunk.model_dump_json())
+                    for candidate in data.get("candidates", []):
+                        content_data = candidate.get("content", {})
+                        parts = content_data.get("parts", [])
+                        for part in parts:
+                            _process_part(part)
+                        finish_reason_raw = candidate.get("finishReason", "stop")
+                        finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
+                        processed_lines += 1
             response_time = time.time() - start_time
             asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
         else:
             # 非流式直接调用
-            response_obj = await client.aio.models.generate_content(
-                model=model_name,
-                contents=gemini_request["contents"],
-                config=gemini_request.get("generation_config")
-            )
+            response_obj = None
+            async with asyncio.timeout(timeout):
+                response_obj = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=gemini_request["contents"],
+                    config=gemini_request.get("generation_config")
+                )
             data = response_obj.to_dict() if hasattr(response_obj, "to_dict") else json.loads(response_obj.model_dump_json())
             for candidate in data.get("candidates", []):
                 finish_reason_raw = candidate.get("finishReason", "stop")
                 finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
                 for part in candidate.get("content", {}).get("parts", []):
-                    text = part.get("text", "")
-                    if text:
-                        complete_content += text
-                        total_tokens += len(text.split())
+                    _process_part(part)
             response_time = time.time() - start_time
             asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
 
@@ -372,7 +413,7 @@ async def collect_gemini_response_directly(
         raise
 
     # 检查是否收集到内容
-    if not complete_content.strip():
+    if not complete_content.strip() and not tool_calls:
         logger.error(f"No content collected directly. Processed {processed_lines} lines")
         raise HTTPException(
             status_code=502,
@@ -403,18 +444,16 @@ async def collect_gemini_response_directly(
                 }]
             })
             try:
-                cont_response = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=continuation_request["contents"],
-                    config=continuation_request.get("generation_config")
-                )
+                async with asyncio.timeout(timeout):
+                    cont_response = await client.aio.models.generate_content(
+                        model=model_name,
+                        contents=continuation_request["contents"],
+                        config=continuation_request.get("generation_config")
+                    )
                 data = cont_response.to_dict() if hasattr(cont_response, "to_dict") else json.loads(cont_response.model_dump_json())
                 for candidate in data.get("candidates", []):
                     for part in candidate.get("content", {}).get("parts", []):
-                        text = part.get("text", "")
-                        if text:
-                            complete_content += text
-                            total_tokens += len(text.split())
+                        _process_part(part)
             except Exception as e:
                 logger.warning(f"Anti-truncation continuation attempt failed: {e}")
                 break
@@ -438,12 +477,15 @@ async def collect_gemini_response_directly(
         final_content = complete_content_final
 
     # 构建最终响应
+    message_content = final_content if final_content else None
     message = {
         "role": "assistant",
-        "content": final_content
+        "content": message_content
     }
     if thinking_content_final:
         message["reasoning"] = thinking_content_final
+    if tool_calls:
+        message["tool_calls"] = tool_calls
 
     usage = {
         "prompt_tokens": prompt_tokens,
@@ -462,7 +504,7 @@ async def collect_gemini_response_directly(
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": finish_reason
+            "finish_reason": "tool_calls" if tool_calls else finish_reason
         }],
         "usage": usage
     }
@@ -619,6 +661,8 @@ async def make_request_with_fast_failover(
                     gemini_request,
                     openai_request,
                     model_name,
+                    use_stream=should_stream_to_gemini,
+                    timeout_seconds=timeout_seconds,
                     _internal_call=_internal_call
                 )
                 
@@ -772,6 +816,8 @@ async def stream_gemini_response_single_attempt(
             anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
             full_response = ""
             saw_finish_tag = False
+            tool_call_states: Dict[str, Dict[str, Any]] = {}
+            next_tool_index = 0
 
             logger.info("Stream response started")
 
@@ -816,18 +862,72 @@ async def stream_gemini_response_single_attempt(
                             elif hasattr(part, "function_call"):
                                 fc = part.function_call
                                 has_content = True
-                                # OpenAI streams tool calls with an index
-                                # We simulate this by creating a tool_call chunk per function call
-                                tool_call_chunk = {
-                                    "index": i, # Use part index as tool index
-                                    "id": f"call_{uuid.uuid4().hex}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": fc.name,
-                                        "arguments": json.dumps(fc.args, ensure_ascii=False)
+
+                                call_id = getattr(fc, "id", None) or f"call_{uuid.uuid4().hex}"
+                                state = tool_call_states.get(call_id)
+                                if state is None:
+                                    state = {
+                                        "id": call_id,
+                                        "index": next_tool_index,
+                                        "args": "",
+                                        "name_sent": False,
+                                        "id_sent": False,
+                                        "sent_initial": False,
                                     }
-                                }
-                                delta["tool_calls"] = [tool_call_chunk]
+                                    tool_call_states[call_id] = state
+                                    next_tool_index += 1
+
+                                function_delta: Dict[str, Any] = {}
+
+                                if getattr(fc, "name", None):
+                                    if not state.get("name_sent"):
+                                        function_delta["name"] = fc.name
+                                        state["name_sent"] = True
+                                # Determine arguments payload for this chunk
+                                args_segment = None
+                                if hasattr(fc, "args_text") and fc.args_text is not None:
+                                    args_segment = fc.args_text
+                                elif hasattr(fc, "args") and fc.args is not None:
+                                    if isinstance(fc.args, str):
+                                        args_segment = fc.args
+                                    else:
+                                        try:
+                                            args_segment = json.dumps(fc.args, ensure_ascii=False)
+                                        except TypeError:
+                                            args_segment = str(fc.args)
+
+                                if args_segment:
+                                    previous_args = state["args"]
+                                    if args_segment.startswith(previous_args):
+                                        delta_args = args_segment[len(previous_args):]
+                                        state["args"] = args_segment
+                                    else:
+                                        delta_args = args_segment
+                                        state["args"] = args_segment
+                                    if delta_args:
+                                        function_delta["arguments"] = delta_args
+
+                                send_chunk = False
+                                if not state["sent_initial"]:
+                                    send_chunk = True
+                                    state["sent_initial"] = True
+                                if function_delta:
+                                    send_chunk = True
+
+                                if send_chunk:
+                                    tool_call_chunk = {
+                                        "index": state["index"],
+                                        "type": "function",
+                                        "function": {}
+                                    }
+                                    if not state["id_sent"]:
+                                        tool_call_chunk["id"] = state["id"]
+                                        state["id_sent"] = True
+                                    tool_call_chunk["function"].update(function_delta)
+                                    if not function_delta and not state["args"]:
+                                        tool_call_chunk["function"].setdefault("arguments", "")
+                                    delta.setdefault("tool_calls", [])
+                                    delta["tool_calls"].append(tool_call_chunk)
 
                             if delta:
                                 chunk_data = {
@@ -1000,6 +1100,22 @@ async def stream_with_fast_failover(
                 should_stream_to_gemini = False
             else:
                 should_stream_to_gemini = True
+
+            if not should_stream_to_gemini:
+                logger.info(
+                    "Gemini streaming disabled by configuration; using non-stream fallback within fast failover"
+                )
+                async for chunk in stream_non_stream_keep_alive(
+                        db,
+                        rate_limiter,
+                        gemini_request,
+                        openai_request,
+                        model_name,
+                        user_key_info=user_key_info,
+                        _internal_call=_internal_call
+                ):
+                    yield chunk
+                return
 
             success = False
             usage_summary: Dict[str, int] = {}
@@ -1443,6 +1559,8 @@ async def make_request_with_failover(
                     gemini_request,
                     openai_request,
                     model_name,
+                    use_stream=should_stream_to_gemini,
+                    timeout_seconds=timeout_seconds,
                     _internal_call=_internal_call
                 )
 
@@ -1573,6 +1691,33 @@ async def stream_with_failover(
 
             key_info = selection_result['key_info']
             logger.info(f"Stream attempt {attempt + 1}: Using key #{key_info['id']}")
+
+            stream_to_gemini_mode = db.get_stream_to_gemini_mode_config().get('mode', 'auto')
+            has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+            if has_tool_calls:
+                should_stream_to_gemini = False
+            elif stream_to_gemini_mode == 'stream':
+                should_stream_to_gemini = True
+            elif stream_to_gemini_mode == 'non_stream':
+                should_stream_to_gemini = False
+            else:
+                should_stream_to_gemini = True
+
+            if not should_stream_to_gemini:
+                logger.info(
+                    "Gemini streaming disabled by configuration; using non-stream fallback within traditional failover"
+                )
+                async for chunk in stream_non_stream_keep_alive(
+                        db,
+                        rate_limiter,
+                        gemini_request,
+                        openai_request,
+                        model_name,
+                        user_key_info=user_key_info,
+                        _internal_call=_internal_call
+                ):
+                    yield chunk
+                return
 
             success = False
             usage_summary: Dict[str, int] = {}

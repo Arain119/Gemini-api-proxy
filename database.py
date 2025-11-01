@@ -277,9 +277,19 @@ class Database:
             logger.error(f"Database migration failed: {e}")
             # 继续执行，不让迁移失败阻止服务启动
 
+    @staticmethod
+    def _env_keep_alive_default() -> str:
+        """获取 Keep-Alive 的环境变量默认值"""
+        value = os.getenv('ENABLE_KEEP_ALIVE')
+        if value is None:
+            value = 'true' if os.getenv('RENDER') else 'false'
+        return str(value).lower()
+
     def _init_system_config(self, cursor):
         """初始化系统配置"""
+        default_keep_alive = self._env_keep_alive_default()
         default_configs = [
+            ('keep_alive_enabled', default_keep_alive, '是否启用 Keep-Alive 与后台调度任务'),
             ('default_model_name', 'gemini-2.5-flash-lite', '默认模型名称'),
             ('max_retries', '3', 'API请求最大重试次数（已废弃，保留兼容性）'),
             ('request_timeout', '60', 'API请求超时时间（秒）'),
@@ -586,6 +596,31 @@ class Database:
             return True
         except Exception as e:
             logger.error(f"Failed to set failover config: {e}")
+            return False
+
+    # Keep-Alive 配置方法
+    def get_keep_alive_config(self) -> Dict[str, any]:
+        """获取 Keep-Alive 配置"""
+        try:
+            default_value = self._env_keep_alive_default()
+            return {
+                'enabled': self.get_config('keep_alive_enabled', default_value).lower() == 'true'
+            }
+        except Exception as e:
+            logger.error(f"Failed to get keep-alive config: {e}")
+            default_enabled = self._env_keep_alive_default() == 'true'
+            return {
+                'enabled': default_enabled
+            }
+
+    def set_keep_alive_config(self, enabled: bool = None) -> bool:
+        """设置 Keep-Alive 配置"""
+        try:
+            if enabled is not None:
+                self.set_config('keep_alive_enabled', 'true' if enabled else 'false')
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set keep-alive config: {e}")
             return False
 
     # 防自动化检测配置方法
