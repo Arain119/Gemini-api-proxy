@@ -360,73 +360,72 @@ def render_key_management_page():
         st.markdown("#### 添加新密钥")
 
         st.markdown("##### 通过 Google 登录 (Gemini CLI)")
-        st.caption("使用 Google 账号完成 Gemini CLI 登录后，系统会自动将该账号作为新的号池来源。")
+        st.caption("通过引导式配置，使用 Google 账号完成 Gemini CLI 登录，将账号作为新的号池来源。")
 
-        cli_auth_info = st.session_state.get('cli_auth_info')
+        # 步骤状态管理
+        oauth_step = st.session_state.get('oauth_step', 1)
 
-        if st.button("通过 Google 登录", key="start_cli_auth", type="secondary"):
-            result = start_cli_oauth_flow()
-            if result and result.get('authorization_url'):
-                st.session_state['cli_auth_info'] = result
-                st.session_state.pop('cli_auth_popup_state', None)
-                st.success("授权链接已生成，正在跳转至 Google 登录页面…")
-            else:
-                st.error("未能获取授权链接，请稍后重试")
+        # Step 1: 配置引导
+        if oauth_step == 1:
+            st.markdown("###### Step 1: 配置 Google OAuth 凭证")
+            if st.button("开始 Google 登录配置", type="primary"):
+                with st.spinner("正在生成配置信息..."):
+                    result = start_cli_oauth_flow()
+                    if result and result.get('callback_url'):
+                        st.session_state['cli_auth_info'] = result
+                        st.session_state['oauth_step'] = 2
+                        st.rerun()
+                    else:
+                        st.error("未能生成配置信息，请检查后端服务是否正常。")
+            st.info("此过程将引导您在 Google Cloud Console 中完成必要的配置，以确保您的应用实例能够安全地进行身份验证。")
 
-        cli_auth_info = st.session_state.get('cli_auth_info')
-        if cli_auth_info:
+        # Step 2: 执行认证
+        elif oauth_step == 2:
+            st.markdown("###### Step 2: 添加回调 URI 并继续登录")
+            cli_auth_info = st.session_state.get('cli_auth_info')
+            if not cli_auth_info:
+                st.error("配置信息已丢失，请返回上一步重试。")
+                if st.button("返回第一步"):
+                    st.session_state['oauth_step'] = 1
+                    st.rerun()
+                st.stop()
+
+            callback_url = cli_auth_info.get('callback_url')
             auth_url = cli_auth_info.get('authorization_url')
             state = cli_auth_info.get('state')
-            mode = (cli_auth_info.get('mode') or 'loopback').lower()
-            loopback_host = cli_auth_info.get('loopback_host')
-            loopback_port = cli_auth_info.get('loopback_port')
-            redirect_uri = cli_auth_info.get('redirect_uri')
-            callback_url = cli_auth_info.get('callback_url') or redirect_uri
-            loopback_hint = redirect_uri
-            if not loopback_hint and loopback_host and loopback_port:
-                loopback_hint = f'http://{loopback_host}:{loopback_port}/oauth2callback'
 
-            status_data = get_cli_oauth_status(state) if state else None
-            status_label = (status_data or {}).get('status')
+            st.markdown("请将以下 **回调 URI** 添加到您在 Google Cloud Console 中的 OAuth 2.0 客户端的“已获授权的重定向 URI”列表中。")
+            st.code(callback_url, language=None)
+            st.markdown(
+                f"[👉 点击这里访问 Google Cloud API 凭据页面](https://console.cloud.google.com/apis/credentials)",
+                unsafe_allow_html=True)
+            st.warning(
+                "**重要提示**：您还需要将您自己的 **客户端ID** 和 **客户端密钥** 配置为服务的环境变量 `GEMINI_CLI_CLIENT_ID` 和 `GEMINI_CLI_CLIENT_SECRET`，然后**重新部署**您的应用。")
 
-            if mode == 'loopback':
-                callback_hint = loopback_hint or 'http://127.0.0.1:8765/oauth2callback'
-                st.caption(
-                    "本次授权沿用 Gemini CLI 的本地回调模式。\n"
-                    f"回调地址：`{callback_hint}`\n"
-                    + "授权完成后系统会自动创建新的 CLI 账号。"
-                )
-                instructions = [
-                    "1. 浏览器会打开新的 Google 登录窗口",
-                    "2. 完成授权后，Google 页面会提示成功或失败",
-                    "3. 授权成功后系统会自动创建新的 CLI 账号",
-                ]
-            elif mode == 'remote':
-                st.caption(
-                    "当前部署启用了云端回调模式，Google 登录会直接跳回服务器完成授权同步。"
-                )
-                st.caption(
-                    f"检测到的 API 基础地址：`{API_BASE_URL}`"
-                )
-                if callback_url:
-                    st.caption(f"回调地址：`{callback_url}`")
-                instructions = [
-                    "1. 浏览器会打开新的 Google 登录窗口",
-                    "2. 完成授权后，Google 页面会自动跳转回服务器并显示授权结果",
-                    "3. 返回此控制台点击“刷新授权状态”以同步新的 CLI 账号",
-                ]
-            else:
-                st.caption("当前授权模式未知，如遇问题请重新生成授权链接。")
-                instructions = [
-                    "1. 浏览器会打开新的 Google 登录窗口",
-                    "2. 完成授权后，Google 页面会提示成功或失败",
-                    "3. 授权成功后系统会自动创建新的 CLI 账号",
-                ]
-            st.info("\n".join(instructions))
+            if st.button("我已完成配置，继续登录", type="primary"):
+                st.session_state['oauth_step'] = 3
+                st.rerun()
 
-            if auth_url:
-                st.markdown(f"[👉 点击这里重新打开授权页面]({auth_url})", unsafe_allow_html=True)
+            if st.button("返回第一步"):
+                st.session_state.pop('cli_auth_info', None)
+                st.session_state['oauth_step'] = 1
+                st.rerun()
 
+        # Step 3: 完成与状态轮询
+        elif oauth_step == 3:
+            st.markdown("###### Step 3: 完成授权")
+            cli_auth_info = st.session_state.get('cli_auth_info')
+            if not cli_auth_info:
+                st.error("授权信息已丢失，请返回第一步重试。")
+                if st.button("返回第一步"):
+                    st.session_state['oauth_step'] = 1
+                    st.rerun()
+                st.stop()
+
+            auth_url = cli_auth_info.get('authorization_url')
+            state = cli_auth_info.get('state')
+
+            # 自动弹出授权窗口
             if auth_url and st.session_state.get('cli_auth_popup_state') != state:
                 st.session_state['cli_auth_popup_state'] = state
                 st.markdown(
@@ -434,28 +433,38 @@ def render_key_management_page():
                     unsafe_allow_html=True,
                 )
 
+            # 状态检查
+            status_data = get_cli_oauth_status(state) if state else None
+            status_label = (status_data or {}).get('status')
+
             if status_label == 'completed':
                 result_info = (status_data or {}).get('result') or {}
                 email = result_info.get('account_email') or status_data.get('account_email') or '账号已成功连接'
-                st.success(f"授权完成，已写入账号：{email}")
+                st.success(f"🎉 授权完成！已成功添加账号：{email}")
             elif status_label == 'failed':
                 message = (status_data or {}).get('message') or '授权失败，请重试。'
-                st.error(message)
+                if "redirect_uri_mismatch" in message:
+                    st.error("错误：`redirect_uri_mismatch`。请确认您已将正确的回调 URI 添加到 Google Cloud Console 并重新部署了应用。")
+                else:
+                    st.error(f"授权失败：{message}")
             elif status_label == 'callback_received':
-                st.info('已收到授权回调，系统正在写入账号信息…')
+                st.info('已收到授权回调，系统正在后台完成账号同步...')
             elif status_label == 'pending':
-                st.info('等待您在新窗口完成 Google 登录…')
-            elif status_label == 'unknown':
-                st.warning('当前无法确定授权状态，如已完成请尝试重新生成授权链接。')
+                st.info('⏳ 等待您在新窗口中完成 Google 登录授权...')
+            else:
+                st.warning('无法确定授权状态，可能已过期或发生错误。')
 
-            col_status, col_clear = st.columns([1, 1])
-            with col_status:
-                if st.button('刷新授权状态', key='refresh_cli_auth_status', type='secondary'):
+            st.markdown(f"[👉 点击这里重新打开授权页面]({auth_url})", unsafe_allow_html=True)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button('刷新授权状态', type="secondary"):
                     st.rerun()
-            with col_clear:
-                if st.button("清除提示", key="clear_cli_auth", type="secondary"):
+            with col2:
+                if st.button("完成并重置", type="primary"):
                     st.session_state.pop('cli_auth_info', None)
                     st.session_state.pop('cli_auth_popup_state', None)
+                    st.session_state['oauth_step'] = 1
                     st.cache_data.clear()
                     st.rerun()
 
