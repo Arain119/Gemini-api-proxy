@@ -338,10 +338,23 @@ async def import_cli_credentials(
 
     try:
         info = json.loads(credentials_json)
-        # Basic validation
-        if not all(k in info for k in ["client_id", "client_secret", "refresh_token"]):
-             raise ValueError("Invalid credentials format. Missing required keys (client_id, client_secret, refresh_token).")
-        credentials = _load_credentials(credentials_json)
+        # Basic validation for the refresh token
+        if "refresh_token" not in info:
+            raise ValueError("Invalid credentials format. Missing required key: 'refresh_token'.")
+
+        # If client_id/secret are missing, inject the default ones used by gcloud/gemini-cli
+        if "client_id" not in info:
+            info["client_id"] = CLI_DEFAULT_CLIENT_ID
+        if "client_secret" not in info:
+            info["client_secret"] = CLI_DEFAULT_CLIENT_SECRET
+
+        # The library expects 'token_uri' and 'scopes' for proper loading.
+        if "token_uri" not in info:
+            info["token_uri"] = "https://oauth2.googleapis.com/token"
+        if "scopes" not in info:
+            info["scopes"] = DEFAULT_SCOPES
+
+        credentials = _load_credentials(json.dumps(info))
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid credentials JSON: {exc}") from exc
 
