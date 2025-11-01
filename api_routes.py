@@ -26,6 +26,7 @@ from api_models import (
     CliAuthStartResponse,
     CliAuthCompleteRequest,
     CliAuthCompleteResponse,
+    CliAuthStatusResponse,
 )
 from api_services import (_execute_deepthink_preprocessing, create_embeddings, create_gemini_native_embeddings, execute_search_flow, make_request_with_failover,
                           should_use_fast_failover,
@@ -45,56 +46,8 @@ from dependencies import (get_anti_detection, get_db, get_keep_alive_enabled,
                           get_request_count, get_start_time, get_rate_limiter,
                           get_cli_auth_manager)
 from api_utils import RateLimitCache
-from cli_auth import CliAuthManager, fetch_account_email
+from cli_auth import CliAuthManager, finalize_cli_oauth
 
-
-async def _finalize_cli_oauth(
-    *,
-    db: Database,
-    credentials,
-    label: Optional[str],
-    state: str,
-) -> CliAuthCompleteResponse:
-    access_token = getattr(credentials, "token", None)
-    email = await fetch_account_email(access_token) if access_token else None
-    credentials_json = credentials.to_json()
-
-    try:
-        account_id = db.create_cli_account(credentials_json, email, label)
-    except Exception as exc:  # pragma: no cover - database errors are logged downstream
-        logger.error("Failed to store CLI OAuth credentials: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to store CLI credentials") from exc
-
-    metadata = {"cli_account_id": account_id}
-    if email:
-        metadata["account_email"] = email
-    key_value = f"cli-account-{account_id}"
-
-    if not db.add_gemini_key(key_value, source_type="cli_oauth", metadata=metadata):
-        key_entry = db.get_gemini_key_by_value(key_value)
-        if not key_entry:
-            raise HTTPException(status_code=500, detail="Failed to register CLI-backed Gemini key")
-    else:
-        key_entry = db.get_gemini_key_by_value(key_value)
-
-    if not key_entry:
-        raise HTTPException(status_code=500, detail="Failed to load CLI-backed Gemini key")
-
-    existing_metadata = dict(key_entry.get("metadata") or {})
-    merged_metadata = {**existing_metadata, **metadata}
-    if merged_metadata != existing_metadata:
-        db.update_gemini_key(key_entry["id"], metadata=merged_metadata)
-        key_entry = db.get_gemini_key_by_value(key_value)
-
-    if email:
-        db.update_cli_account_credentials(account_id, credentials_json, email)
-
-    return CliAuthCompleteResponse(
-        account_id=account_id,
-        gemini_key_id=key_entry["id"],
-        state=state,
-        account_email=email,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -835,7 +788,20 @@ async def complete_cli_oauth(
     db: Database = Depends(get_db),
     cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
 ):
+    completed = cli_auth_manager.pop_completed_result(request.state)
+    if completed:
+        error = completed.get("error")
+        if error:
+            raise HTTPException(status_code=400, detail=error)
+        response_data = completed.get("response")
+        if isinstance(response_data, CliAuthCompleteResponse):
+            return response_data
+        return CliAuthCompleteResponse(**response_data)
+
     if not request.authorization_response and not request.code:
+        status = cli_auth_manager.get_status(request.state)
+        if status.get("status") in {"pending", "callback_received"}:
+            raise HTTPException(status_code=409, detail="Authorization is still pending")
         raise HTTPException(status_code=400, detail="Either authorization_response or code must be provided")
 
     credentials = await cli_auth_manager.complete_authorization(
@@ -843,12 +809,27 @@ async def complete_cli_oauth(
         code=request.code,
         authorization_response=request.authorization_response,
     )
-    return await _finalize_cli_oauth(
+    result = await finalize_cli_oauth(
         db=db,
         credentials=credentials,
         label=request.label,
         state=request.state,
     )
+    cli_auth_manager.record_completed_result(request.state, result)
+    return result
+
+
+@admin_router.get(
+    "/cli-auth/status/{state}",
+    summary="查询 Gemini CLI OAuth 状态",
+    response_model=CliAuthStatusResponse,
+)
+async def get_cli_oauth_status(
+    state: str,
+    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
+):
+    status = cli_auth_manager.get_status(state)
+    return CliAuthStatusResponse(**status)
 
 
 @admin_router.get(
@@ -871,12 +852,15 @@ async def cli_oauth_callback(
         html = f"""
         <!DOCTYPE html>
         <html lang="zh-CN">
-            <head><meta charset="utf-8"><title>Gemini CLI 登录失败</title></head>
+            <head>
+                <meta charset="utf-8">
+                <title>Gemini CLI 登录失败</title>
+            </head>
             <body>
                 <h1>Gemini CLI 登录失败</h1>
                 <p>Google OAuth 错误：{error}</p>
                 <p>{message}</p>
-                <p>请关闭此页面并返回管理后台重试。</p>
+                <p>请关闭此页面并返回控制台。</p>
             </body>
         </html>
         """
@@ -889,21 +873,25 @@ async def cli_oauth_callback(
             authorization_response=authorization_response,
             code=code,
         )
-        result = await _finalize_cli_oauth(
+        result = await finalize_cli_oauth(
             db=db,
             credentials=credentials,
             label=None,
             state=state,
         )
+        cli_auth_manager.record_completed_result(state, result)
     except HTTPException as exc:
         html = f"""
         <!DOCTYPE html>
         <html lang="zh-CN">
-            <head><meta charset="utf-8"><title>Gemini CLI 登录失败</title></head>
+            <head>
+                <meta charset="utf-8">
+                <title>Gemini CLI 登录失败</title>
+            </head>
             <body>
                 <h1>Gemini CLI 登录失败</h1>
                 <p>{exc.detail}</p>
-                <p>请关闭此页面并返回管理后台。</p>
+                <p>请关闭此页面并返回控制台。</p>
             </body>
         </html>
         """
@@ -913,11 +901,14 @@ async def cli_oauth_callback(
     html = f"""
     <!DOCTYPE html>
     <html lang="zh-CN">
-        <head><meta charset="utf-8"><title>Gemini CLI 登录成功</title></head>
+        <head>
+            <meta charset="utf-8">
+            <title>Gemini CLI 登录成功</title>
+        </head>
         <body>
             <h1>Gemini CLI 登录成功</h1>
             <p>Google 账号：{email_text}</p>
-            <p>请返回管理后台查看新的 CLI 账号记录。</p>
+            <p>请返回控制台刷新页面查看结果。</p>
             <p>此页面可以关闭。</p>
         </body>
     </html>

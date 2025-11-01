@@ -287,7 +287,21 @@ async def review_prompt_with_flashlite(
             if start != -1 and end != -1:
                 json_candidate = json_candidate[start:end + 1]
 
-        parsed = json.loads(json_candidate)
+        if not json_candidate:
+            logger.info("Pre-input review returned empty response; using default decision")
+            return default_decision
+
+        try:
+            parsed = json.loads(json_candidate)
+        except json.JSONDecodeError as decode_error:
+            preview = json_candidate[:200]
+            logger.warning(
+                "Pre-input review returned non-JSON payload (preview: %s): %s",
+                preview,
+                decode_error,
+            )
+            return default_decision
+
         decision = default_decision.copy()
         decision["should_search"] = bool(parsed.get("should_search"))
         decision["append_current_time"] = bool(parsed.get("append_current_time"))

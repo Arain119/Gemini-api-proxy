@@ -247,6 +247,12 @@ def complete_cli_oauth_flow(state: str, *, code: Optional[str] = None, authoriza
     return call_api('/admin/cli-auth/complete', 'POST', data=payload)
 
 
+def get_cli_oauth_status(state: str) -> Optional[Dict]:
+    """查询 Gemini CLI OAuth 登录状态"""
+    endpoint = f'/admin/cli-auth/status/{state}'
+    return call_api(endpoint, 'GET')
+
+
 def get_health_status_color(health_status: str) -> str:
     """获取健康状态颜色"""
     status_colors = {
