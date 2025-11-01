@@ -22,18 +22,46 @@ from api_models import (ChatCompletionRequest, ChatMessage, EmbeddingRequest, Em
                           GeminiEmbeddingRequest, GeminiEmbeddingResponse, EmbeddingValue)
 from api_utils import (
     GeminiAntiDetectionInjector,
-    get_cached_client,
     map_finish_reason,
     decrypt_response,
     check_gemini_key_health,
     RateLimitCache,
     openai_to_gemini,
 )
+from cli_auth import (
+    call_gemini_with_cli_account,
+    embed_with_cli_account,
+    stream_gemini_with_cli_account,
+    resolve_cli_model_name,
+)
 
 logger = logging.getLogger(__name__)
 
 _rr_counter = itertools.count()
 _rr_lock = asyncio.Lock()
+
+
+def _normalize_source_type(key_info: Dict[str, Any]) -> str:
+    source_type = (key_info.get('source_type') or 'cli_api_key').lower()
+    if source_type == 'api_key':
+        return 'cli_api_key'
+    return source_type
+
+
+def _is_cli_key(key_info: Dict[str, Any]) -> bool:
+    return _normalize_source_type(key_info) == 'cli_oauth'
+
+
+def _uses_cli_transport(key_info: Dict[str, Any]) -> bool:
+    return _normalize_source_type(key_info) in {'cli_oauth', 'cli_api_key'}
+
+
+def _get_cli_account_id(key_info: Dict[str, Any]) -> Optional[int]:
+    metadata = key_info.get('metadata') or {}
+    try:
+        return int(metadata.get('cli_account_id')) if metadata.get('cli_account_id') is not None else None
+    except (TypeError, ValueError):
+        return None
 
 async def update_key_performance_background(db: Database, key_id: int, success: bool, response_time: float, error_type: str = None):
     """
@@ -49,7 +77,7 @@ async def update_key_performance_background(db: Database, key_id: int, success: 
 
         # 更新EMA指标
         new_ema_success_rate = key_info['ema_success_rate'] * (1 - alpha) + (1 if success else 0) * alpha
-        
+
         # 仅在成功时更新响应时间EMA
         new_ema_response_time = key_info['ema_response_time']
         if success:
@@ -85,14 +113,14 @@ async def update_key_performance_background(db: Database, key_id: int, success: 
             else:
                 # 超出时间窗口，重置连续失败计数
                 consecutive_failures = 1
-            
+
             update_data["consecutive_failures"] = consecutive_failures
             update_data["last_failure_timestamp"] = current_time
 
             if consecutive_failures >= breaker_threshold:
                 update_data["breaker_status"] = "tripped"
                 logger.warning(f"Circuit breaker tripped for key #{key_id} after {consecutive_failures} failures.")
-            
+
             # --- 区分失败类型 ---
             if error_type == "rate_limit":
                 update_data["health_status"] = "rate_limited"
@@ -130,7 +158,7 @@ async def schedule_health_check(db: Database, key_id: int, failover_config: Opti
 
         key_info = db.get_gemini_key_by_id(key_id)
         if key_info and key_info.get('status') == 1:  # 只检测激活的key
-            health_result = await check_gemini_key_health(key_info['key'])
+            health_result = await check_gemini_key_health(key_info, db)
 
             # 更新健康状态
             db.update_key_performance(
@@ -284,7 +312,7 @@ async def review_prompt_with_flashlite(
 
 async def collect_gemini_response_directly(
         db: Database,
-        gemini_key: str,
+        key_info: Dict[str, Any],
         key_id: int,
         gemini_request: Dict,
         openai_request: ChatCompletionRequest,
@@ -296,8 +324,9 @@ async def collect_gemini_response_directly(
     """
     从Google API收集完整响应
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
-    
+    normalized_model = resolve_cli_model_name(db, model_name)
+    url = f"https://generativelanguage.googleapis.com/v1beta/{normalized_model}:streamGenerateContent?alt=sse"
+
     # 确定超时时间
     if timeout_seconds is None:
         has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
@@ -311,8 +340,15 @@ async def collect_gemini_response_directly(
     else:
         timeout = timeout_seconds
 
+    if not _uses_cli_transport(key_info):
+        raise HTTPException(status_code=503, detail="Non-CLI Gemini keys are no longer supported")
+
+    if use_stream:
+        logger.info("CLI transport uses buffered mode for direct collection; forcing non-stream mode")
+        use_stream = False
+
     logger.info(f"Starting direct collection from: {url}")
-    
+
     complete_content = ""
     thinking_content = ""
     total_tokens = 0
@@ -361,45 +397,25 @@ async def collect_gemini_response_directly(
     saw_finish_tag = False
     start_time = time.time()
 
-    client = get_cached_client(gemini_key)
     try:
-        if use_stream:
-            # 使用 google-genai 的流式接口
-            async with asyncio.timeout(timeout):
-                genai_stream = await client.aio.models.generate_content_stream(
-                    model=model_name,
-                    contents=gemini_request["contents"],
-                    config=gemini_request.get("generation_config")
-                )
-                async for chunk in genai_stream:
-                    data = chunk.to_dict() if hasattr(chunk, "to_dict") else json.loads(chunk.model_dump_json())
-                    for candidate in data.get("candidates", []):
-                        content_data = candidate.get("content", {})
-                        parts = content_data.get("parts", [])
-                        for part in parts:
-                            _process_part(part)
-                        finish_reason_raw = candidate.get("finishReason", "stop")
-                        finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
-                        processed_lines += 1
-            response_time = time.time() - start_time
-            asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
-        else:
-            # 非流式直接调用
-            response_obj = None
-            async with asyncio.timeout(timeout):
-                response_obj = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=gemini_request["contents"],
-                    config=gemini_request.get("generation_config")
-                )
-            data = response_obj.to_dict() if hasattr(response_obj, "to_dict") else json.loads(response_obj.model_dump_json())
-            for candidate in data.get("candidates", []):
-                finish_reason_raw = candidate.get("finishReason", "stop")
-                finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
-                for part in candidate.get("content", {}).get("parts", []):
-                    _process_part(part)
-            response_time = time.time() - start_time
-            asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
+        data = await call_gemini_with_cli_account(
+            db,
+            key_info,
+            gemini_request,
+            model_name,
+            timeout=float(timeout),
+        )
+        response_time = time.time() - start_time
+        asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
+        account_id = _get_cli_account_id(key_info)
+        if account_id:
+            db.touch_cli_account(account_id)
+
+        for candidate in data.get("candidates", []):
+            finish_reason_raw = candidate.get("finishReason", "stop")
+            finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
+            for part in candidate.get("content", {}).get("parts", []):
+                _process_part(part)
 
     except asyncio.TimeoutError as e:
         logger.warning(f"Direct request timeout/connection error: {str(e)}")
@@ -444,14 +460,14 @@ async def collect_gemini_response_directly(
                 }]
             })
             try:
-                async with asyncio.timeout(timeout):
-                    cont_response = await client.aio.models.generate_content(
-                        model=model_name,
-                        contents=continuation_request["contents"],
-                        config=continuation_request.get("generation_config")
-                    )
-                data = cont_response.to_dict() if hasattr(cont_response, "to_dict") else json.loads(cont_response.model_dump_json())
-                for candidate in data.get("candidates", []):
+                cont_data = await call_gemini_with_cli_account(
+                    db,
+                    key_info,
+                    continuation_request,
+                    model_name,
+                    timeout=float(timeout),
+                )
+                for candidate in cont_data.get("candidates", []):
                     for part in candidate.get("content", {}).get("parts", []):
                         _process_part(part)
             except Exception as e:
@@ -515,25 +531,26 @@ async def collect_gemini_response_directly(
 
 async def make_gemini_request_single_attempt(
         db: Database,
-        gemini_key: str,
+        key_info: Dict[str, Any],
         key_id: int,
         gemini_request: Dict,
         model_name: str,
         timeout: float = 60.0
 ) -> Dict:
     start_time = time.time()
+    if not _uses_cli_transport(key_info):
+        raise HTTPException(status_code=503, detail="Non-CLI Gemini keys are no longer supported")
 
     try:
-        client = get_cached_client(gemini_key)
-        async with asyncio.timeout(timeout):
-            response_obj = await client.aio.models.generate_content(
-                model=model_name,
-                contents=gemini_request["contents"],
-                config=gemini_request["generation_config"]
-            )
+        response_dict = await call_gemini_with_cli_account(
+            db,
+            key_info,
+            gemini_request,
+            model_name,
+            timeout=float(timeout),
+        )
+
         response_time = time.time() - start_time
-        # SDK 对象转 dict
-        response_dict = response_obj.to_dict() if hasattr(response_obj, "to_dict") else json.loads(response_obj.model_dump_json())
         asyncio.create_task(
             update_key_performance_background(db, key_id, True, response_time)
         )
@@ -547,12 +564,18 @@ async def make_gemini_request_single_attempt(
         logger.warning(f"Key #{key_id} timeout after {response_time:.2f}s")
         raise HTTPException(status_code=504, detail="Request timeout")
 
+    except HTTPException:
+        response_time = time.time() - start_time
+        asyncio.create_task(
+            update_key_performance_background(db, key_id, False, response_time)
+        )
+        raise
+
     except Exception as e:
         response_time = time.time() - start_time
         asyncio.create_task(
             update_key_performance_background(db, key_id, False, response_time)
         )
-        # google-genai 会在异常中封装详细信息
         err_msg = str(e)
         if "rate_limit" in err_msg.lower() or "status: 429" in err_msg:
             logger.warning(f"Key #{key_id} is rate-limited (429). Marking as 'rate_limited'.")
@@ -617,7 +640,7 @@ async def make_request_with_fast_failover(
             if selection_result is None:
                 logger.warning(f"select_gemini_key_and_check_limits returned None on attempt {attempt + 1}")
                 break
-            
+
             if 'key_info' not in selection_result:
                 logger.error(f"Invalid selection_result format on attempt {attempt + 1}: missing 'key_info'")
                 break
@@ -649,14 +672,16 @@ async def make_request_with_fast_failover(
                     logger.info("Using extended 60s timeout for fast response mode")
                 else:
                     timeout_seconds = float(db.get_config('request_timeout', '60'))
-                
+
                 # 从Google API收集完整响应
                 logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']}")
-                
+                if _is_cli_key(key_info):
+                    should_stream_to_gemini = False
+
                 # 收集响应
                 response = await collect_gemini_response_directly(
                     db,
-                    key_info['key'],
+                    key_info,
                     key_info['id'],
                     gemini_request,
                     openai_request,
@@ -665,7 +690,7 @@ async def make_request_with_fast_failover(
                     timeout_seconds=timeout_seconds,
                     _internal_call=_internal_call
                 )
-                
+
                 logger.info(f"✅ Request successful with key #{key_info['id']} on attempt {attempt + 1}")
 
                 # 从响应中获取token使用量
@@ -746,36 +771,223 @@ async def make_request_with_fast_failover(
             detail=f"All {failed_count} available API keys failed"
         )
 
+async def _stream_cli_transport_response(
+        *,
+        db: Database,
+        key_info: Dict[str, Any],
+        key_id: int,
+        gemini_request: Dict,
+        openai_request: ChatCompletionRequest,
+        model_name: str,
+        timeout: float,
+        usage_collector: Optional[Dict[str, int]] = None,
+) -> AsyncGenerator[bytes, None]:
+    """通过 Gemini CLI 传输流式返回，并转换为 OpenAI SSE 片段。"""
+    stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    total_tokens = 0
+    reasoning_tokens = 0
+    thinking_sent = False
+    anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
+    saw_finish_tag = False
+    account_id = _get_cli_account_id(key_info)
+    start_time = time.time()
+
+    try:
+        async for event in stream_gemini_with_cli_account(
+            db,
+            key_info,
+            gemini_request,
+            model_name,
+            timeout=timeout,
+        ):
+            for candidate in event.get("candidates", []):
+                content = candidate.get("content") or {}
+                parts = content.get("parts", [])
+
+                for part in parts:
+                    function_call = part.get("functionCall") or part.get("function_call")
+                    if function_call:
+                        name = function_call.get("name", "")
+                        arguments = function_call.get("arguments") or function_call.get("args") or {}
+                        if not isinstance(arguments, str):
+                            try:
+                                arguments = json.dumps(arguments, ensure_ascii=False)
+                            except Exception:
+                                arguments = str(arguments)
+
+                        tool_chunk = {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": openai_request.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [{
+                                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": arguments or "{}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": None,
+                            }]
+                        }
+                        yield f"data: {json.dumps(tool_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
+                        continue
+
+                    text = part.get("text")
+                    if not text:
+                        continue
+
+                    if anti_trunc_cfg.get('enabled'):
+                        idx = text.find('[finish]')
+                        if idx != -1:
+                            text = text[:idx]
+                            saw_finish_tag = True
+
+                    is_thought = part.get("thought", False)
+                    token_count = len(text.split())
+                    total_tokens += token_count
+                    if is_thought:
+                        reasoning_tokens += token_count
+
+                    if is_thought and not (openai_request.thinking_config and openai_request.thinking_config.include_thoughts):
+                        continue
+
+                    if is_thought and not thinking_sent:
+                        thinking_header = {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": openai_request.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": "**Thinking Process:**\n"},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(thinking_header, ensure_ascii=False)}\n\n".encode('utf-8')
+                        thinking_sent = True
+
+                    if not is_thought and thinking_sent:
+                        response_header = {
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": openai_request.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": "\n\n**Response:**\n"},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(response_header, ensure_ascii=False)}\n\n".encode('utf-8')
+                        thinking_sent = False
+
+                    chunk_data = {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": openai_request.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": text},
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
+
+                finish_reason_raw = candidate.get("finishReason")
+                if finish_reason_raw or saw_finish_tag:
+                    finish_reason = map_finish_reason(finish_reason_raw) if finish_reason_raw else "stop"
+                    finish_chunk = {
+                        "id": stream_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": openai_request.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": finish_reason
+                        }]
+                    }
+                    yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
+                    yield b"data: [DONE]\n\n"
+
+                    response_time = time.time() - start_time
+                    asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
+                    if usage_collector is not None:
+                        prompt_tokens = usage_collector.get('prompt_tokens', 0)
+                        usage_collector['completion_tokens'] = total_tokens
+                        usage_collector['reasoning_tokens'] = reasoning_tokens
+                        usage_collector['total_tokens'] = prompt_tokens + total_tokens
+                    if account_id:
+                        db.touch_cli_account(account_id)
+                    return
+
+    except HTTPException:
+        response_time = time.time() - start_time
+        asyncio.create_task(update_key_performance_background(db, key_id, False, response_time))
+        raise
+    except Exception as exc:  # pragma: no cover - unexpected failures
+        response_time = time.time() - start_time
+        asyncio.create_task(update_key_performance_background(db, key_id, False, response_time))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # 如果循环结束但没有明确的 finish，发送默认完成
+    finish_chunk = {
+        "id": stream_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": openai_request.model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    }
+    yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
+    yield b"data: [DONE]\n\n"
+
+    response_time = time.time() - start_time
+    asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
+    if usage_collector is not None:
+        prompt_tokens = usage_collector.get('prompt_tokens', 0)
+        usage_collector['completion_tokens'] = total_tokens
+        usage_collector['reasoning_tokens'] = reasoning_tokens
+        usage_collector['total_tokens'] = prompt_tokens + total_tokens
+    if account_id:
+        db.touch_cli_account(account_id)
+
+
 async def stream_gemini_response_single_attempt(
         db: Database,
         rate_limiter: RateLimitCache,
-        gemini_key: str,
-        key_id: int,
+        key_info: Dict[str, Any],
         gemini_request: Dict,
         openai_request: ChatCompletionRequest,
         model_name: str,
         _internal_call: bool = False,
         usage_collector: Optional[Dict[str, int]] = None
 ) -> AsyncGenerator[bytes, None]:
-    """
-    单次流式请求尝试，失败立即抛出异常，使用 google-genai SDK 实现
-    """
-    # 确定超时时间：工具调用或快速响应模式使用60秒，其他使用配置值
+    """使用 CLI 传输执行一次流式请求。"""
+    if not _uses_cli_transport(key_info):
+        raise HTTPException(status_code=503, detail="Non-CLI Gemini keys are no longer supported")
+
     has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
     is_fast_failover = await should_use_fast_failover(db)
-    if has_tool_calls:
-        timeout = 60.0  # 工具调用强制60秒超时
-        logger.info("Using extended 60s timeout for tool calls in streaming")
-    elif is_fast_failover:
-        timeout = 60.0  # 快速响应模式使用60秒超时
-        logger.info("Using extended 60s timeout for fast response mode in streaming")
+    if has_tool_calls or is_fast_failover:
+        timeout = 60.0
     else:
         timeout = float(db.get_config('request_timeout', '60'))
 
-    logger.info(f"Starting single stream request to model: {model_name}")
+    logger.info(f"Starting CLI stream request to model: {model_name}")
 
-    start_time = time.time()
-
+    key_id = key_info['id']
     prompt_tokens = len(str(openai_request.messages).split())
     if usage_collector is not None:
         usage_collector['prompt_tokens'] = prompt_tokens
@@ -783,480 +995,31 @@ async def stream_gemini_response_single_attempt(
         usage_collector['reasoning_tokens'] = 0
         usage_collector['total_tokens'] = prompt_tokens
 
-    try:
-        client = get_cached_client(gemini_key)
-        async with asyncio.timeout(timeout):
-            contents = gemini_request["contents"]
-            # 流式接口直接使用contents和body参数
-            genai_stream = await client.aio.models.generate_content_stream(
-                model=model_name,
-                contents=gemini_request["contents"],
-                config=gemini_request.get("generation_config")
-            )
+    async for chunk in _stream_cli_transport_response(
+        db=db,
+        key_info=key_info,
+        key_id=key_id,
+        gemini_request=gemini_request,
+        openai_request=openai_request,
+        model_name=model_name,
+        timeout=timeout,
+        usage_collector=usage_collector,
+    ):
+        yield chunk
 
-            if False:  # legacy httpx code disabled after migration to google-genai
-                    response_time = time.time() - start_time
-                    asyncio.create_task(
-                        update_key_performance_background(db, key_id, False, response_time)
-                    )
-
-                    error_text = await response.aread()
-                    error_msg = error_text.decode() if error_text else f"HTTP {response.status_code}"
-                    logger.error(f"Stream request failed with status {response.status_code}: {error_msg}")
-                    raise Exception(f"Stream request failed: {error_msg}")
-
-            stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-            created = int(time.time())
-            completion_tokens = 0
-            reasoning_tokens = 0
-            thinking_sent = False
-            has_content = False
-            processed_lines = 0
-            # Anti-truncation related variables
-            anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
-            full_response = ""
-            saw_finish_tag = False
-            tool_call_states: Dict[str, Dict[str, Any]] = {}
-            next_tool_index = 0
-
-            logger.info("Stream response started")
-
-            async for chunk in genai_stream:
-                    choices = chunk.candidates or []
-                    for candidate in choices:
-                        content = candidate.content or {}
-                        parts = content.parts or []
-                        
-                        # Tool call streaming can be complex, aggregate parts first
-                        # This logic assumes tool calls might be streamed chunk by chunk.
-                        # A more robust implementation might need to accumulate parts across chunks.
-                        
-                        for i, part in enumerate(parts):
-                            delta = {}
-                            finish_reason_str = None
-
-                            if hasattr(part, "text"):
-                                text = part.text
-                                if not text:
-                                    continue
-                                token_count = len(text.split())
-                                has_content = True
-
-                                # Anti-truncation handling (stream) remains the same
-                                text_to_send = text
-                                if anti_trunc_cfg.get('enabled') and not _internal_call:
-                                    idx = text.find('[finish]')
-                                    if idx != -1:
-                                        text_to_send = text[:idx]
-                                        saw_finish_tag = True
-                                full_response += text_to_send
-
-                                is_thought = getattr(part, "thought", False)
-                                if is_thought:
-                                    reasoning_tokens += token_count
-                                    delta["reasoning"] = text_to_send
-                                else:
-                                    completion_tokens += token_count
-                                    delta["content"] = text_to_send
-                            
-                            elif hasattr(part, "function_call"):
-                                fc = part.function_call
-                                has_content = True
-
-                                call_id = getattr(fc, "id", None) or f"call_{uuid.uuid4().hex}"
-                                state = tool_call_states.get(call_id)
-                                if state is None:
-                                    state = {
-                                        "id": call_id,
-                                        "index": next_tool_index,
-                                        "args": "",
-                                        "name_sent": False,
-                                        "id_sent": False,
-                                        "sent_initial": False,
-                                    }
-                                    tool_call_states[call_id] = state
-                                    next_tool_index += 1
-
-                                function_delta: Dict[str, Any] = {}
-
-                                if getattr(fc, "name", None):
-                                    if not state.get("name_sent"):
-                                        function_delta["name"] = fc.name
-                                        state["name_sent"] = True
-                                # Determine arguments payload for this chunk
-                                args_segment = None
-                                if hasattr(fc, "args_text") and fc.args_text is not None:
-                                    args_segment = fc.args_text
-                                elif hasattr(fc, "args") and fc.args is not None:
-                                    if isinstance(fc.args, str):
-                                        args_segment = fc.args
-                                    else:
-                                        try:
-                                            args_segment = json.dumps(fc.args, ensure_ascii=False)
-                                        except TypeError:
-                                            args_segment = str(fc.args)
-
-                                if args_segment:
-                                    previous_args = state["args"]
-                                    if args_segment.startswith(previous_args):
-                                        delta_args = args_segment[len(previous_args):]
-                                        state["args"] = args_segment
-                                    else:
-                                        delta_args = args_segment
-                                        state["args"] = args_segment
-                                    if delta_args:
-                                        function_delta["arguments"] = delta_args
-
-                                send_chunk = False
-                                if not state["sent_initial"]:
-                                    send_chunk = True
-                                    state["sent_initial"] = True
-                                if function_delta:
-                                    send_chunk = True
-
-                                if send_chunk:
-                                    tool_call_chunk = {
-                                        "index": state["index"],
-                                        "type": "function",
-                                        "function": {}
-                                    }
-                                    if not state["id_sent"]:
-                                        tool_call_chunk["id"] = state["id"]
-                                        state["id_sent"] = True
-                                    tool_call_chunk["function"].update(function_delta)
-                                    if not function_delta and not state["args"]:
-                                        tool_call_chunk["function"].setdefault("arguments", "")
-                                    delta.setdefault("tool_calls", [])
-                                    delta["tool_calls"].append(tool_call_chunk)
-
-                            if delta:
-                                chunk_data = {
-                                    "id": stream_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": openai_request.model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": delta,
-                                        "finish_reason": None
-                                    }]
-                                }
-                                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
-
-                        finish_reason = getattr(candidate, "finish_reason", None)
-                        if finish_reason:
-                            finish_chunk = {
-                                "id": stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": openai_request.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": map_finish_reason(finish_reason)
-                                }]
-                            }
-                            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                            yield "data: [DONE]\n\n".encode('utf-8')
-
-                            total_generated_tokens = completion_tokens + reasoning_tokens
-                            total_with_prompt = total_generated_tokens + prompt_tokens
-                            if usage_collector is not None:
-                                usage_collector['completion_tokens'] = completion_tokens
-                                usage_collector['reasoning_tokens'] = reasoning_tokens
-                                usage_collector['total_tokens'] = total_with_prompt
-
-                            logger.info(
-                                f"Stream completed with finish_reason: {finish_reason}, tokens: {total_with_prompt}"
-                            )
-
-                            response_time = time.time() - start_time
-                            asyncio.create_task(update_key_performance_background(db, key_id, True, response_time))
-                            if not _internal_call:
-                                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
-                            return
-
-
-
-            # 如果正常结束但没有内容，抛出异常
-            if not has_content:
-                logger.warning("Stream ended without content")
-                raise Exception("Stream response had no content")
-
-            # 正常结束，发送完成信号
-            if has_content:
-                finish_chunk = {
-                    "id": stream_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": openai_request.model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }]
-                }
-                yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                yield "data: [DONE]\n\n".encode('utf-8')
-
-                total_generated_tokens = completion_tokens + reasoning_tokens
-                total_with_prompt = total_generated_tokens + prompt_tokens
-                if usage_collector is not None:
-                    usage_collector['completion_tokens'] = completion_tokens
-                    usage_collector['reasoning_tokens'] = reasoning_tokens
-                    usage_collector['total_tokens'] = total_with_prompt
-
-                logger.info(
-                    f"Stream ended naturally, tokens: {total_with_prompt}")
-
-                response_time = time.time() - start_time
-                asyncio.create_task(
-                    update_key_performance_background(db, key_id, True, response_time)
-                )
-
-            total_generated_tokens = completion_tokens + reasoning_tokens
-            total_with_prompt = total_generated_tokens + prompt_tokens
-            if usage_collector is not None:
-                usage_collector['completion_tokens'] = completion_tokens
-                usage_collector['reasoning_tokens'] = reasoning_tokens
-                usage_collector['total_tokens'] = total_with_prompt
-
-            if not _internal_call:
-                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
-
-
-
-    # except Exception as e:  # 原 httpx 超时连接异常移除
-    # Legacy httpx branch disabled after migration to google-genai
-    except Exception as e:
-        logger.warning(f"Stream timeout/connection error: {str(e)}")
-        response_time = time.time() - start_time
-        asyncio.create_task(
-            update_key_performance_background(db, key_id, False, response_time)
-        )
-        raise Exception(f"Stream connection failed: {str(e)}")
-
-
-async def stream_with_fast_failover(
-        db: Database,
-        rate_limiter: RateLimitCache,
-        gemini_request: Dict,
-        openai_request: ChatCompletionRequest,
-        model_name: str,
-        user_key_info: Dict = None,
-        max_key_attempts: int = None,
-        _internal_call: bool = False
-) -> AsyncGenerator[bytes, None]:
-    """
-    流式响应快速故障转移
-    """
-    available_keys = db.get_available_gemini_keys()
-
-    if not available_keys:
-        error_data = {
-            'error': {
-                'message': 'No available API keys',
-                'type': 'service_unavailable',
-                'code': 503
-            }
-        }
-        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
-        yield "data: [DONE]\n\n".encode('utf-8')
-        return
-
-    if max_key_attempts is None:
-        max_key_attempts = len(available_keys)
-    max_key_attempts = min(max_key_attempts, len(available_keys))
-
-    logger.info(f"Starting stream fast failover with up to {max_key_attempts} key attempts for {model_name}")
-
-    failed_keys = []
-
-    track_usage = bool(user_key_info) and not _internal_call
-
-    for attempt in range(max_key_attempts):
-        try:
-            selection_result = await select_gemini_key_and_check_limits(
-                db,
-                rate_limiter,
-                model_name,
-                excluded_keys=set(failed_keys)
-            )
-
-            if not selection_result:
-                break
-
-            key_info = selection_result['key_info']
-            logger.info(f"Stream fast failover attempt {attempt + 1}: Using key #{key_info['id']}")
-
-            # ====== 计算 should_stream_to_gemini ======
-            stream_to_gemini_mode = db.get_stream_to_gemini_mode_config().get('mode', 'auto')
-            has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-            if has_tool_calls:
-                should_stream_to_gemini = False
-            elif stream_to_gemini_mode == 'stream':
-                should_stream_to_gemini = True
-            elif stream_to_gemini_mode == 'non_stream':
-                should_stream_to_gemini = False
-            else:
-                should_stream_to_gemini = True
-
-            if not should_stream_to_gemini:
-                logger.info(
-                    "Gemini streaming disabled by configuration; using non-stream fallback within fast failover"
-                )
-                async for chunk in stream_non_stream_keep_alive(
-                        db,
-                        rate_limiter,
-                        gemini_request,
-                        openai_request,
-                        model_name,
-                        user_key_info=user_key_info,
-                        _internal_call=_internal_call
-                ):
-                    yield chunk
-                return
-
-            success = False
-            usage_summary: Dict[str, int] = {}
-
-            try:
-                async for chunk in stream_gemini_response_single_attempt(
-                        db,
-                        rate_limiter,
-                        key_info['key'],
-                        key_info['id'],
-                        gemini_request,
-                        openai_request,
-                        model_name,
-                        _internal_call=_internal_call,
-                        usage_collector=usage_summary
-                ):
-                    yield chunk
-                    success = True
-
-                if success:
-                    # 在后台记录使用量
-                    if track_usage:
-                        total_tokens = usage_summary.get('total_tokens')
-                        if total_tokens is None:
-                            prompt_tokens = usage_summary.get('prompt_tokens', 0)
-                            completion_tokens = usage_summary.get('completion_tokens', 0)
-                            reasoning_tokens = usage_summary.get('reasoning_tokens', 0)
-                            total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
-                        asyncio.create_task(
-                            log_usage_background(
-                                db,
-                                key_info['id'],
-                                user_key_info['id'],
-                                model_name,
-                                'success',
-                                1,
-                                total_tokens
-                            )
-                        )
-
-                    return
-
-            except Exception as e:
-                failed_keys.append(key_info['id'])
-                logger.warning(f"Stream key #{key_info['id']} failed: {str(e)}")
-
-                # 在后台更新性能指标
-                asyncio.create_task(
-                    update_key_performance_background(db, key_info['id'], False, 0.0)
-                )
-
-                # 记录失败的使用量
-                if track_usage:
-                    asyncio.create_task(
-                        log_usage_background(
-                            db,
-                            key_info['id'],
-                            user_key_info['id'],
-                            model_name,
-                            'failure',
-                            1,
-                            0
-                        )
-                    )
-
-                if attempt < max_key_attempts - 1:
-                    logger.info(f"Key #{key_info['id']} failed, trying next key...")
-                    # retry_msg = {
-                    #     'error': {
-                    #         'message': f'Key #{key_info["id"]} failed, trying next key...',
-                    #         'type': 'retry_info',
-                    #         'retry_attempt': attempt + 1
-                    #     }
-                    # }
-                    # yield f"data: {json.dumps(retry_msg, ensure_ascii=False)}\n\n".encode('utf-8')
-                    continue
-                else:
-                    break
-
-        except Exception as e:
-            logger.error(f"Stream failover error on attempt {attempt + 1}: {str(e)}")
-            continue
-
-    # 所有key都失败了
-    error_data = {
-        'error': {
-            'message': f'All {len(failed_keys)} available API keys failed',
-            'type': 'all_keys_failed',
-            'code': 503,
-            'failed_keys': failed_keys
-        }
-    }
-    yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
-    yield "data: [DONE]\n\n".encode('utf-8')
 
 
 async def _keep_alive_generator(task: asyncio.Task) -> AsyncGenerator[bytes, Any]:
     """
-    一个通用的异步生成器，用于在后台任务运行时发送 keep-alive 心跳。
-    任务完成后，它会 yield 任务的结果。
+    在后台任务执行期间周期性发送 keep-alive 心跳，任务完成后返回结果。
     """
     while not task.done():
         try:
-            # 等待任务2秒，如果未完成则发送心跳
             await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
         except asyncio.TimeoutError:
             yield b": keep-alive\n\n"
-    
-    # 任务完成，返回结果
+
     yield await task
-
-
-async def stream_with_preprocessing(
-    preprocessing_coro: Coroutine,
-    streaming_func: callable,
-    db: Database,
-    rate_limiter: RateLimitCache,
-    openai_request: ChatCompletionRequest,
-    model_name: str,
-    user_key_info: Dict = None
-) -> AsyncGenerator[bytes, None]:
-    """
-    在执行一个耗时的预处理任务时发送 keep-alive 心跳，然后流式传输最终结果。
-    """
-    task = asyncio.create_task(preprocessing_coro)
-    
-    async for result in _keep_alive_generator(task):
-        if isinstance(result, bytes):
-            yield result  # This is a keep-alive chunk
-        else:
-            # This is the final result from the preprocessing task
-            modified_gemini_request = result
-            if modified_gemini_request:
-                # Now, stream the final response
-                async for chunk in streaming_func(db, rate_limiter, modified_gemini_request, openai_request, model_name, user_key_info):
-                    yield chunk
-            else:
-                # Handle cases where preprocessing failed
-                error_data = {"error": {"message": "Preprocessing failed to produce a valid request.", "code": 500}}
-                yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode("utf-8")
-                yield b"data: [DONE]\n\n"
 
 
 async def stream_non_stream_keep_alive(
@@ -1317,12 +1080,12 @@ async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLim
         excluded_keys = set()
 
     available_keys = db.get_available_gemini_keys()
-    
+
     # 防御性检查：确保 available_keys 不为 None
     if available_keys is None:
         logger.error("get_available_gemini_keys() returned None")
         return None
-    
+
     available_keys = [k for k in available_keys if k['id'] not in excluded_keys]
 
     if not available_keys:
@@ -1373,10 +1136,10 @@ async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLim
 
             # 响应时间评分，10秒为基准，超过10秒评分为0
             time_score = max(0.0, 1.0 - (ema_response_time / 10.0))
-            
+
             # 最终评分：成功率权重70%，时间权重30%
             score = ema_success_rate * 0.7 + time_score * 0.3
-            
+
             # 增加近期失败惩罚
             last_failure = key_info.get('last_failure_timestamp', 0)
             time_since_failure = time.time() - last_failure
@@ -1401,7 +1164,7 @@ async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLim
 # 传统故障转移函数 - 使用 google-genai 替代 httpx
 async def make_gemini_request_with_retry(
         db: Database,
-        gemini_key: str,
+        key_info: Dict[str, Any],
         key_id: int,
         gemini_request: Dict,
         model_name: str,
@@ -1415,41 +1178,46 @@ async def make_gemini_request_with_retry(
     for attempt in range(max_retries):
         start_time = time.time()
         try:
-            # 复用缓存 client，避免重复创建
-            client = get_cached_client(gemini_key)
-            async with asyncio.timeout(timeout):
-                genai_response = await client.aio.models.generate_content(
-                    model=model_name,
-                    contents=gemini_request["contents"],
-                    config=gemini_request["generation_config"]
-                )
-                
-                response_time = time.time() - start_time
-                # 更新key性能
-                db.update_key_performance(key_id, True, response_time)
-                
-                # 将genai响应格式化为与旧代码兼容的格式
-                response_json = genai_response.to_dict()
-                return response_json
+            if not _uses_cli_transport(key_info):
+                raise HTTPException(status_code=503, detail="Non-CLI Gemini keys are no longer supported")
+
+            response = await call_gemini_with_cli_account(
+                db,
+                key_info,
+                gemini_request,
+                model_name,
+                timeout=float(timeout),
+            )
+            account_id = _get_cli_account_id(key_info)
+            if account_id:
+                db.touch_cli_account(account_id)
+
+            response_time = time.time() - start_time
+            db.update_key_performance(key_id, True, response_time)
+            return response
 
         except asyncio.TimeoutError:
             response_time = time.time() - start_time
             db.update_key_performance(key_id, False, response_time)
             if attempt == max_retries - 1:
                 raise HTTPException(status_code=504, detail="Request timeout")
-            else:
-                logger.warning(f"Request timeout (attempt {attempt + 1}), retrying...")
+            logger.warning(f"Request timeout (attempt {attempt + 1}), retrying...")
+            await asyncio.sleep(2 ** attempt)
+            continue
+        except HTTPException as exc:
+            response_time = time.time() - start_time
+            db.update_key_performance(key_id, False, response_time)
+            if exc.status_code in (429, 500) and attempt < max_retries - 1:
+                logger.warning(f"HTTP error {exc.status_code} on attempt {attempt + 1}: {exc.detail}")
                 await asyncio.sleep(2 ** attempt)
                 continue
+            raise
         except Exception as e:
             response_time = time.time() - start_time
             db.update_key_performance(key_id, False, response_time)
             if attempt == max_retries - 1:
-                # 提取错误消息
                 error_message = str(e)
                 status_code = 500
-                
-                # 尝试分析错误类型
                 if "429" in error_message or "rate limit" in error_message.lower():
                     status_code = 429
                 elif "403" in error_message or "permission" in error_message.lower():
@@ -1458,12 +1226,10 @@ async def make_gemini_request_with_retry(
                     status_code = 404
                 elif "400" in error_message or "invalid" in error_message.lower():
                     status_code = 400
-                
+
                 raise HTTPException(status_code=status_code, detail=error_message)
-            else:
-                logger.warning(f"Request failed (attempt {attempt + 1}): {str(e)}, retrying...")
-                await asyncio.sleep(2 ** attempt)
-                continue
+            logger.warning(f"Request failed (attempt {attempt + 1}): {str(e)}, retrying...")
+            await asyncio.sleep(2 ** attempt)
 
     raise HTTPException(status_code=500, detail="Max retries exceeded")
 
@@ -1550,11 +1316,14 @@ async def make_request_with_failover(
             try:
                 # 直接从Google API收集完整响应（传统故障转移）
                 logger.info(f"Using direct collection for non-streaming request with key #{key_info['id']} (traditional failover)")
-                
+
                 # 直接收集响应，避免SSE双重解析
+                if _is_cli_key(key_info):
+                    should_stream_to_gemini = False
+
                 response = await collect_gemini_response_directly(
                     db,
-                    key_info['key'],
+                    key_info,
                     key_info['id'],
                     gemini_request,
                     openai_request,
@@ -1647,7 +1416,7 @@ async def stream_with_failover(
         excluded_keys: set = None,
         _internal_call: bool = False
 ) -> AsyncGenerator[bytes, None]:
-    """传统流式响应处理（保留用于兼容）"""
+    """传统流式响应处理（保留用于兼容）。只支持 CLI 类型的上游。"""
     if excluded_keys is None:
         excluded_keys = set()
 
@@ -1663,7 +1432,7 @@ async def stream_with_failover(
             }
         }
         yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
-        yield "data: [DONE]\n\n".encode('utf-8')
+        yield b"data: [DONE]\n\n"
         return
 
     if max_key_attempts is None:
@@ -1674,121 +1443,114 @@ async def stream_with_failover(
     logger.info(f"Starting stream failover with {max_key_attempts} key attempts for {model_name}")
 
     failed_keys = []
-
     track_usage = bool(user_key_info) and not _internal_call
 
     for attempt in range(max_key_attempts):
-        try:
-            selection_result = await select_gemini_key_and_check_limits(
+        selection_result = await select_gemini_key_and_check_limits(
+            db,
+            rate_limiter,
+            model_name,
+            excluded_keys=excluded_keys.union(set(failed_keys))
+        )
+
+        if not selection_result:
+            break
+
+        key_info = selection_result['key_info']
+        if not _uses_cli_transport(key_info):
+            logger.warning("Skipping non-CLI key during streaming failover")
+            failed_keys.append(key_info['id'])
+            continue
+
+        logger.info(f"Stream attempt {attempt + 1}: Using key #{key_info['id']}")
+
+        stream_to_gemini_mode = db.get_stream_to_gemini_mode_config().get('mode', 'auto')
+        has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
+        if has_tool_calls:
+            should_stream_to_gemini = False
+        elif stream_to_gemini_mode == 'stream':
+            should_stream_to_gemini = True
+        elif stream_to_gemini_mode == 'non_stream':
+            should_stream_to_gemini = False
+        else:
+            should_stream_to_gemini = True
+
+        if not should_stream_to_gemini:
+            logger.info("Streaming disabled by configuration; falling back to buffered mode")
+            async for chunk in stream_non_stream_keep_alive(
                 db,
                 rate_limiter,
+                gemini_request,
+                openai_request,
                 model_name,
-                excluded_keys=excluded_keys.union(set(failed_keys))
-            )
+                user_key_info=user_key_info,
+                _internal_call=_internal_call,
+            ):
+                yield chunk
+            return
 
-            if not selection_result:
-                break
+        usage_summary: Dict[str, int] = {}
+        try:
+            async for chunk in stream_gemini_response_single_attempt(
+                db,
+                rate_limiter,
+                key_info,
+                gemini_request,
+                openai_request,
+                model_name,
+                _internal_call=_internal_call,
+                usage_collector=usage_summary,
+            ):
+                yield chunk
 
-            key_info = selection_result['key_info']
-            logger.info(f"Stream attempt {attempt + 1}: Using key #{key_info['id']}")
+            total_tokens = usage_summary.get('total_tokens')
+            if total_tokens is None:
+                prompt_tokens = usage_summary.get('prompt_tokens', 0)
+                completion_tokens = usage_summary.get('completion_tokens', 0)
+                reasoning_tokens = usage_summary.get('reasoning_tokens', 0)
+                total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
 
-            stream_to_gemini_mode = db.get_stream_to_gemini_mode_config().get('mode', 'auto')
-            has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-            if has_tool_calls:
-                should_stream_to_gemini = False
-            elif stream_to_gemini_mode == 'stream':
-                should_stream_to_gemini = True
-            elif stream_to_gemini_mode == 'non_stream':
-                should_stream_to_gemini = False
-            else:
-                should_stream_to_gemini = True
-
-            if not should_stream_to_gemini:
-                logger.info(
-                    "Gemini streaming disabled by configuration; using non-stream fallback within traditional failover"
+            if track_usage:
+                db.log_usage(
+                    gemini_key_id=key_info['id'],
+                    user_key_id=user_key_info['id'],
+                    model_name=model_name,
+                    status='success',
+                    requests=1,
+                    tokens=total_tokens
                 )
-                async for chunk in stream_non_stream_keep_alive(
-                        db,
-                        rate_limiter,
-                        gemini_request,
-                        openai_request,
-                        model_name,
-                        user_key_info=user_key_info,
-                        _internal_call=_internal_call
-                ):
-                    yield chunk
-                return
+            return
 
-            success = False
-            usage_summary: Dict[str, int] = {}
-            try:
-                async for chunk in stream_gemini_response(
-                        db,
-                        rate_limiter,
-                        key_info['key'],
-                        key_info['id'],
-                        gemini_request,
-                        openai_request,
-                        key_info,
-                        model_name,
-                        _internal_call=_internal_call,
-                        usage_collector=usage_summary
-                ):
-                    yield chunk
-                    success = True
-
-                if success:
-                    total_tokens = usage_summary.get('total_tokens')
-                    if total_tokens is None:
-                        prompt_tokens = usage_summary.get('prompt_tokens', 0)
-                        completion_tokens = usage_summary.get('completion_tokens', 0)
-                        reasoning_tokens = usage_summary.get('reasoning_tokens', 0)
-                        total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
-                    if track_usage:
-                        db.log_usage(
-                            gemini_key_id=key_info['id'],
-                            user_key_id=user_key_info['id'],
-                            model_name=model_name,
-                            status='success',
-                            requests=1,
-                            tokens=total_tokens
-                        )
-                        logger.info(
-                            f"📊 Logged stream usage: gemini_key_id={key_info['id']}, user_key_id={user_key_info['id']}, model={model_name}")
-                    return
-
-            except Exception as e:
-                failed_keys.append(key_info['id'])
-                logger.warning(f"Stream key #{key_info['id']} failed: {str(e)}")
-
-                db.update_key_performance(key_info['id'], False, 0.0)
-
-                if track_usage:
-                    db.log_usage(
-                        gemini_key_id=key_info['id'],
-                        user_key_id=user_key_info['id'],
-                        model_name=model_name,
-                        status='failure',
-                        requests=1,
-                        tokens=0
-                    )
-
-                if attempt < max_key_attempts - 1:
-                    retry_msg = {
-                        'error': {
-                            'message': f'Key #{key_info["id"]} failed, trying next key...',
-                            'type': 'retry_info',
-                            'retry_attempt': attempt + 1
-                        }
+        except HTTPException as exc:
+            failed_keys.append(key_info['id'])
+            logger.warning(f"Stream key #{key_info['id']} failed: {exc.detail}")
+            if track_usage:
+                db.log_usage(
+                    gemini_key_id=key_info['id'],
+                    user_key_id=user_key_info['id'],
+                    model_name=model_name,
+                    status='failure',
+                    requests=1,
+                    tokens=0
+                )
+            if attempt < max_key_attempts - 1:
+                retry_msg = {
+                    'error': {
+                        'message': f'Key #{key_info["id"]} failed, trying next key...',
+                        'type': 'retry_info',
+                        'retry_attempt': attempt + 1
                     }
-                    yield f"data: {json.dumps(retry_msg, ensure_ascii=False)}\n\n".encode('utf-8')
-                    continue
-                else:
-                    break
+                }
+                yield f"data: {json.dumps(retry_msg, ensure_ascii=False)}\n\n".encode('utf-8')
+                continue
+            break
 
-        except Exception as e:
-            logger.error(f"Stream failover error on attempt {attempt + 1}: {str(e)}")
-            continue
+        except Exception as exc:
+            failed_keys.append(key_info['id'])
+            logger.error(f"Stream failover error on attempt {attempt + 1}: {exc}")
+            if attempt < max_key_attempts - 1:
+                continue
+            break
 
     error_data = {
         'error': {
@@ -1799,417 +1561,9 @@ async def stream_with_failover(
         }
     }
     yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n".encode('utf-8')
-    yield "data: [DONE]\n\n".encode('utf-8')
+    yield b"data: [DONE]\n\n"
 
 
-async def stream_gemini_response(
-        db: Database,
-        rate_limiter: RateLimitCache,
-        gemini_key: str,
-        key_id: int,
-        gemini_request: Dict,
-        openai_request: ChatCompletionRequest,
-        key_info: Dict,
-        model_name: str,
-        _internal_call: bool = False,
-        usage_collector: Optional[Dict[str, int]] = None
-) -> AsyncGenerator[bytes, None]:
-    """处理Gemini的流式响应，记录性能指标"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse"
-    
-    # 确定超时时间：工具调用或快速响应模式使用60秒，其他使用配置值
-    has_tool_calls = bool(openai_request.tools or openai_request.tool_choice)
-    is_fast_failover = await should_use_fast_failover(db)
-    if has_tool_calls:
-        timeout = 60.0  # 工具调用强制60秒超时
-        logger.info("Using extended 60s timeout for tool calls in traditional streaming")
-    elif is_fast_failover:
-        timeout = 60.0  # 快速响应模式使用60秒超时
-        logger.info("Using extended 60s timeout for fast response mode in traditional streaming")
-    else:
-        timeout = float(db.get_config('request_timeout', '60'))
-    
-    max_retries = int(db.get_config('max_retries', '3'))
-
-    logger.info(f"Starting stream request to: {url}")
-
-    start_time = time.time()
-
-    prompt_tokens = len(str(openai_request.messages).split())
-    if usage_collector is not None:
-        usage_collector['prompt_tokens'] = prompt_tokens
-        usage_collector['completion_tokens'] = 0
-        usage_collector['reasoning_tokens'] = 0
-        usage_collector['total_tokens'] = prompt_tokens
-
-    for attempt in range(max_retries):
-        try:
-            client = get_cached_client(gemini_key)
-            async with asyncio.timeout(timeout):
-                genai_stream = await client.aio.models.generate_content_stream(
-                    model=model_name,
-                    contents=gemini_request["contents"],
-                    config=gemini_request.get("generation_config")
-                )
-                # 将 google-genai 流式响应包装为 SSE
-                stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-                created = int(time.time())
-                total_tokens = 0
-                thinking_sent = False
-                processed_chunks = 0
-                
-                # 防截断相关变量
-                anti_trunc_cfg = db.get_anti_truncation_config() if hasattr(db, 'get_anti_truncation_config') else {'enabled': False}
-                full_response = ""
-                continuation_attempted = False
-                saw_finish_tag = False
-
-                async for chunk in genai_stream:
-                    processed_chunks += 1
-                    choices = chunk.candidates or []
-                    for candidate in choices:
-                        content = candidate.content or {}
-                        parts = content.parts or []
-                        for part in parts:
-                            if hasattr(part, "text"):
-                                text = part.text
-                                if not text:
-                                    continue
-                                total_tokens += len(text.split())
-                                chunk_data = {
-                                    "id": stream_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": openai_request.model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": text},
-                                        "finish_reason": None
-                                    }]
-                                }
-                                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
-
-                        finish_reason = getattr(candidate, "finish_reason", None)
-                        if finish_reason:
-                            finish_chunk = {
-                                "id": stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": openai_request.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": map_finish_reason(finish_reason)
-                                }]
-                            }
-                            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                            yield "data: [DONE]\n\n".encode('utf-8')
-
-                            response_time = time.time() - start_time
-                            db.update_key_performance(key_id, True, response_time)
-                            total_with_prompt = total_tokens + prompt_tokens
-                            if usage_collector is not None:
-                                usage_collector['completion_tokens'] = total_tokens
-                                usage_collector['total_tokens'] = total_with_prompt
-                            if not _internal_call:
-                                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
-                            return
-                    if response.status_code != 200:
-                        response_time = time.time() - start_time
-                        db.update_key_performance(key_id, False, response_time)
-
-                        # 如果是429错误，则标记为速率受限
-                        if response.status_code == 429:
-                            logger.warning(f"Stream key #{key_id} is rate-limited (429). Marking as 'rate_limited'.")
-                            db.update_gemini_key_status(key_id, 'rate_limited')
-
-                        error_text = await response.aread()
-                        error_msg = error_text.decode() if error_text else "Unknown error"
-                        logger.error(f"Stream request failed with status {response.status_code}: {error_msg}")
-                        yield f"data: {json.dumps({'error': {'message': error_msg, 'type': 'api_error', 'code': response.status_code}}, ensure_ascii=False)}\n\n".encode(
-                            'utf-8')
-                        yield "data: [DONE]\n\n".encode('utf-8')
-                        return
-
-                    stream_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-                    created = int(time.time())
-                    total_tokens = 0
-                    thinking_sent = False
-                    has_content = False
-                    processed_lines = 0
-
-                    logger.info(f"Stream response started, status: {response.status_code}")
-
-                    try:
-                        async for line in response.aiter_lines():
-                            processed_lines += 1
-
-                            if not line:
-                                continue
-
-                            if processed_lines <= 5:
-                                logger.debug(f"Stream line {processed_lines}: {line[:100]}...")
-
-                            if line.startswith("data: "):
-                                json_str = line[6:]
-
-                                if json_str.strip() == "[DONE]":
-                                    logger.info("Received [DONE] signal from stream")
-                                    break
-
-                                if not json_str.strip():
-                                    continue
-
-                                try:
-                                    data = json.loads(json_str)
-
-                                    for candidate in data.get("candidates", []):
-                                        content_data = candidate.get("content", {})
-                                        parts = content_data.get("parts", [])
-
-                                        for part in parts:
-                                            if "text" in part:
-                                                text = part["text"]
-                                                if not text:
-                                                    continue
-
-                                                token_count = len(text.split())
-                                                total_tokens += token_count
-                                                has_content = True
-                                                # Anti-truncation handling
-                                                if anti_trunc_cfg.get('enabled') and not _internal_call:
-                                                    idx = text.find('[finish]')
-                                                    if idx != -1:
-                                                        text_to_send = text[:idx]
-                                                        saw_finish_tag = True
-                                                    else:
-                                                        text_to_send = text
-                                                else:
-                                                    text_to_send = text
-                                                full_response += text_to_send
-
-                                                is_thought = part.get("thought", False)
-
-                                                if is_thought and not (openai_request.thinking_config and
-                                                                       openai_request.thinking_config.include_thoughts):
-                                                    continue
-
-                                                if is_thought and not thinking_sent:
-                                                    thinking_header = {
-                                                        "id": stream_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": created,
-                                                        "model": openai_request.model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {"content": "**Thinking Process:**\n"},
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(thinking_header, ensure_ascii=False)}\n\n".encode(
-                                                        'utf-8')
-                                                    thinking_sent = True
-                                                    logger.debug("Sent thinking header")
-                                                elif not is_thought and thinking_sent:
-                                                    response_header = {
-                                                        "id": stream_id,
-                                                        "object": "chat.completion.chunk",
-                                                        "created": created,
-                                                        "model": openai_request.model,
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {"content": "\n\n**Response:**\n"},
-                                                            "finish_reason": None
-                                                        }]
-                                                    }
-                                                    yield f"data: {json.dumps(response_header, ensure_ascii=False)}\n\n".encode(
-                                                        'utf-8')
-                                                    thinking_sent = False
-                                                    logger.debug("Sent response header")
-
-                                                chunk_data = {
-                                                    "id": stream_id,
-                                                    "object": "chat.completion.chunk",
-                                                    "created": created,
-                                                    "model": openai_request.model,
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {"content": text},
-                                                        "finish_reason": None
-                                                    }]
-                                                }
-                                                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode(
-                                                    'utf-8')
-
-                                        finish_reason = candidate.get("finishReason")
-                                        if finish_reason:
-                                            finish_chunk = {
-                                                "id": stream_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created,
-                                                "model": openai_request.model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {},
-                                                    "finish_reason": map_finish_reason(finish_reason)
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode(
-                                                'utf-8')
-                                            yield "data: [DONE]\n\n".encode('utf-8')
-
-                                            response_time = time.time() - start_time
-                                            db.update_key_performance(key_id, True, response_time)
-                                            total_with_prompt = total_tokens + prompt_tokens
-                                            if usage_collector is not None:
-                                                usage_collector['completion_tokens'] = total_tokens
-                                                usage_collector['total_tokens'] = total_with_prompt
-                                            logger.info(
-                                                f"Stream completed with finish_reason: {finish_reason}, tokens: {total_with_prompt}")
-                                            if not _internal_call:
-                                                await rate_limiter.add_usage(model_name, 1, total_with_prompt)
-                                            return
-
-                                except json.JSONDecodeError as e:
-                                    logger.warning(f"JSON decode error: {e}, line: {json_str[:200]}...")
-                                    continue
-
-                            elif line.startswith("event: "):
-                                continue
-                            elif line.startswith("id: ") or line.startswith("retry: "):
-                                continue
-
-                        if has_content:
-                            finish_chunk = {
-                                "id": stream_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": openai_request.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }]
-                            }
-                            yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                            yield "data: [DONE]\n\n".encode('utf-8')
-
-                            response_time = time.time() - start_time
-                            db.update_key_performance(key_id, True, response_time)
-                            total_with_prompt = total_tokens + prompt_tokens
-                            if usage_collector is not None:
-                                usage_collector['completion_tokens'] = total_tokens
-                                usage_collector['total_tokens'] = total_with_prompt
-                            logger.info(
-                                f"Stream ended naturally, processed {processed_lines} lines, tokens: {total_with_prompt}")
-
-                        if not has_content:
-                            logger.warning(
-                                f"Stream response had no content after processing {processed_lines} lines, falling back to non-stream")
-                            try:
-                                fallback_response = await make_gemini_request_with_retry(
-                                    db, gemini_key, key_id, gemini_request, model_name, 1, timeout=timeout
-                                )
-
-                                include_thoughts_fallback = openai_request.thinking_config and openai_request.thinking_config.include_thoughts
-                                thoughts, content = extract_thoughts_and_content(fallback_response, include_thoughts_fallback)
-
-                                if thoughts and openai_request.thinking_config and openai_request.thinking_config.include_thoughts:
-                                    full_content = f"**Thinking Process:**\n{thoughts}\n\n**Response:**\n{content}"
-                                else:
-                                    full_content = content
-
-                                if full_content:
-                                    chunk_data = {
-                                        "id": stream_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": openai_request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": full_content},
-                                            "finish_reason": None
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n".encode('utf-8')
-
-                                    finish_chunk = {
-                                        "id": stream_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": openai_request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {},
-                                            "finish_reason": "stop"
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode('utf-8')
-                                    total_tokens = len(full_content.split())
-
-                                    total_with_prompt = total_tokens + prompt_tokens
-                                    if usage_collector is not None:
-                                        usage_collector['completion_tokens'] = total_tokens
-                                        usage_collector['total_tokens'] = total_with_prompt
-                                    logger.info(f"Fallback completed, tokens: {total_with_prompt}")
-
-                            except Exception as e:
-                                logger.error(f"Fallback request failed: {e}")
-                                response_time = time.time() - start_time
-                                db.update_key_performance(key_id, False, response_time)
-                                yield f"data: {json.dumps({'error': {'message': 'Failed to get response', 'type': 'server_error'}}, ensure_ascii=False)}\n\n".encode(
-                                    'utf-8')
-
-                        total_with_prompt = total_tokens + prompt_tokens
-                        if usage_collector is not None:
-                            usage_collector['completion_tokens'] = total_tokens
-                            usage_collector['total_tokens'] = total_with_prompt
-                        if not _internal_call:
-                            await rate_limiter.add_usage(model_name, 1, total_with_prompt)
-                        yield "data: [DONE]\n\n".encode('utf-8')
-                        return
-
-                    except Exception as e:
-                        logger.warning(f"Stream connection error (attempt {attempt + 1}): {str(e)}")
-                        response_time = time.time() - start_time
-                        db.update_key_performance(key_id, False, response_time)
-                        if attempt < max_retries - 1:
-                            yield f"data: {json.dumps({'error': {'message': 'Connection interrupted, retrying...', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                                'utf-8')
-                            await asyncio.sleep(1)
-                            continue
-                        else:
-                            yield f"data: {json.dumps({'error': {'message': 'Stream connection failed after retries', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                                'utf-8')
-                            yield "data: [DONE]\n\n".encode('utf-8')
-                            return
-
-        except Exception as e:
-            logger.warning(f"Connection error (attempt {attempt + 1}): {str(e)}")
-            response_time = time.time() - start_time
-            db.update_key_performance(key_id, False, response_time)
-            if attempt < max_retries - 1:
-                yield f"data: {json.dumps({'error': {'message': f'Connection error, retrying... (attempt {attempt + 1})', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                    'utf-8')
-                await asyncio.sleep(2 ** attempt)
-                continue
-            else:
-                yield f"data: {json.dumps({'error': {'message': 'Connection failed after all retries', 'type': 'connection_error'}}, ensure_ascii=False)}\n\n".encode(
-                    'utf-8')
-                yield "data: [DONE]\n\n".encode('utf-8')
-                return
-        except Exception as e:
-            logger.error(f"Unexpected error in stream (attempt {attempt + 1}): {str(e)}")
-            response_time = time.time() - start_time
-            db.update_key_performance(key_id, False, response_time)
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1)
-                continue
-            else:
-                yield f"data: {json.dumps({'error': {'message': 'Unexpected error occurred', 'type': 'server_error'}}, ensure_ascii=False)}\n\n".encode(
-                    'utf-8')
-                yield "data: [DONE]\n\n".encode('utf-8')
-                return
 
 async def record_hourly_health_check(db: Database):
     """每小时记录一次健康检测结果"""
@@ -2220,7 +1574,7 @@ async def record_hourly_health_check(db: Database):
             key_id = key_info['id']
 
             # 执行健康检测
-            health_result = await check_gemini_key_health(key_info['key'])
+            health_result = await check_gemini_key_health(key_info, db)
 
             # 记录到历史表
             db.record_daily_health_status(
@@ -2281,7 +1635,7 @@ def delete_unhealthy_keys(db: Database) -> Dict[str, Any]:
         for key in unhealthy_keys:
             db.delete_gemini_key(key['id'])
             deleted_count += 1
-        
+
         logger.info(f"Deleted {deleted_count} unhealthy Gemini keys.")
         return {"success": True, "message": f"成功删除 {deleted_count} 个异常密钥", "deleted_count": deleted_count}
     except Exception as e:
@@ -2293,17 +1647,17 @@ async def cleanup_database_records(db: Database):
     """每日自动清理旧的数据库记录"""
     try:
         logger.info("Starting daily database cleanup...")
-        
+
         # 清理使用日志
         deleted_logs = db.cleanup_old_logs(days=1)
         logger.info(f"Cleaned up {deleted_logs} old usage log records.")
-        
+
         # 清理健康检查历史
         deleted_history = db.cleanup_old_health_history(days=1)
         logger.info(f"Cleaned up {deleted_history} old health history records.")
-        
+
         logger.info("✅ Daily database cleanup completed.")
-        
+
     except Exception as e:
         logger.error(f"❌ Daily database cleanup failed: {e}")
 
@@ -2466,7 +1820,7 @@ async def _get_search_plan_from_ai(
 
         # Get current time and format it
         current_time_str = datetime.now(ZoneInfo("Asia/Shanghai")).strftime('%Y-%m-%d %H:%M:%S')
-        
+
         planning_target = search_focus or original_user_prompt
 
         planning_prompt = (
@@ -2499,7 +1853,7 @@ async def _get_search_plan_from_ai(
             model=original_request.model,
             messages=[ChatMessage(role="user", content=planning_prompt)]
         )
-        
+
         planning_gemini_request = openai_to_gemini(db, planning_openai_request, anti_detection, {}, False)
 
         # Make the internal call. _internal_call=True bypasses some logging/features.
@@ -2508,14 +1862,14 @@ async def _get_search_plan_from_ai(
         )
 
         ai_response_text = response_dict['choices'][0]['message']['content']
-        
+
         # Clean up and parse JSON
         json_str = ai_response_text.strip()
         if '```json' in json_str:
             json_str = json_str.split('```json')[1].strip()
         if '```' in json_str:
             json_str = json_str.split('```')[0].strip()
-        
+
         plan = json.loads(json_str)
 
         if isinstance(plan, dict) and 'search_tasks' in plan and isinstance(plan['search_tasks'], list):
@@ -2548,9 +1902,9 @@ async def execute_search_flow(
     """
     original_user_prompt = ""
     if original_request.messages:
-        last_user_message = next((m.content for m in reversed(original_request.messages) if m.role == 'user'), None)
+        last_user_message = next((m for m in reversed(original_request.messages) if m.role == 'user'), None)
         if last_user_message:
-            original_user_prompt = last_user_message.strip()
+            original_user_prompt = last_user_message.get_text_content().strip()
 
     if not original_user_prompt:
         raise HTTPException(status_code=400, detail="User prompt is missing for search.")
@@ -2614,7 +1968,7 @@ async def execute_search_flow(
     # 2. Concurrently perform searches and scrape results
     if not search_tasks_to_run:
         raise HTTPException(status_code=500, detail="Search plan resulted in no tasks to execute.")
-        
+
     logger.info(f"Executing {len(search_tasks_to_run)} search/scrape tasks concurrently.")
     search_results = await asyncio.gather(*search_tasks_to_run)
 
@@ -2624,7 +1978,7 @@ async def execute_search_flow(
     if not search_context.strip():
         search_context = "No search results found."
         logger.warning("All search queries returned no usable results.")
-    
+
     logger.info(f"Aggregated search context length: {len(search_context)} chars")
 
     # 4. Build the final prompt for the Gemini model
@@ -2638,7 +1992,7 @@ async def execute_search_flow(
 
     # 5. Modify the original request to include the new context-aware prompt
     final_gemini_request = openai_to_gemini(db, original_request, anti_detection, file_storage, enable_anti_detection)
-    
+
     if final_gemini_request['contents']:
         for part in reversed(final_gemini_request['contents']):
             if part.get('role') == 'user':
@@ -2647,7 +2001,7 @@ async def execute_search_flow(
 
     return final_gemini_request
 
-            
+
 
 
 
@@ -2662,7 +2016,7 @@ async def create_embeddings(
     """
     model_name = request.model
     contents = [request.input] if isinstance(request.input, str) else request.input
-    
+
     config = {}
     if request.task_type:
         config['task_type'] = request.task_type
@@ -2674,30 +2028,47 @@ async def create_embeddings(
         raise HTTPException(status_code=429, detail="Rate limit exceeded or no available keys.")
 
     key_info = selection_result['key_info']
-    client = get_cached_client(key_info['key'])
+    if not _uses_cli_transport(key_info):
+        raise HTTPException(status_code=503, detail="Non-CLI Gemini keys are no longer supported")
 
-    try:
+    embedding_data: List[EmbeddingData] = []
+    prompt_tokens = 0
+
+    async def _run_embed(text_value: str, index: int) -> None:
+        nonlocal prompt_tokens
+        payload: Dict[str, Any] = {
+            "content": {
+                "parts": [{"text": text_value}]
+            }
+        }
+        if config.get('task_type'):
+            payload["taskType"] = config['task_type']
+        if config.get('output_dimensionality'):
+            payload["outputDimensionality"] = config['output_dimensionality']
+
         start_time = time.time()
-        result = await client.aio.models.embed_content(
-            model=model_name,
-            contents=contents,
-            config=types.EmbedContentConfig(**config) if config else None
+        response = await embed_with_cli_account(
+            db,
+            key_info,
+            payload,
+            model_name,
+            timeout=float(db.get_config('request_timeout', '60')),
         )
         response_time = time.time() - start_time
-        
         asyncio.create_task(update_key_performance_background(db, key_info['id'], True, response_time))
 
-        embeddings = result.embeddings
-        embedding_data = [
-            EmbeddingData(embedding=e.values, index=i)
-            for i, e in enumerate(embeddings)
-        ]
+        values = response.get("embedding", {}).get("values") or []
+        embedding_data.append(EmbeddingData(embedding=values, index=index))
+        prompt_tokens += len(text_value.split())
 
-        prompt_tokens = sum(len(c.split()) for c in contents)
-        
+    try:
+        for idx, item in enumerate(contents):
+            text_value = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+            await _run_embed(text_value, idx)
+
         usage = EmbeddingUsage(
             prompt_tokens=prompt_tokens,
-            total_tokens=prompt_tokens
+            total_tokens=prompt_tokens,
         )
 
         asyncio.create_task(
@@ -2708,7 +2079,7 @@ async def create_embeddings(
                 model_name,
                 'success',
                 1,
-                prompt_tokens
+                prompt_tokens,
             )
         )
         await rate_limiter.add_usage(model_name, 1, prompt_tokens)
@@ -2716,13 +2087,15 @@ async def create_embeddings(
         return EmbeddingResponse(
             data=embedding_data,
             model=model_name,
-            usage=usage
+            usage=usage,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        response_time = time.time() - start_time
-        asyncio.create_task(update_key_performance_background(db, key_info['id'], False, response_time, error_type="other"))
-        
+        asyncio.create_task(
+            update_key_performance_background(db, key_info['id'], False, 0.0, error_type="other")
+        )
         asyncio.create_task(
             log_usage_background(
                 db,
@@ -2731,11 +2104,10 @@ async def create_embeddings(
                 model_name,
                 'failure',
                 1,
-                0
+                0,
             )
         )
         await rate_limiter.add_usage(model_name, 1, 0)
-        
         logger.error(f"Embedding creation failed for key #{key_info['id']}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2751,7 +2123,7 @@ async def create_gemini_native_embeddings(
     Create embeddings using Gemini's native request and response format.
     """
     contents = [request.contents] if isinstance(request.contents, str) else request.contents
-    
+
     config_dict = request.config.dict() if request.config else {}
 
     selection_result = await select_gemini_key_and_check_limits(db, rate_limiter, model_name)
@@ -2759,23 +2131,42 @@ async def create_gemini_native_embeddings(
         raise HTTPException(status_code=429, detail="Rate limit exceeded or no available keys.")
 
     key_info = selection_result['key_info']
-    client = get_cached_client(key_info['key'])
+    if not _uses_cli_transport(key_info):
+        raise HTTPException(status_code=503, detail="Non-CLI Gemini keys are no longer supported")
 
-    try:
+    embeddings: List[EmbeddingValue] = []
+    prompt_tokens = 0
+
+    async def _run_native_embed(raw_content: Any) -> None:
+        nonlocal prompt_tokens
+        payload: Dict[str, Any] = {
+            "content": raw_content if isinstance(raw_content, dict) else {
+                "parts": [{"text": str(raw_content)}]
+            }
+        }
+        if config_dict.get('task_type'):
+            payload["taskType"] = config_dict['task_type']
+        if config_dict.get('output_dimensionality'):
+            payload["outputDimensionality"] = config_dict['output_dimensionality']
+
         start_time = time.time()
-        result = await client.aio.models.embed_content(
-            model=model_name,
-            contents=contents,
-            config=types.EmbedContentConfig(**config_dict) if config_dict else None
+        response = await embed_with_cli_account(
+            db,
+            key_info,
+            payload,
+            model_name,
+            timeout=float(db.get_config('request_timeout', '60')),
         )
         response_time = time.time() - start_time
-        
         asyncio.create_task(update_key_performance_background(db, key_info['id'], True, response_time))
 
-        # Directly use the native response structure
-        embeddings = [EmbeddingValue(values=e.values) for e in result.embeddings]
-        
-        prompt_tokens = sum(len(str(c).split()) for c in contents)
+        values = response.get("embedding", {}).get("values") or []
+        embeddings.append(EmbeddingValue(values=values))
+        prompt_tokens += len(str(raw_content).split())
+
+    try:
+        for item in contents:
+            await _run_native_embed(item)
 
         asyncio.create_task(
             log_usage_background(
@@ -2792,10 +2183,12 @@ async def create_gemini_native_embeddings(
 
         return GeminiEmbeddingResponse(embeddings=embeddings)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        response_time = time.time() - start_time
-        asyncio.create_task(update_key_performance_background(db, key_info['id'], False, response_time, error_type="other"))
-        
+        asyncio.create_task(
+            update_key_performance_background(db, key_info['id'], False, 0.0, error_type="other")
+        )
         asyncio.create_task(
             log_usage_background(
                 db,
@@ -2808,7 +2201,7 @@ async def create_gemini_native_embeddings(
             )
         )
         await rate_limiter.add_usage(model_name, 1, 0)
-        
+
         logger.error(f"Native embedding creation failed for key #{key_info['id']}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2891,19 +2284,19 @@ async def _execute_deepthink_preprocessing(
     logger.info("--- DeepThink Phase 2.2: Critical Reflection & Secondary Planning ---")
     reflection_prompt = f"""
     You are a 'Reflector AI'. Your task is to critically analyze a preliminary answer and plan for its improvement.
-    
+
     User's Original Request: "{original_user_prompt}"
-    
+
     Preliminary Answer Draft:
     ---
     {draft_answer}
     ---
-    
+
     Your Tasks:
     1.  **Analyze & Critique**: Evaluate the draft. Is it complete? Does it have logical gaps? Is the information sufficient?
     2.  **Propose Improvements**: Clearly state what is missing or could be improved.
     3.  **Plan Secondary Exploration**: Based on your critique, generate exactly 2 new, targeted exploration prompts to gather the missing information. If a prompt needs web search, prefix it with `[search]`.
-    
+
     Return your response as a JSON object with three keys: "critique", "improvements", and "new_prompts" (which should be an array of 2 strings).
     Example: {{ "critique": "...", "improvements": "...", "new_prompts": ["[search] latest market trends for AI", "Explain the technical challenges of..."] }}
     """
@@ -2925,31 +2318,31 @@ async def _execute_deepthink_preprocessing(
     logger.info("--- DeepThink Phase 3.2: Final Synthesis ---")
     final_synthesis_prompt = f"""
     Your task is to generate a final, high-quality answer by integrating all available information.
-    
+
     1.  **User's Original Request**: "{original_user_prompt}"
-    
+
     2.  **Preliminary Draft**:
         ---
         {draft_answer}
         ---
-        
+
     3.  **Critique and Improvements Suggested**:
         - Critique: {reflection_result.get('critique')}
         - Improvements: {reflection_result.get('improvements')}
-        
+
     4.  **Additional Information from Secondary Exploration**:
         ---
         {secondary_context}
         ---
-        
+
     Instructions:
     - Revise and enhance the preliminary draft using the critique and the new information.
     - Ensure the final answer is comprehensive, accurate, and directly addresses the user's original request.
     - Produce only the final, polished answer without any extra commentary.
-    
+
     Final Answer:
     """
-    
+
     # 更新原始请求以包含最终的综合提示
     final_request_messages = copy.deepcopy(original_request.messages)
     found_user = False
@@ -2962,6 +2355,6 @@ async def _execute_deepthink_preprocessing(
          final_request_messages.append(ChatMessage(role="user", content=final_synthesis_prompt))
 
     final_openai_request = original_request.copy(update={"messages": final_request_messages})
-    
+
     # 4. 返回最终的gemini_request
     return openai_to_gemini(db, final_openai_request, anti_detection, file_storage, enable_anti_detection=enable_anti_detection)

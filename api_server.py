@@ -12,9 +12,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from database import Database
 from api_routes import router as api_router, admin_router
-from dependencies import get_db, get_start_time, get_request_count, get_keep_alive_enabled, get_anti_detection, get_rate_limiter
+from dependencies import (
+    get_db,
+    get_start_time,
+    get_request_count,
+    get_keep_alive_enabled,
+    get_anti_detection,
+    get_rate_limiter,
+    get_cli_auth_manager,
+)
 from api_utils import GeminiAntiDetectionInjector, keep_alive_ping, RateLimitCache
 from api_services import record_hourly_health_check, auto_cleanup_failed_keys, cleanup_database_records
+from cli_auth import CliAuthManager, close_cli_http_clients
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +55,7 @@ db_queue = Queue(maxsize=10000)
 db = Database(db_queue=db_queue)
 anti_detection = GeminiAntiDetectionInjector()
 rate_limiter = RateLimitCache()
+cli_auth_manager = CliAuthManager()
 
 async def db_writer_worker(queue: Queue, db_instance: Database):
     """A worker that processes database write operations from a queue."""
@@ -156,6 +166,8 @@ async def lifespan(app: FastAPI):
     await db_worker_task
     logger.info("Database writer worker shut down.")
 
+    await close_cli_http_clients()
+
     logger.info("👋 Service shutting down...")
 
 # Create FastAPI app instance
@@ -212,11 +224,15 @@ def _get_anti_detection():
 def _get_rate_limiter():
     return rate_limiter
 
+def _get_cli_auth_manager():
+    return cli_auth_manager
+
 app.dependency_overrides[get_db] = _get_db
 app.dependency_overrides[get_start_time] = _get_start_time
 app.dependency_overrides[get_request_count] = _get_request_count
 app.dependency_overrides[get_keep_alive_enabled] = _get_keep_alive_enabled
 app.dependency_overrides[get_anti_detection] = _get_anti_detection
 app.dependency_overrides[get_rate_limiter] = _get_rate_limiter
+app.dependency_overrides[get_cli_auth_manager] = _get_cli_auth_manager
 
 logger.info("✅ FastAPI app initialized with routes and dependencies.")

@@ -10,14 +10,23 @@ import time
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 import psutil
 import sys
 from fastapi import (APIRouter, Depends, File, Header, HTTPException,
-                     UploadFile)
-from fastapi.responses import JSONResponse, StreamingResponse
+                     Request, UploadFile)
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from api_models import ChatCompletionRequest, ChatMessage, EmbeddingRequest, GeminiEmbeddingRequest
+from api_models import (
+    ChatCompletionRequest,
+    ChatMessage,
+    EmbeddingRequest,
+    GeminiEmbeddingRequest,
+    CliAuthStartResponse,
+    CliAuthCompleteRequest,
+    CliAuthCompleteResponse,
+)
 from api_services import (_execute_deepthink_preprocessing, create_embeddings, create_gemini_native_embeddings, execute_search_flow, make_request_with_failover,
                           make_request_with_fast_failover,
                           should_use_fast_failover,
@@ -28,12 +37,64 @@ from api_services import (_execute_deepthink_preprocessing, create_embeddings, c
 from api_utils import (GeminiAntiDetectionInjector, check_gemini_key_health,
                        delete_file_from_gemini, get_actual_model_name,
                        inject_prompt_to_messages, openai_to_gemini,
-                       upload_file_to_gemini, validate_file_for_gemini, UserRateLimiter)
+                       upload_file_to_gemini, validate_file_for_gemini,
+                       UserRateLimiter, keep_alive_ping)
 from database import Database
 from api_services import auto_cleanup_failed_keys
 from dependencies import (get_anti_detection, get_db, get_keep_alive_enabled,
-                          get_request_count, get_start_time, get_rate_limiter)
+                          get_request_count, get_start_time, get_rate_limiter,
+                          get_cli_auth_manager)
 from api_utils import RateLimitCache
+from cli_auth import CliAuthManager, fetch_account_email
+
+
+async def _finalize_cli_oauth(
+    *,
+    db: Database,
+    credentials,
+    label: Optional[str],
+    state: str,
+) -> CliAuthCompleteResponse:
+    access_token = getattr(credentials, "token", None)
+    email = await fetch_account_email(access_token) if access_token else None
+    credentials_json = credentials.to_json()
+
+    try:
+        account_id = db.create_cli_account(credentials_json, email, label)
+    except Exception as exc:  # pragma: no cover - database errors are logged downstream
+        logger.error("Failed to store CLI OAuth credentials: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store CLI credentials") from exc
+
+    metadata = {"cli_account_id": account_id}
+    if email:
+        metadata["account_email"] = email
+    key_value = f"cli-account-{account_id}"
+
+    if not db.add_gemini_key(key_value, source_type="cli_oauth", metadata=metadata):
+        key_entry = db.get_gemini_key_by_value(key_value)
+        if not key_entry:
+            raise HTTPException(status_code=500, detail="Failed to register CLI-backed Gemini key")
+    else:
+        key_entry = db.get_gemini_key_by_value(key_value)
+
+    if not key_entry:
+        raise HTTPException(status_code=500, detail="Failed to load CLI-backed Gemini key")
+
+    existing_metadata = dict(key_entry.get("metadata") or {})
+    merged_metadata = {**existing_metadata, **metadata}
+    if merged_metadata != existing_metadata:
+        db.update_gemini_key(key_entry["id"], metadata=merged_metadata)
+        key_entry = db.get_gemini_key_by_value(key_value)
+
+    if email:
+        db.update_cli_account_credentials(account_id, credentials_json, email)
+
+    return CliAuthCompleteResponse(
+        account_id=account_id,
+        gemini_key_id=key_entry["id"],
+        state=state,
+        account_email=email,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -259,14 +320,17 @@ async def upload_file(
         file_info["data"] = base64.b64encode(file_content).decode('utf-8')
         file_info["format"] = "inlineData"
     else:
-        gemini_keys = db.get_available_gemini_keys()
+        gemini_keys = [
+            key for key in db.get_available_gemini_keys()
+            if (key.get('source_type') or 'cli_api_key').lower() in {'cli_api_key', 'cli_oauth'}
+        ]
         if not gemini_keys:
             raise HTTPException(status_code=503, detail="No available Gemini keys for file upload")
-        gemini_key = gemini_keys[0]['key']
-        gemini_file_uri = await upload_file_to_gemini(file_content, mime_type, file.filename, gemini_key)
+        key_info = gemini_keys[0]
+        gemini_file_uri = await upload_file_to_gemini(db, key_info, file_content, mime_type, file.filename)
         if gemini_file_uri:
             file_info["gemini_file_uri"] = gemini_file_uri
-            file_info["gemini_key_used"] = gemini_key
+            file_info["gemini_key_id"] = key_info['id']
             file_info["format"] = "fileData"
         else:
             raise HTTPException(status_code=500, detail="Failed to upload file to Gemini File API")
@@ -308,8 +372,11 @@ async def delete_file(file_id: str, authorization: str = Header(None), db: Datab
     
     file_info = file_storage[file_id]
     if "gemini_file_uri" in file_info:
-        await delete_file_from_gemini(file_info["gemini_file_uri"], file_info["gemini_key_used"])
-    
+        key_id = file_info.get("gemini_key_id")
+        key_info = db.get_gemini_key_by_id(key_id) if key_id else None
+        if key_info:
+            await delete_file_from_gemini(db, key_info, file_info["gemini_file_uri"])
+
     del file_storage[file_id]
     return {"id": file_id, "object": "file", "deleted": True}
 
@@ -566,7 +633,7 @@ async def check_all_keys_health_endpoint(db: Database = Depends(get_db)):
     if not active_keys:
         return {"success": True, "message": "No active keys to check"}
     
-    tasks = [check_gemini_key_health(key['key']) for key in active_keys]
+    tasks = [check_gemini_key_health(key, db) for key in active_keys]
     results = await asyncio.gather(*tasks)
     
     healthy_count = 0
@@ -738,9 +805,118 @@ async def toggle_keep_alive(request: dict, db: Database = Depends(get_db)):
 
 @admin_router.post("/keep-alive/ping", summary="手动触发 Keep-Alive")
 async def ping_keep_alive():
-    # This endpoint is a placeholder to allow manual triggering if needed.
-    # The actual keep-alive logic is handled by the background task.
-    return {"success": True, "message": "Ping acknowledged. Keep-alive is managed by a background task."}
+    await keep_alive_ping()
+    return {"success": True, "message": "Keep-alive ping executed"}
+
+
+@admin_router.post(
+    "/cli-auth/start",
+    summary="启动 Gemini CLI OAuth 登录流程",
+    response_model=CliAuthStartResponse,
+)
+async def start_cli_oauth(cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager)):
+    result = cli_auth_manager.start_authorization()
+    return CliAuthStartResponse(**result)
+
+
+@admin_router.post(
+    "/cli-auth/complete",
+    summary="完成 Gemini CLI OAuth 登录并注册密钥",
+    response_model=CliAuthCompleteResponse,
+)
+async def complete_cli_oauth(
+    request: CliAuthCompleteRequest,
+    db: Database = Depends(get_db),
+    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
+):
+    if not request.authorization_response and not request.code:
+        raise HTTPException(status_code=400, detail="Either authorization_response or code must be provided")
+
+    credentials = await cli_auth_manager.complete_authorization(
+        request.state,
+        code=request.code,
+        authorization_response=request.authorization_response,
+    )
+    return await _finalize_cli_oauth(
+        db=db,
+        credentials=credentials,
+        label=request.label,
+        state=request.state,
+    )
+
+
+@admin_router.get(
+    "/cli-auth/callback",
+    summary="Gemini CLI OAuth 回调",
+    include_in_schema=False,
+    response_class=HTMLResponse,
+)
+async def cli_oauth_callback(
+    request: Request,
+    state: str,
+    code: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+    db: Database = Depends(get_db),
+    cli_auth_manager: CliAuthManager = Depends(get_cli_auth_manager),
+):
+    if error:
+        message = error_description or "Google OAuth returned an error."
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+            <head><meta charset="utf-8"><title>Gemini CLI 登录失败</title></head>
+            <body>
+                <h1>Gemini CLI 登录失败</h1>
+                <p>Google OAuth 错误：{error}</p>
+                <p>{message}</p>
+                <p>请关闭此页面并返回管理后台重试。</p>
+            </body>
+        </html>
+        """
+        return HTMLResponse(content=html, status_code=400)
+
+    authorization_response = str(request.url)
+    try:
+        credentials = await cli_auth_manager.complete_authorization(
+            state,
+            authorization_response=authorization_response,
+            code=code,
+        )
+        result = await _finalize_cli_oauth(
+            db=db,
+            credentials=credentials,
+            label=None,
+            state=state,
+        )
+    except HTTPException as exc:
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+            <head><meta charset="utf-8"><title>Gemini CLI 登录失败</title></head>
+            <body>
+                <h1>Gemini CLI 登录失败</h1>
+                <p>{exc.detail}</p>
+                <p>请关闭此页面并返回管理后台。</p>
+            </body>
+        </html>
+        """
+        return HTMLResponse(content=html, status_code=exc.status_code)
+
+    email_text = result.account_email or "账号已成功连接"
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+        <head><meta charset="utf-8"><title>Gemini CLI 登录成功</title></head>
+        <body>
+            <h1>Gemini CLI 登录成功</h1>
+            <p>Google 账号：{email_text}</p>
+            <p>请返回管理后台查看新的 CLI 账号记录。</p>
+            <p>此页面可以关闭。</p>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 @admin_router.get("/keys/gemini", summary="获取所有Gemini密钥")
 async def get_gemini_keys_endpoint(db: Database = Depends(get_db)):

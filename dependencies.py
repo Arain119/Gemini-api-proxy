@@ -1,6 +1,7 @@
 from typing import Generator
 from database import Database
 from api_utils import GeminiAntiDetectionInjector, RateLimitCache
+from cli_auth import CliAuthManager
 
 # Dependency stubs that will be overridden in the main application setup.
 
@@ -27,3 +28,8 @@ def get_anti_detection() -> GeminiAntiDetectionInjector:
 def get_rate_limiter() -> RateLimitCache:
     """Dependency for the rate limiter instance."""
     raise NotImplementedError("get_rate_limiter dependency must be overridden")
+
+
+def get_cli_auth_manager() -> CliAuthManager:
+    """Dependency for the Gemini CLI auth manager."""
+    raise NotImplementedError("get_cli_auth_manager dependency must be overridden")

@@ -4,8 +4,9 @@ import secrets
 import string
 import os
 import asyncio
+import time
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import threading
 from contextlib import contextmanager
 import logging
@@ -29,8 +30,44 @@ class Database:
 
         self.db_path = db_path
 
+        # 缓存结构，减少高频查询的数据库压力
+        self._config_cache: Dict[str, Optional[str]] = {}
+        self._config_cache_lock = threading.RLock()
+
+        self._model_config_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._model_configs_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+        self._model_cache_lock = threading.RLock()
+        self._model_cache_ttl = 5.0  # 秒
+
+        self._available_keys_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+        self._available_keys_cache_lock = threading.RLock()
+        self._available_keys_cache_ttl = 1.0  # 秒
+
         # 初始化数据库
         self.init_db()
+
+    # ------------------------------------------------------------------
+    # 内部工具方法
+    # ------------------------------------------------------------------
+
+    def _invalidate_config_cache(self, key: Optional[str] = None) -> None:
+        with self._config_cache_lock:
+            if key is None:
+                self._config_cache.clear()
+            else:
+                self._config_cache.pop(key, None)
+
+    def _invalidate_model_cache(self, model_name: Optional[str] = None) -> None:
+        with self._model_cache_lock:
+            if model_name is None:
+                self._model_config_cache.clear()
+            else:
+                self._model_config_cache.pop(model_name, None)
+            self._model_configs_cache = None
+
+    def _invalidate_available_keys_cache(self) -> None:
+        with self._available_keys_cache_lock:
+            self._available_keys_cache = None
 
     @contextmanager
     def get_connection(self):
@@ -66,6 +103,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS gemini_keys (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     key TEXT UNIQUE NOT NULL,
+                    source_type TEXT DEFAULT 'cli_api_key' NOT NULL,
+                    metadata TEXT DEFAULT '{}' NOT NULL,
                     status INTEGER DEFAULT 1,
                     health_status TEXT DEFAULT 'unknown',
                     consecutive_failures INTEGER DEFAULT 0,
@@ -149,6 +188,19 @@ class Database:
                 )
             ''')
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cli_accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT,
+                    account_email TEXT,
+                    credentials TEXT NOT NULL,
+                    status INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP
+                )
+            ''')
+
             # 检查并迁移旧表结构
             self._migrate_database(cursor)
 
@@ -173,6 +225,19 @@ class Database:
 
             conn.commit()
 
+    def _format_gemini_row(self, row: sqlite3.Row) -> Dict:
+        data = dict(row)
+        metadata = data.get('metadata')
+        if isinstance(metadata, str):
+            try:
+                data['metadata'] = json.loads(metadata) if metadata else {}
+            except json.JSONDecodeError:
+                logger.warning("Invalid metadata JSON for gemini key %s", data.get('id'))
+                data['metadata'] = {}
+        elif metadata is None:
+            data['metadata'] = {}
+        return data
+
     def _migrate_database(self, cursor):
         """迁移旧的数据库结构并添加新字段"""
         try:
@@ -195,6 +260,12 @@ class Database:
                 cursor.execute("ALTER TABLE gemini_keys ADD COLUMN total_requests INTEGER DEFAULT 0")
             if 'successful_requests' not in columns:
                 cursor.execute("ALTER TABLE gemini_keys ADD COLUMN successful_requests INTEGER DEFAULT 0")
+            if 'source_type' not in columns:
+                cursor.execute("ALTER TABLE gemini_keys ADD COLUMN source_type TEXT DEFAULT 'cli_api_key' NOT NULL")
+            else:
+                cursor.execute("UPDATE gemini_keys SET source_type='cli_api_key' WHERE source_type='api_key'")
+            if 'metadata' not in columns:
+                cursor.execute("ALTER TABLE gemini_keys ADD COLUMN metadata TEXT DEFAULT '{}' NOT NULL")
             if 'breaker_status' not in columns:
                 cursor.execute("ALTER TABLE gemini_keys ADD COLUMN breaker_status TEXT DEFAULT 'active' NOT NULL")
             if 'last_failure_timestamp' not in columns:
@@ -376,15 +447,25 @@ class Database:
     # 系统配置管理
     def get_config(self, key: str, default: str = None) -> str:
         """获取系统配置"""
+        with self._config_cache_lock:
+            if key in self._config_cache:
+                return self._config_cache[key]
+
+        value = default
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT value FROM system_config WHERE key = ?', (key,))
                 row = cursor.fetchone()
-                return row['value'] if row else default
+                if row:
+                    value = row['value']
         except Exception as e:
             logger.error(f"Failed to get config {key}: {e}")
-            return default
+
+        with self._config_cache_lock:
+            self._config_cache[key] = value
+
+        return value
 
     def set_config(self, key: str, value: str) -> bool:
         """设置系统配置"""
@@ -396,6 +477,8 @@ class Database:
                     VALUES (?, ?, CURRENT_TIMESTAMP)
                 ''', (key, value))
                 conn.commit()
+                with self._config_cache_lock:
+                    self._config_cache[key] = value
                 return True
         except Exception as e:
             logger.error(f"Failed to set config {key}: {e}")
@@ -772,6 +855,12 @@ class Database:
 
     def get_model_config(self, model_name: str) -> Optional[Dict]:
         """获取模型配置（包含计算的总限制）"""
+        now = time.time()
+        with self._model_cache_lock:
+            cached = self._model_config_cache.get(model_name)
+            if cached and now - cached[0] < self._model_cache_ttl:
+                return dict(cached[1])
+
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
@@ -798,6 +887,9 @@ class Database:
                 config['tpm_limit'] = config['total_tpm_limit']
                 config['rpd_limit'] = config['total_rpd_limit']
 
+                with self._model_cache_lock:
+                    self._model_config_cache[model_name] = (time.time(), dict(config))
+
                 return config
         except Exception as e:
             logger.error(f"Failed to get model config for {model_name}: {e}")
@@ -805,6 +897,11 @@ class Database:
 
     def get_all_model_configs(self) -> List[Dict]:
         """获取所有模型配置（包含计算的总限制）"""
+        now = time.time()
+        with self._model_cache_lock:
+            if self._model_configs_cache and now - self._model_configs_cache[0] < self._model_cache_ttl:
+                return [dict(item) for item in self._model_configs_cache[1]]
+
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
@@ -823,6 +920,9 @@ class Database:
                     config['rpm_limit'] = config['total_rpm_limit']
                     config['tpm_limit'] = config['total_tpm_limit']
                     config['rpd_limit'] = config['total_rpd_limit']
+
+                with self._model_cache_lock:
+                    self._model_configs_cache = (time.time(), [dict(item) for item in configs])
 
                 return configs
         except Exception as e:
@@ -851,32 +951,43 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute(query, values)
                 conn.commit()
-                return cursor.rowcount > 0
+                updated = cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to update model config for {model_name}: {e}")
             return False
+
+        if updated:
+            self._invalidate_model_cache(model_name)
+        return updated
 
     def is_thinking_model(self, model_name: str) -> bool:
         """检查模型是否支持思考功能"""
         return '2.5' in model_name
 
     # Gemini Key管理 - 增强版
-    def add_gemini_key(self, key: str) -> bool:
+    def add_gemini_key(self, key: str, *, source_type: str = 'cli_api_key', metadata: Optional[Dict] = None) -> bool:
         """添加Gemini Key"""
+        success = False
         try:
+            metadata_json = json.dumps(metadata or {})
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO gemini_keys (key)
-                    VALUES (?)
-                ''', (key,))
+                    INSERT INTO gemini_keys (key, source_type, metadata)
+                    VALUES (?, ?, ?)
+                ''', (key, source_type, metadata_json))
                 conn.commit()
-                return True
+                success = cursor.rowcount > 0
         except sqlite3.IntegrityError:
             return False
         except Exception as e:
             logger.error(f"Failed to add Gemini key: {e}")
             return False
+
+        if success:
+            self._invalidate_available_keys_cache()
+            self._invalidate_model_cache()
+        return success
 
     def update_gemini_key(self, key_id: int, **kwargs):
         """更新Gemini Key"""
@@ -884,14 +995,19 @@ class Database:
             allowed_fields = ['status', 'health_status', 'consecutive_failures',
                               'last_check_time', 'success_rate', 'avg_response_time',
                               'total_requests', 'successful_requests', 'breaker_status',
-                              'last_failure_timestamp', 'ema_success_rate', 'ema_response_time']
+                              'last_failure_timestamp', 'ema_success_rate', 'ema_response_time',
+                              'source_type', 'metadata', 'key']
             fields = []
             values = []
 
             for field, value in kwargs.items():
                 if field in allowed_fields:
-                    fields.append(f"{field} = ?")
-                    values.append(value)
+                    if field == 'metadata' and isinstance(value, dict):
+                        fields.append(f"{field} = ?")
+                        values.append(json.dumps(value))
+                    else:
+                        fields.append(f"{field} = ?")
+                        values.append(value)
 
             if not fields:
                 return False
@@ -903,10 +1019,15 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute(query, values)
                 conn.commit()
-                return cursor.rowcount > 0
+                updated = cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to update Gemini key {key_id}: {e}")
             return False
+
+        if updated:
+            self._invalidate_available_keys_cache()
+            self._invalidate_model_cache()
+        return updated
 
     def delete_gemini_key(self, key_id: int) -> bool:
         """删除Gemini Key"""
@@ -915,10 +1036,15 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM gemini_keys WHERE id = ?", (key_id,))
                 conn.commit()
-                return cursor.rowcount > 0
+                deleted = cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to delete Gemini key {key_id}: {e}")
             return False
+
+        if deleted:
+            self._invalidate_available_keys_cache()
+            self._invalidate_model_cache()
+        return deleted
 
     def get_all_gemini_keys(self) -> List[Dict]:
         """获取所有Gemini Keys"""
@@ -926,34 +1052,44 @@ class Database:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM gemini_keys ORDER BY success_rate DESC, avg_response_time ASC, id ASC")
-                return [dict(row) for row in cursor.fetchall()]
+                return [self._format_gemini_row(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to get all Gemini keys: {e}")
             return []
 
     def get_available_gemini_keys(self) -> List[Dict]:
         """获取所有可用的Gemini Keys (排除了熔断的key)"""
+        now = time.time()
+        with self._available_keys_cache_lock:
+            if self._available_keys_cache and now - self._available_keys_cache[0] < self._available_keys_cache_ttl:
+                return [dict(item) for item in self._available_keys_cache[1]]
+
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 # 增加了 breaker_status != 'tripped' 的过滤条件
                 # 增加了 ema_success_rate 和 ema_response_time 用于排序和返回
                 cursor.execute("""
-                    SELECT id, key, health_status, success_rate, avg_response_time, 
-                           ema_success_rate, ema_response_time, consecutive_failures, last_failure_timestamp
-                    FROM gemini_keys 
+                    SELECT id, key, source_type, metadata, health_status, success_rate, avg_response_time,
+                           ema_success_rate, ema_response_time, consecutive_failures, last_failure_timestamp, status, breaker_status
+                    FROM gemini_keys
                     WHERE status = 1 AND breaker_status != 'tripped'
-                    ORDER BY 
+                    ORDER BY
                         CASE health_status
                             WHEN 'healthy' THEN 1
                             WHEN 'untested' THEN 2
                             WHEN 'rate_limited' THEN 3
                             ELSE 4
-                        END, 
-                        ema_success_rate DESC, 
+                        END,
+                        ema_success_rate DESC,
                         ema_response_time ASC
                 """)
-                return [dict(row) for row in cursor.fetchall()]
+                rows = [self._format_gemini_row(row) for row in cursor.fetchall()]
+
+                with self._available_keys_cache_lock:
+                    self._available_keys_cache = (time.time(), [dict(item) for item in rows])
+
+                return rows
         except Exception as e:
             logger.error(f"Failed to get available Gemini keys: {e}")
             return []
@@ -964,11 +1100,11 @@ class Database:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT * FROM gemini_keys 
+                    SELECT * FROM gemini_keys
                     WHERE status = 1 AND health_status = 'healthy'
                     ORDER BY success_rate DESC, avg_response_time ASC, id ASC
                 ''')
-                return [dict(row) for row in cursor.fetchall()]
+                return [self._format_gemini_row(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to get healthy Gemini keys: {e}")
             return []
@@ -979,7 +1115,7 @@ class Database:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM gemini_keys WHERE health_status = 'unhealthy' AND status = 1")
-                return [dict(row) for row in cursor.fetchall()]
+                return [self._format_gemini_row(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Failed to get unhealthy Gemini keys: {e}")
             return []
@@ -996,25 +1132,32 @@ class Database:
                     WHERE id = ?
                 ''', (key_id,))
                 conn.commit()
-                return cursor.rowcount > 0
+                toggled = cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to toggle Gemini key {key_id} status: {e}")
             return False
+
+        if toggled:
+            self._invalidate_available_keys_cache()
+            self._invalidate_model_cache()
+        return toggled
 
     def update_gemini_key_status(self, key_id: int, new_status: str):
         """更新Gemini Key的健康状态"""
         allowed_statuses = ['healthy', 'unhealthy', 'untested', 'rate_limited']
         if new_status not in allowed_statuses:
             raise ValueError(f"Invalid status: {new_status}")
-        
+
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                UPDATE gemini_keys 
-                SET health_status = ?, last_check_time = CURRENT_TIMESTAMP 
+                UPDATE gemini_keys
+                SET health_status = ?, last_check_time = CURRENT_TIMESTAMP
                 WHERE id = ?
             """, (new_status, key_id))
             conn.commit()
+        self._invalidate_available_keys_cache()
+        self._invalidate_model_cache()
 
     def get_gemini_key_by_id(self, key_id: int) -> Optional[Dict]:
         """根据ID获取Gemini Key"""
@@ -1023,9 +1166,20 @@ class Database:
                 cursor = conn.cursor()
                 cursor.execute('SELECT * FROM gemini_keys WHERE id = ?', (key_id,))
                 row = cursor.fetchone()
-                return dict(row) if row else None
+                return self._format_gemini_row(row) if row else None
         except Exception as e:
             logger.error(f"Failed to get Gemini key {key_id}: {e}")
+            return None
+
+    def get_gemini_key_by_value(self, key: str) -> Optional[Dict]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM gemini_keys WHERE key = ?', (key,))
+                row = cursor.fetchone()
+                return self._format_gemini_row(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to get Gemini key by value: {e}")
             return None
 
     def update_key_performance(self, key_id: int, success: bool, response_time: float = 0.0):
@@ -1075,10 +1229,14 @@ class Database:
                       consecutive_failures, health_status, key_id))
 
                 conn.commit()
-                return True
+                updated = cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Failed to update key performance for {key_id}: {e}")
             return False
+
+        if updated:
+            self._invalidate_available_keys_cache()
+        return updated
 
     def get_thinking_models(self) -> List[str]:
         """获取支持思考功能的模型列表"""
@@ -1261,7 +1419,7 @@ class Database:
                             if sufficient_checks and len(recent_records) >= days_threshold:
                                 # 标记为删除（软删除）
                                 cursor.execute('''
-                                    UPDATE gemini_keys 
+                                    UPDATE gemini_keys
                                     SET status = 0, health_status = 'auto_removed',
                                         updated_at = CURRENT_TIMESTAMP
                                     WHERE id = ?
@@ -1285,6 +1443,77 @@ class Database:
 
         except Exception as e:
             logger.error(f"Auto cleanup failed: {e}")
+            return []
+
+    # Gemini CLI account management
+    def create_cli_account(self, credentials_json: str, account_email: Optional[str] = None, label: Optional[str] = None) -> int:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    INSERT INTO cli_accounts (label, account_email, credentials)
+                    VALUES (?, ?, ?)
+                    ''',
+                    (label, account_email, credentials_json),
+                )
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Failed to create CLI account: {e}")
+            raise
+
+    def update_cli_account_credentials(self, account_id: int, credentials_json: str, account_email: Optional[str] = None) -> bool:
+        try:
+            fields = ["credentials = ?", "updated_at = CURRENT_TIMESTAMP"]
+            values: List[Any] = [credentials_json]
+            if account_email:
+                fields.insert(1, "account_email = ?")
+                values.append(account_email)
+
+            values.append(account_id)
+            query = f"UPDATE cli_accounts SET {', '.join(fields)} WHERE id = ?"
+
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, values)
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Failed to update CLI account {account_id}: {e}")
+            return False
+
+    def touch_cli_account(self, account_id: int):
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE cli_accounts SET last_used = CURRENT_TIMESTAMP WHERE id = ?",
+                    (account_id,),
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update last_used for CLI account {account_id}: {e}")
+
+    def get_cli_account(self, account_id: int) -> Optional[Dict]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM cli_accounts WHERE id = ?', (account_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Failed to load CLI account {account_id}: {e}")
+            return None
+
+    def list_cli_accounts(self) -> List[Dict]:
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM cli_accounts ORDER BY created_at DESC')
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Failed to list CLI accounts: {e}")
             return []
 
     # 用户Key管理

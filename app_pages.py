@@ -24,7 +24,8 @@ from app_utils import (
     get_hourly_stats,
     get_recent_logs,
     get_cached_deepthink_config,
-    update_deepthink_config
+    update_deepthink_config,
+    start_cli_oauth_flow
 )
 
 def render_dashboard_page():
@@ -355,6 +356,49 @@ def render_key_management_page():
     with tab1:
         st.markdown("#### 添加新密钥")
 
+        st.markdown("##### 通过 Google 登录 (Gemini CLI)")
+        st.caption("使用 Google 账号完成 Gemini CLI 登录后，系统会自动将该账号作为新的号池来源。")
+
+        cli_auth_info = st.session_state.get('cli_auth_info')
+
+        if st.button("通过 Google 登录", key="start_cli_auth", type="secondary"):
+            result = start_cli_oauth_flow()
+            if result and result.get('authorization_url'):
+                st.session_state['cli_auth_info'] = result
+                st.session_state.pop('cli_auth_popup_state', None)
+                st.success("授权链接已生成，正在跳转至 Google 登录页面…")
+            else:
+                st.error("未能获取授权链接，请稍后重试")
+
+        cli_auth_info = st.session_state.get('cli_auth_info')
+        if cli_auth_info:
+            auth_url = cli_auth_info.get('authorization_url')
+            redirect_uri = cli_auth_info.get('redirect_uri')
+            st.info(
+                "1. 浏览器会打开新的 Google 登录窗口\n"
+                "2. 完成授权后页面会自动跳转回管理后台\n"
+                "3. 返回本页面后点击上方刷新按钮，即可看到新的 Gemini CLI 账号"
+            )
+            if auth_url:
+                st.markdown(f"[👉 点击这里重新打开授权页面]({auth_url})", unsafe_allow_html=True)
+            if redirect_uri:
+                st.caption(f"授权回调地址：{redirect_uri}")
+
+            if auth_url and st.session_state.get('cli_auth_popup_state') != cli_auth_info.get('state'):
+                st.session_state['cli_auth_popup_state'] = cli_auth_info.get('state')
+                st.markdown(
+                    f"<script>window.open('{auth_url}', '_blank');</script>",
+                    unsafe_allow_html=True,
+                )
+
+            if st.button("我已完成授权，清除提示", key="clear_cli_auth", type="secondary"):
+                st.session_state.pop('cli_auth_info', None)
+                st.session_state.pop('cli_auth_popup_state', None)
+                st.cache_data.clear()
+                st.rerun()
+
+        st.markdown('<hr style="margin: 1.5rem 0;">', unsafe_allow_html=True)
+
         with st.form("add_gemini_key"):
             new_key = st.text_area(
                 "Gemini API 密钥",
@@ -504,12 +548,41 @@ def render_key_management_page():
                                             unsafe_allow_html=True)
 
                             with col2:
+                                metadata = key_info.get('metadata') or {}
+                                source_type = (key_info.get('source_type') or 'cli_api_key').lower()
+                                meta_items = []
+
+                                if source_type == 'cli_oauth':
+                                    meta_items.append("来源: Gemini CLI 登录")
+                                    account_id = metadata.get('cli_account_id')
+                                    account_email = metadata.get('account_email')
+                                    if account_id is not None:
+                                        meta_items.append(f"Gemini CLI 账号 #{account_id}")
+                                    if account_email:
+                                        meta_items.append(f"Google账号 {account_email}")
+                                elif source_type == 'cli_api_key':
+                                    meta_items.append("来源: Gemini CLI API Key")
+                                else:
+                                    meta_items.append("来源: 原生 API Key")
+
+                                total_requests = key_info.get('total_requests', 0)
+                                if total_requests and total_requests > 0:
+                                    success_rate = key_info.get('success_rate', 1.0) * 100
+                                    response_time = key_info.get('avg_response_time', 0.0)
+                                    meta_items.extend([
+                                        f"成功率 {success_rate:.1f}%",
+                                        f"响应时间 {response_time:.2f}s",
+                                        f"请求数 {total_requests}",
+                                    ])
+                                else:
+                                    meta_items.append("尚未使用")
+
+                                meta_text = " · ".join(meta_items)
                                 st.markdown(f'''
                                 <div>
                                     <div class="key-code">{mask_key(key_info.get('key', ''), show_full_keys)}</div>
                                     <div class="key-meta">
-                                        {f"成功率 {key_info.get('success_rate', 1.0) * 100:.1f}% · 响应时间 {key_info.get('avg_response_time', 0.0):.2f}s · 请求数 {key_info.get('total_requests', 0)}"
-                                if key_info.get('total_requests', 0) > 0 else "尚未使用"}
+                                        {meta_text}
                                     </div>
                                 </div>
                                 ''', unsafe_allow_html=True)

@@ -114,6 +114,11 @@ class ChatMessage(BaseModel):
                         text_parts.append(item['text'])
                     elif 'text' in item:
                         text_parts.append(item['text'])
+                elif isinstance(item, ContentPart):
+                    if item.type == 'text' and item.text:
+                        text_parts.append(item.text)
+                    elif item.text:
+                        text_parts.append(item.text)
             return ' '.join(text_parts) if text_parts else ""
         else:
             return str(self.content)
@@ -122,8 +127,17 @@ class ChatMessage(BaseModel):
         """检查是否包含多模态内容"""
         if isinstance(self.content, list):
             for item in self.content:
-                if isinstance(item, dict) and item.get('type') in ['image', 'audio', 'video', 'document']:
-                    return True
+                if isinstance(item, dict):
+                    item_type = item.get('type')
+                    if item_type and item_type not in ['text', 'input_text']:
+                        return True
+                    if any(k in item for k in ['image_url', 'inlineData', 'inline_data', 'fileData', 'file_data']):
+                        return True
+                elif isinstance(item, ContentPart):
+                    if item.type and item.type not in ['text', 'input_text']:
+                        return True
+                    if any([item.inlineData, item.inline_data, item.fileData, item.file_data]):
+                        return True
         return False
 
 
@@ -215,3 +229,23 @@ class EmbeddingValue(BaseModel):
 
 class GeminiEmbeddingResponse(BaseModel):
     embeddings: List[EmbeddingValue]
+
+
+class CliAuthStartResponse(BaseModel):
+    authorization_url: str
+    state: str
+    redirect_uri: str
+
+
+class CliAuthCompleteRequest(BaseModel):
+    state: str
+    code: Optional[str] = None
+    authorization_response: Optional[str] = None
+    label: Optional[str] = None
+
+
+class CliAuthCompleteResponse(BaseModel):
+    account_id: int
+    gemini_key_id: int
+    state: str
+    account_email: Optional[str] = None

@@ -9,28 +9,24 @@ import base64
 import mimetypes
 import random
 import hashlib
-import io
 import itertools
+from collections import deque
 import copy
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, AsyncGenerator, Union, Any
-from functools import lru_cache
-
-from google import genai
 from google.genai import types
 from fastapi import HTTPException
 
 from database import Database
-from api_models import ChatCompletionRequest, ChatMessage
+from api_models import ChatCompletionRequest, ChatMessage, ContentPart
+from cli_auth import (
+    call_gemini_with_cli_account,
+    upload_file_with_cli_account,
+    delete_file_with_cli_account,
+)
 
 # 配置日志
 logger = logging.getLogger(__name__)
-
-# GenAI Client 缓存
-@lru_cache(maxsize=32)
-def get_cached_client(api_key: str) -> genai.Client:
-    """按 key 复用 google-genai Client，减小握手 & 日志开销"""
-    return genai.Client(api_key=api_key)
 
 # 防自动化检测注入器
 class GeminiAntiDetectionInjector:
@@ -157,52 +153,93 @@ def decrypt_response(hex_string: str) -> str:
     except (ValueError, TypeError): return hex_string
 
 class RateLimitCache:
-    def __init__(self, max_entries: int = 10000):
-        self.cache: Dict[str, Dict[str, List[tuple]]] = {}
+    def __init__(self, max_entries: int = 10000, default_window: int = 60):
+        self.cache: Dict[str, Dict[str, deque]] = {}
         self.max_entries = max_entries
+        self.default_window = default_window
         self.lock = asyncio.Lock()
 
-    async def cleanup_expired(self, window_seconds: int = 60):
-        current_time = time.time()
-        cutoff_time = current_time - window_seconds
+    @staticmethod
+    def _prune_queue(queue: deque, cutoff: float) -> None:
+        while queue and queue[0][0] <= cutoff:
+            queue.popleft()
+
+    def _ensure_model_locked(self, model_name: str) -> Dict[str, deque]:
+        metrics = self.cache.get(model_name)
+        if metrics is None:
+            metrics = {'requests': deque(), 'tokens': deque()}
+            self.cache[model_name] = metrics
+        return metrics
+
+    async def cleanup_expired(self, window_seconds: int = None):
+        if window_seconds is None:
+            window_seconds = self.default_window
+        cutoff_time = time.time() - window_seconds
         async with self.lock:
             for model_name in list(self.cache.keys()):
-                if model_name in self.cache:
-                    self.cache[model_name]['requests'] = [(t, v) for t, v in self.cache[model_name]['requests'] if t > cutoff_time]
-                    self.cache[model_name]['tokens'] = [(t, v) for t, v in self.cache[model_name]['tokens'] if t > cutoff_time]
+                metrics = self.cache.get(model_name)
+                if not metrics:
+                    continue
+                self._prune_queue(metrics['requests'], cutoff_time)
+                self._prune_queue(metrics['tokens'], cutoff_time)
+                if not metrics['requests'] and not metrics['tokens']:
+                    self.cache.pop(model_name, None)
 
     async def add_usage(self, model_name: str, requests: int = 1, tokens: int = 0):
+        now = time.time()
+        cutoff_time = now - self.default_window
         async with self.lock:
-            if model_name not in self.cache: self.cache[model_name] = {'requests': [], 'tokens': []}
-            current_time = time.time()
-            self.cache[model_name]['requests'].append((current_time, requests))
-            self.cache[model_name]['tokens'].append((current_time, tokens))
+            metrics = self._ensure_model_locked(model_name)
+            metrics['requests'].append((now, requests))
+            metrics['tokens'].append((now, tokens))
 
-    async def get_current_usage(self, model_name: str, window_seconds: int = 60) -> Dict[str, int]:
+            self._prune_queue(metrics['requests'], cutoff_time)
+            self._prune_queue(metrics['tokens'], cutoff_time)
+
+            if self.max_entries > 0:
+                while len(metrics['requests']) > self.max_entries:
+                    metrics['requests'].popleft()
+                while len(metrics['tokens']) > self.max_entries:
+                    metrics['tokens'].popleft()
+
+    async def get_current_usage(self, model_name: str, window_seconds: int = None) -> Dict[str, int]:
+        if window_seconds is None:
+            window_seconds = self.default_window
+        cutoff_time = time.time() - window_seconds
         async with self.lock:
-            if model_name not in self.cache: return {'requests': 0, 'tokens': 0}
-            current_time = time.time()
-            cutoff_time = current_time - window_seconds
-            self.cache[model_name]['requests'] = [(t, v) for t, v in self.cache[model_name]['requests'] if t > cutoff_time]
-            self.cache[model_name]['tokens'] = [(t, v) for t, v in self.cache[model_name]['tokens'] if t > cutoff_time]
-            total_requests = sum(v for _, v in self.cache[model_name]['requests'])
-            total_tokens = sum(v for _, v in self.cache[model_name]['tokens'])
+            metrics = self.cache.get(model_name)
+            if not metrics:
+                return {'requests': 0, 'tokens': 0}
+
+            self._prune_queue(metrics['requests'], cutoff_time)
+            self._prune_queue(metrics['tokens'], cutoff_time)
+
+            total_requests = sum(value for _, value in metrics['requests'])
+            total_tokens = sum(value for _, value in metrics['tokens'])
             return {'requests': total_requests, 'tokens': total_tokens}
 
-async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, Any]:
+async def check_gemini_key_health(key_info: Dict[str, Any], db: Optional[Database] = None, timeout: int = 10) -> Dict[str, Any]:
     start_time = time.time()
     try:
-        client = get_cached_client(api_key)
-        await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents="Hello",
-                config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
-                )
-            ),
-            timeout=timeout
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database required for CLI health check")
+        await call_gemini_with_cli_account(
+            db,
+            key_info,
+            {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": "Hello"}],
+                    }
+                ],
+                "generation_config": {
+                    "temperature": 0.0,
+                    "top_p": 0.1,
+                },
+            },
+            "gemini-2.5-flash-lite",
+            timeout=float(timeout),
         )
         return {"healthy": True, "response_time": time.time() - start_time, "status_code": 200, "error": None}
     except asyncio.TimeoutError:
@@ -215,7 +252,7 @@ async def check_gemini_key_health(api_key: str, timeout: int = 10) -> Dict[str, 
         match = re.match(r"(\d{3})", error_message)
         if match:
             status_code = int(match.group(1))
-        
+
         return {"healthy": False, "response_time": time.time() - start_time, "status_code": status_code, "error": error_message}
 
 async def keep_alive_ping():
@@ -241,33 +278,67 @@ def init_anti_detection_config(db: Database):
     except Exception as e:
         logger.error(f"Failed to initialize anti-detection system: {e}")
 
-async def upload_file_to_gemini(file_content: bytes, mime_type: str, filename: str, gemini_key: str) -> Optional[str]:
-    try:
-        client = get_cached_client(gemini_key)
-        file_stream = io.BytesIO(file_content)
-        upload_result = await client.aio.files.upload(
-            file=file_stream,
-            config={"mimeType": mime_type, "displayName": filename, "name": f"files/{uuid.uuid4().hex}_{filename}"}
-        )
-        file_uri = getattr(upload_result, "uri", None)
-        if file_uri:
-            logger.info(f"File uploaded to Gemini successfully: {file_uri}")
-            return file_uri
-        else:
-            logger.error("No URI returned from google-genai upload result")
-            return None
-    except Exception as e:
-        logger.error(f"Error uploading file to Gemini: {str(e)}")
+async def upload_file_to_gemini(
+    db: Database,
+    key_info: Dict[str, Any],
+    file_content: bytes,
+    mime_type: str,
+    filename: str,
+) -> Optional[str]:
+    source_type = (key_info.get('source_type') or 'cli_api_key').lower()
+    if source_type not in {'cli_api_key', 'cli_oauth'}:
+        logger.error("Attempted to upload file with unsupported key type: %s", source_type)
         return None
 
-async def delete_file_from_gemini(file_uri: str, gemini_key: str) -> bool:
     try:
-        client = get_cached_client(gemini_key)
-        await client.aio.files.delete(name=file_uri)
-        logger.info(f"File deleted from Gemini successfully: {file_uri}")
+        result = await upload_file_with_cli_account(
+            db,
+            key_info,
+            filename=filename,
+            mime_type=mime_type,
+            file_content=file_content,
+            timeout=float(db.get_config('request_timeout', '60')),
+        )
+    except HTTPException as exc:
+        logger.error("CLI file upload failed: %s", exc.detail)
+        return None
+    except Exception as exc:  # pragma: no cover
+        logger.error("Unexpected CLI file upload failure: %s", exc)
+        return None
+
+    file_obj = result.get("file") or {}
+    file_uri = file_obj.get("uri") or file_obj.get("name")
+    if file_uri:
+        logger.info("File uploaded to Gemini successfully: %s", file_uri)
+    else:
+        logger.error("CLI upload response missing URI: %s", result)
+    return file_uri
+
+
+async def delete_file_from_gemini(
+    db: Database,
+    key_info: Dict[str, Any],
+    file_uri: str,
+) -> bool:
+    source_type = (key_info.get('source_type') or 'cli_api_key').lower()
+    if source_type not in {'cli_api_key', 'cli_oauth'}:
+        logger.error("Attempted to delete file with unsupported key type: %s", source_type)
+        return False
+
+    try:
+        await delete_file_with_cli_account(
+            db,
+            key_info,
+            file_uri=file_uri,
+            timeout=float(db.get_config('request_timeout', '60')),
+        )
+        logger.info("File deleted from Gemini successfully: %s", file_uri)
         return True
-    except Exception as e:
-        logger.error(f"Error deleting file from Gemini: {str(e)}")
+    except HTTPException as exc:
+        logger.error("CLI file deletion failed: %s", exc.detail)
+        return False
+    except Exception as exc:  # pragma: no cover
+        logger.error("Unexpected CLI file deletion failure: %s", exc)
         return False
 
 def get_actual_model_name(db: Database, request_model: str) -> str:
@@ -294,26 +365,44 @@ def inject_prompt_to_messages(db: Database, messages: List[ChatMessage]) -> List
     if not inject_config['enabled'] or not inject_config['content']: return messages
     content = inject_config['content']
     position = inject_config['position']
-    new_messages = messages.copy()
+    new_messages = copy.deepcopy(messages)
+
+    def _prepend_text(message: ChatMessage, text: str):
+        if isinstance(message.content, str):
+            message.content = f"{text}\n\n{message.content}" if message.content else text
+        elif isinstance(message.content, list):
+            message.content = [{"type": "text", "text": text}] + list(message.content)
+        else:
+            message.content = f"{text}\n\n{message.get_text_content()}"
+
+    def _append_text(message: ChatMessage, text: str):
+        if isinstance(message.content, str):
+            message.content = f"{message.content}\n\n{text}" if message.content else text
+        elif isinstance(message.content, list):
+            message.content = list(message.content) + [{"type": "text", "text": text}]
+        else:
+            message.content = f"{message.get_text_content()}\n\n{text}"
+
     if position == 'system':
         system_msg = next((msg for msg in new_messages if msg.role == 'system'), None)
         if system_msg:
-            system_msg.content = f"{content}\n\n{system_msg.get_text_content()}"
+            _prepend_text(system_msg, content)
         else:
             new_messages.insert(0, ChatMessage(role='system', content=content))
     elif position == 'user_prefix':
         user_msg = next((msg for msg in new_messages if msg.role == 'user'), None)
-        if user_msg: user_msg.content = f"{content}\n\n{user_msg.get_text_content()}"
+        if user_msg:
+            _prepend_text(user_msg, content)
     elif position == 'user_suffix':
         user_msg = next((msg for msg in reversed(new_messages) if msg.role == 'user'), None)
-        if user_msg: user_msg.content = f"{user_msg.get_text_content()}\n\n{content}"
+        if user_msg:
+            _append_text(user_msg, content)
     anti_truncation_cfg = db.get_anti_truncation_config()
     if anti_truncation_cfg.get('enabled'):
         user_msg = next((msg for msg in reversed(new_messages) if msg.role == 'user'), None)
         if user_msg:
             suffix = "请以 [finish] 结尾"
-            if isinstance(user_msg.content, str): user_msg.content = f"{user_msg.content}\n\n{suffix}"
-            elif isinstance(user_msg.content, list): user_msg.content.append(suffix)
+            _append_text(user_msg, suffix)
     return new_messages
 
 def get_thinking_config(db: Database, request: ChatCompletionRequest) -> Dict:
@@ -360,10 +449,19 @@ def get_thinking_config(db: Database, request: ChatCompletionRequest) -> Dict:
 
     return thinking_config
 
-def process_multimodal_content(item: Dict, file_storage: Dict) -> Optional[Dict]:
+def process_multimodal_content(item: Union[Dict[str, Any], ContentPart], file_storage: Dict) -> Optional[Dict]:
     try:
-        file_data = item.get('file_data') or item.get('fileData')
-        inline_data = item.get('inline_data') or item.get('inlineData')
+        if isinstance(item, ContentPart):
+            item_dict = item.model_dump(exclude_none=True)
+        else:
+            item_dict = item
+
+        file_data = item_dict.get('file_data') or item_dict.get('fileData')
+        inline_data = item_dict.get('inline_data') or item_dict.get('inlineData')
+        if hasattr(file_data, "model_dump"):
+            file_data = file_data.model_dump(exclude_none=True)
+        if hasattr(inline_data, "model_dump"):
+            inline_data = inline_data.model_dump(exclude_none=True)
         if inline_data:
             mime_type = inline_data.get('mimeType') or inline_data.get('mime_type')
             data = inline_data.get('data')
@@ -372,8 +470,8 @@ def process_multimodal_content(item: Dict, file_storage: Dict) -> Optional[Dict]
             mime_type = file_data.get('mimeType') or file_data.get('mime_type')
             file_uri = file_data.get('fileUri') or file_data.get('file_uri')
             if mime_type and file_uri: return {"fileData": {"mimeType": mime_type, "fileUri": file_uri}}
-        elif item.get('type') == 'file' and 'file_id' in item:
-            file_id = item['file_id']
+        elif item_dict.get('type') == 'file' and 'file_id' in item_dict:
+            file_id = item_dict['file_id']
             if file_id in file_storage:
                 file_info = file_storage[file_id]
                 if file_info.get('format') == 'inlineData':
@@ -385,8 +483,8 @@ def process_multimodal_content(item: Dict, file_storage: Dict) -> Optional[Dict]
                         logger.warning(f"Using local file URI for file {file_id}, this may not work with Gemini")
                         return {"fileData": {"mimeType": file_info['mime_type'], "fileUri": file_info['file_uri']}}
             else: logger.warning(f"File ID {file_id} not found in storage")
-        if item.get('type') == 'image_url' and 'image_url' in item:
-            image_url = item['image_url'].get('url', '')
+        if item_dict.get('type') == 'image_url' and 'image_url' in item_dict:
+            image_url = item_dict['image_url'].get('url', '')
             if image_url.startswith('data:'):
                 try:
                     header, data = image_url.split(',', 1)
@@ -394,7 +492,7 @@ def process_multimodal_content(item: Dict, file_storage: Dict) -> Optional[Dict]
                     return {"inlineData": {"mimeType": mime_type, "data": data}}
                 except Exception as e: logger.warning(f"Failed to parse data URL: {e}")
             else: logger.warning("HTTP URLs not supported for images, use file upload instead")
-        logger.warning(f"Unsupported multimodal content format: {item}")
+        logger.warning(f"Unsupported multimodal content format: {item_dict}")
         return None
     except Exception as e:
         logger.error(f"Error processing multimodal content: {e}")
@@ -532,6 +630,16 @@ def openai_to_gemini(db: Database, request: ChatCompletionRequest, anti_detectio
                     elif item.get('type') in ['image', 'image_url', 'audio', 'video', 'document']:
                         multimodal_part = process_multimodal_content(item, file_storage)
                         if multimodal_part: parts.append(multimodal_part)
+                elif isinstance(item, ContentPart):
+                    if item.type in (None, 'text', 'input_text'):
+                        text_value = item.text or ""
+                        if text_value:
+                            text_value = anti_detection_injector.inject_symbols(text_value) if anti_detection_enabled and msg.role == 'user' else text_value
+                            parts.append({"text": text_value})
+                    else:
+                        multimodal_part = process_multimodal_content(item, file_storage)
+                        if multimodal_part:
+                            parts.append(multimodal_part)
 
         if parts:
             contents.append({"role": role, "parts": parts})
