@@ -1,7 +1,6 @@
 from typing import Generator
 from database import Database
 from api_utils import GeminiAntiDetectionInjector, RateLimitCache
-from cli_auth import CliAuthManager
 
 # Dependency stubs that will be overridden in the main application setup.
 
