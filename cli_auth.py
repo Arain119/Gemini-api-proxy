@@ -330,6 +330,7 @@ async def _ensure_cli_account_metadata(
 # return `restricted_client` errors for the public desktop client we rely on.
 DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/generative-language",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
@@ -473,13 +474,15 @@ async def import_cli_credentials(
         # The library expects 'token_uri' and 'scopes' for proper loading.
         if "token_uri" not in info:
             info["token_uri"] = "https://oauth2.googleapis.com/token"
-        credentials, _updated_json, removed_restricted = _load_credentials(
-            json.dumps(info)
-        )
-        if removed_restricted:
-            logger.info(
-                "Removed restricted OAuth scopes from imported CLI credentials"
-            )
+        scopes = _normalize_scopes(info.get("scopes"))
+        if scopes is None:
+            scopes = list(DEFAULT_SCOPES)
+        else:
+            required = [scope for scope in DEFAULT_SCOPES if scope not in scopes]
+            scopes.extend(required)
+        info["scopes"] = scopes
+
+        credentials = _load_credentials(json.dumps(info))
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid credentials JSON: {exc}") from exc
 
@@ -546,12 +549,8 @@ def _load_credentials(
     serialized: str,
 ) -> Tuple[google_credentials.Credentials, Optional[str], bool]:
     info = json.loads(serialized)
-    scopes, changed, removed_restricted = _apply_scope_policy(info)
-    updated_json = json.dumps(info) if changed else None
-    credentials = google_credentials.Credentials.from_authorized_user_info(
-        info, scopes=scopes
-    )
-    return credentials, updated_json, removed_restricted
+    scopes = _normalize_scopes(info.get("scopes")) or list(DEFAULT_SCOPES)
+    return google_credentials.Credentials.from_authorized_user_info(info, scopes=scopes)
 
 
 async def ensure_cli_credentials(
