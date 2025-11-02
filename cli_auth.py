@@ -325,15 +325,49 @@ async def _ensure_cli_account_metadata(
     db.touch_cli_account(account_id)
 
 # NOTE: Keep this list aligned with the scopes requested by the official
-# gemini-cli project. Requesting additional scopes (including
-# `https://www.googleapis.com/auth/generative-language`) makes Google OAuth
-# return `restricted_client` errors for the public desktop client we rely on.
+# gemini-cli project.
+#
+# Google explicitly blocks the public desktop client that gemini-cli (and this
+# proxy) relies on from requesting certain sensitive scopes such as
+# `https://www.googleapis.com/auth/generative-language`. When the OAuth
+# refresh flow includes those scopes Google responds with
+# `restricted_client` and the token refresh fails, which bubbles up as a 401
+# during credential import or reuse. We therefore track the allowed default
+# scopes separately from the restricted list and always remove the latter when
+# normalising user supplied credentials.
 DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/generative-language",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
+
+RESTRICTED_SCOPES = {
+    "https://www.googleapis.com/auth/generative-language",
+}
+
+
+def _resolve_cli_scopes(scopes: Any) -> list:
+    """Return a sanitized scope list compatible with the public CLI client."""
+
+    normalized = _normalize_scopes(scopes) or []
+
+    filtered = []
+    seen = set()
+    for scope in normalized:
+        if scope in RESTRICTED_SCOPES:
+            continue
+        if scope in seen:
+            continue
+        seen.add(scope)
+        filtered.append(scope)
+
+    for scope in DEFAULT_SCOPES:
+        if scope in seen:
+            continue
+        seen.add(scope)
+        filtered.append(scope)
+
+    return filtered
 
 
 async def fetch_account_email(access_token: str) -> Optional[str]:
@@ -440,13 +474,7 @@ async def import_cli_credentials(
         # The library expects 'token_uri' and 'scopes' for proper loading.
         if "token_uri" not in info:
             info["token_uri"] = "https://oauth2.googleapis.com/token"
-        scopes = _normalize_scopes(info.get("scopes"))
-        if scopes is None:
-            scopes = list(DEFAULT_SCOPES)
-        else:
-            required = [scope for scope in DEFAULT_SCOPES if scope not in scopes]
-            scopes.extend(required)
-        info["scopes"] = scopes
+        info["scopes"] = _resolve_cli_scopes(info.get("scopes"))
 
         credentials = _load_credentials(json.dumps(info))
     except (json.JSONDecodeError, ValueError) as exc:
@@ -513,7 +541,8 @@ async def import_cli_credentials(
 
 def _load_credentials(serialized: str) -> google_credentials.Credentials:
     info = json.loads(serialized)
-    scopes = _normalize_scopes(info.get("scopes")) or list(DEFAULT_SCOPES)
+    scopes = _resolve_cli_scopes(info.get("scopes"))
+    info["scopes"] = scopes
     return google_credentials.Credentials.from_authorized_user_info(info, scopes=scopes)
 
 
