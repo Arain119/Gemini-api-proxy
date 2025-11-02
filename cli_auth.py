@@ -97,6 +97,69 @@ def _base_headers() -> Dict[str, str]:
     }
 
 
+def _extract_quota_project(
+    credentials: Optional[google_credentials.Credentials],
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Best-effort extraction of the quota project id for CLI requests."""
+
+    if metadata:
+        for key in ("quota_project_id", "project_number", "project_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    if not credentials:
+        return None
+
+    quota_project = getattr(credentials, "quota_project_id", None)
+    if isinstance(quota_project, str) and quota_project.strip():
+        return quota_project.strip()
+
+    project_id = getattr(credentials, "project_id", None)
+    if isinstance(project_id, str) and project_id.strip():
+        return project_id.strip()
+
+    try:
+        info = json.loads(credentials.to_json())
+    except Exception:  # pragma: no cover - defensive fallback
+        info = {}
+
+    for key in ("quota_project_id", "project_id", "project_number", "quota_project"):
+        value = info.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return None
+
+
+def _normalize_scopes(scopes: Any) -> Optional[list]:
+    """Normalize scopes into a list of unique, non-empty strings."""
+
+    if not scopes:
+        return None
+
+    if isinstance(scopes, str):
+        scopes = [scope.strip() for scope in scopes.split()]
+    elif isinstance(scopes, (tuple, set)):
+        scopes = list(scopes)
+
+    if not isinstance(scopes, list):
+        return None
+
+    normalized = []
+    seen = set()
+    for scope in scopes:
+        if not isinstance(scope, str):
+            continue
+        stripped = scope.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        normalized.append(stripped)
+    return normalized if normalized else None
+
+
 def normalize_cli_model_name(model_name: str) -> str:
     """Ensure the model name carries the full resource prefix.
 
@@ -199,6 +262,20 @@ async def _prepare_cli_headers(
         credentials, account = await ensure_cli_credentials(db, account_id)
         headers["Authorization"] = f"Bearer {credentials.token}"
 
+        quota_project_id = _extract_quota_project(credentials, metadata)
+        if quota_project_id:
+            headers["X-Goog-User-Project"] = quota_project_id
+            if metadata.get("quota_project_id") != quota_project_id:
+                metadata["quota_project_id"] = quota_project_id
+                key_id = key_info.get("id")
+                if key_id:
+                    try:
+                        db.update_gemini_key(key_id, metadata=metadata)
+                    except Exception as exc:  # pragma: no cover - database errors logged downstream
+                        logger.warning(
+                            "Failed to persist quota project id for key %s: %s", key_id, exc
+                        )
+
         account_email = account.get("account_email")
         if account_email and metadata.get("account_email") != account_email:
             metadata["account_email"] = account_email
@@ -233,6 +310,13 @@ async def _ensure_cli_account_metadata(
             metadata_changed = True
             db.update_cli_account_credentials(account_id, credentials.to_json(), email)
 
+    quota_project_id = metadata.get("quota_project_id")
+    if not quota_project_id:
+        quota_project_candidate = _extract_quota_project(credentials, metadata)
+        if quota_project_candidate:
+            metadata["quota_project_id"] = quota_project_candidate
+            metadata_changed = True
+
     if metadata_changed:
         key_id = key_info.get("id")
         if key_id:
@@ -241,14 +325,48 @@ async def _ensure_cli_account_metadata(
     db.touch_cli_account(account_id)
 
 # NOTE: Keep this list aligned with the scopes requested by the official
-# gemini-cli project. Asking for extra scopes (like the deprecated
-# `generative-language.retrieval`) causes Google OAuth to return
-# `invalid_scope` and blocks users from signing in.
+# gemini-cli project. Requesting additional scopes (including
+# `https://www.googleapis.com/auth/generative-language`) makes Google OAuth
+# return `restricted_client` errors for the public desktop client we rely on.
 DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
+
+# OAuth scopes that the public Gemini CLI desktop client is not allowed to
+# request. They must be stripped from imported credentials; otherwise the token
+# refresh call fails with `restricted_client`.
+RESTRICTED_SCOPES = {
+    "https://www.googleapis.com/auth/generative-language",
+}
+
+
+def _apply_scope_policy(info: Dict[str, Any]) -> Tuple[list, bool, bool]:
+    """Normalize scopes, add required defaults, and strip restricted scopes."""
+
+    original_value = info.get("scopes")
+    normalized = _normalize_scopes(original_value) or []
+
+    sanitized = [scope for scope in normalized if scope not in RESTRICTED_SCOPES]
+    removed_restricted = len(sanitized) != len(normalized)
+
+    for scope in DEFAULT_SCOPES:
+        if scope not in sanitized:
+            sanitized.append(scope)
+
+    if not sanitized:
+        sanitized = list(DEFAULT_SCOPES)
+
+    changed = (
+        removed_restricted
+        or sanitized != normalized
+        or original_value != sanitized
+    )
+
+    info["scopes"] = sanitized
+
+    return sanitized, changed, removed_restricted
 
 
 async def fetch_account_email(access_token: str) -> Optional[str]:
@@ -296,9 +414,13 @@ async def finalize_cli_oauth(
         logger.error("Failed to store CLI OAuth credentials: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to store CLI credentials") from exc
 
+    quota_project_id = _extract_quota_project(credentials)
+
     metadata = {"cli_account_id": account_id}
     if email:
         metadata["account_email"] = email
+    if quota_project_id:
+        metadata["quota_project_id"] = quota_project_id
     key_value = f"cli-account-{account_id}"
 
     if not db.add_gemini_key(key_value, source_type="cli_oauth", metadata=metadata):
@@ -351,10 +473,13 @@ async def import_cli_credentials(
         # The library expects 'token_uri' and 'scopes' for proper loading.
         if "token_uri" not in info:
             info["token_uri"] = "https://oauth2.googleapis.com/token"
-        if "scopes" not in info:
-            info["scopes"] = DEFAULT_SCOPES
-
-        credentials = _load_credentials(json.dumps(info))
+        credentials, _updated_json, removed_restricted = _load_credentials(
+            json.dumps(info)
+        )
+        if removed_restricted:
+            logger.info(
+                "Removed restricted OAuth scopes from imported CLI credentials"
+            )
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid credentials JSON: {exc}") from exc
 
@@ -381,9 +506,13 @@ async def import_cli_credentials(
         logger.error("Failed to store imported CLI OAuth credentials: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to store CLI credentials") from exc
 
+    quota_project_id = _extract_quota_project(credentials)
+
     metadata = {"cli_account_id": account_id}
     if email:
         metadata["account_email"] = email
+    if quota_project_id:
+        metadata["quota_project_id"] = quota_project_id
     key_value = f"cli-account-{account_id}"
 
     if not db.add_gemini_key(key_value, source_type="cli_oauth", metadata=metadata):
@@ -413,10 +542,16 @@ async def import_cli_credentials(
     )
 
 
-def _load_credentials(serialized: str) -> google_credentials.Credentials:
+def _load_credentials(
+    serialized: str,
+) -> Tuple[google_credentials.Credentials, Optional[str], bool]:
     info = json.loads(serialized)
-    scopes = info.get("scopes") or DEFAULT_SCOPES
-    return google_credentials.Credentials.from_authorized_user_info(info, scopes=scopes)
+    scopes, changed, removed_restricted = _apply_scope_policy(info)
+    updated_json = json.dumps(info) if changed else None
+    credentials = google_credentials.Credentials.from_authorized_user_info(
+        info, scopes=scopes
+    )
+    return credentials, updated_json, removed_restricted
 
 
 async def ensure_cli_credentials(
@@ -429,10 +564,33 @@ async def ensure_cli_credentials(
         raise HTTPException(status_code=503, detail="CLI account is not active")
 
     try:
-        credentials = _load_credentials(account["credentials"])
+        credentials, sanitized_json, removed_restricted = _load_credentials(
+            account["credentials"]
+        )
     except Exception as exc:  # pragma: no cover - invalid data
         logger.error("Failed to load CLI credentials for account %s: %s", account_id, exc)
         raise HTTPException(status_code=500, detail="Stored credentials are invalid") from exc
+
+    if sanitized_json:
+        try:
+            db.update_cli_account_credentials(
+                account_id,
+                sanitized_json,
+                account.get("account_email"),
+            )
+            account["credentials"] = sanitized_json
+        except Exception as exc:  # pragma: no cover - database errors logged downstream
+            logger.warning(
+                "Failed to persist sanitized scopes for CLI account %s: %s",
+                account_id,
+                exc,
+            )
+
+    if removed_restricted:
+        logger.info(
+            "Removed restricted OAuth scopes from stored CLI credentials for account %s",
+            account_id,
+        )
 
     if credentials.expired and credentials.refresh_token:
         logger.info("Refreshing access token for CLI account %s", account_id)
