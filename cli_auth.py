@@ -267,11 +267,6 @@ def _simplify_code_assist_model(model_name: str) -> str:
     return simplified
 
 
-def _is_search_variant(model_name: str) -> bool:
-    simplified = _strip_model_prefix(model_name)
-    return "-search" in simplified
-
-
 def _is_nothinking_variant(model_name: str) -> bool:
     simplified = _strip_model_prefix(model_name)
     return "-nothinking" in simplified
@@ -426,24 +421,6 @@ def _build_code_assist_request_payload(
 
     if include_thoughts is not None:
         thinking_config["includeThoughts"] = include_thoughts
-
-    if _is_search_variant(model_name):
-        tools_value = request_body.get("tools")
-        if tools_value is None:
-            tools_list = []
-        elif isinstance(tools_value, list):
-            tools_list = tools_value
-        elif isinstance(tools_value, (tuple, set)):
-            tools_list = list(tools_value)
-        else:
-            tools_list = [tools_value]
-
-        has_search_tool = any(
-            isinstance(tool, dict) and tool.get("googleSearch") is not None for tool in tools_list
-        )
-        if not has_search_tool:
-            tools_list.append({"googleSearch": {}})
-        request_body["tools"] = tools_list
 
     request_body.pop("model", None)
 
