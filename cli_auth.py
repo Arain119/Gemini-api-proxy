@@ -308,7 +308,8 @@ async def _ensure_cli_account_metadata(
         if email:
             metadata["account_email"] = email
             metadata_changed = True
-            db.update_cli_account_credentials(account_id, credentials.to_json(), email)
+            credentials, sanitized_json, _ = _sanitize_credentials_instance(credentials)
+            db.update_cli_account_credentials(account_id, sanitized_json, email)
 
     quota_project_id = metadata.get("quota_project_id")
     if not quota_project_id:
@@ -403,6 +404,35 @@ def _sanitize_cli_scope_fields(info: Dict[str, Any]) -> Tuple[list, bool]:
     return resolved, changed
 
 
+def _sanitize_credentials_instance(
+    credentials: google_credentials.Credentials,
+) -> Tuple[google_credentials.Credentials, str, bool]:
+    """Ensure a credentials object serializes without restricted scopes."""
+
+    serialized = credentials.to_json()
+    info = json.loads(serialized)
+
+    scopes, changed = _sanitize_cli_scope_fields(info)
+    sanitized_serialized = json.dumps(info)
+
+    if not changed:
+        return credentials, sanitized_serialized, False
+
+    sanitized_credentials = google_credentials.Credentials.from_authorized_user_info(
+        info, scopes=scopes
+    )
+
+    token = getattr(credentials, "token", None)
+    if token:
+        sanitized_credentials.token = token
+
+    expiry = getattr(credentials, "expiry", None)
+    if expiry:
+        sanitized_credentials.expiry = expiry
+
+    return sanitized_credentials, sanitized_serialized, True
+
+
 async def fetch_account_email(access_token: str) -> Optional[str]:
     """Fetch the authenticated account's email using Google UserInfo API."""
 
@@ -438,9 +468,10 @@ async def finalize_cli_oauth(
 ) -> CliAuthCompleteResponse:
     """Store CLI OAuth credentials and register a corresponding Gemini key."""
 
+    credentials, credentials_json, _ = _sanitize_credentials_instance(credentials)
+
     access_token = getattr(credentials, "token", None)
     email = await fetch_account_email(access_token) if access_token else None
-    credentials_json = credentials.to_json()
 
     try:
         account_id = db.create_cli_account(credentials_json, email, label)
@@ -522,11 +553,10 @@ async def import_cli_credentials(
         logger.error("Failed to refresh imported CLI credentials: %s", exc)
         raise HTTPException(status_code=401, detail=f"Failed to refresh imported credentials. They might be expired or invalid: {exc}") from exc
 
+    credentials, refreshed_credentials_json, _ = _sanitize_credentials_instance(credentials)
+
     access_token = getattr(credentials, "token", None)
     email = await fetch_account_email(access_token) if access_token else None
-    
-    # Use the refreshed credentials JSON for storage
-    refreshed_credentials_json = credentials.to_json()
 
     try:
         account_id = db.create_cli_account(refreshed_credentials_json, email, label)
@@ -624,9 +654,11 @@ async def ensure_cli_credentials(
             logger.error("Failed to refresh CLI credentials: %s", exc)
             raise HTTPException(status_code=401, detail="Failed to refresh CLI credentials") from exc
 
+        credentials, sanitized_json, _ = _sanitize_credentials_instance(credentials)
+
         db.update_cli_account_credentials(
             account_id,
-            credentials.to_json(),
+            sanitized_json,
             account.get("account_email"),
         )
 
