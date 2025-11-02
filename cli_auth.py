@@ -342,21 +342,9 @@ DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
 
-RESTRICTED_SCOPE_PREFIXES = (
+RESTRICTED_SCOPES = {
     "https://www.googleapis.com/auth/generative-language",
-)
-
-
-def _is_restricted_scope(scope: str) -> bool:
-    """Return True if the scope is blocked for the public desktop client."""
-
-    if not scope:
-        return False
-
-    for prefix in RESTRICTED_SCOPE_PREFIXES:
-        if scope == prefix or scope.startswith(prefix + "/") or scope.startswith(prefix + "."):
-            return True
-    return False
+}
 
 
 def _resolve_cli_scopes(scopes: Any) -> list:
@@ -367,7 +355,7 @@ def _resolve_cli_scopes(scopes: Any) -> list:
     filtered = []
     seen = set()
     for scope in normalized:
-        if _is_restricted_scope(scope):
+        if scope in RESTRICTED_SCOPES:
             continue
         if scope in seen:
             continue
