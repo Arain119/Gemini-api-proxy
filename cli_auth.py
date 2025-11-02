@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -38,6 +39,21 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
 CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com"
 
 _MODEL_PREFIXES = ("models/", "tunedModels/", "cachedContents/")
+
+DEFAULT_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_UNSPECIFIED", "threshold": "BLOCK_NONE"},
+]
+
+_CODE_ASSIST_MODEL_SUFFIXES = ("-maxthinking", "-nothinking", "-search")
 
 CLI_VERSION = "0.1.5"
 
@@ -231,6 +247,16 @@ def _strip_model_prefix(model_name: str) -> str:
     return model_name
 
 
+def _simplify_code_assist_model(model_name: str) -> str:
+    """Mirror geminicli2api model normalisation for Code Assist endpoints."""
+
+    simplified = _strip_model_prefix(model_name)
+    for suffix in _CODE_ASSIST_MODEL_SUFFIXES:
+        if simplified.endswith(suffix):
+            return simplified[: -len(suffix)]
+    return simplified
+
+
 def resolve_cli_model_name(db: Optional[Database], model_name: str) -> str:
     """Normalize并校验模型是否在系统支持列表中。
 
@@ -289,6 +315,27 @@ def _serialize_cli_payload(value: Any) -> Any:
         return [_serialize_cli_payload(item) for item in value if item is not None]
 
     return value
+
+
+def _build_code_assist_request_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Construct the request body expected by Code Assist endpoints."""
+
+    request_body: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if value is None:
+            continue
+        request_body[key] = value
+
+    if "safetySettings" not in request_body:
+        request_body["safetySettings"] = copy.deepcopy(DEFAULT_SAFETY_SETTINGS)
+
+    generation_config = request_body.get("generationConfig")
+    if generation_config is None:
+        request_body["generationConfig"] = {}
+
+    request_body.pop("model", None)
+
+    return request_body
 
 
 def _format_code_assist_error(response: httpx.Response) -> str:
@@ -476,12 +523,12 @@ async def _build_cli_oauth_request(
     )
 
     normalized_model = resolve_cli_model_name(db, model_name)
-    code_assist_model = _strip_model_prefix(normalized_model)
+    code_assist_model = _simplify_code_assist_model(normalized_model)
     serialized_payload = _serialize_cli_payload(payload)
     request_envelope = {
         "model": code_assist_model,
         "project": project_id,
-        "request": serialized_payload,
+        "request": _build_code_assist_request_payload(serialized_payload),
     }
 
     return account_id, credentials, metadata, request_envelope
