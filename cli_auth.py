@@ -308,7 +308,8 @@ async def _ensure_cli_account_metadata(
         if email:
             metadata["account_email"] = email
             metadata_changed = True
-            db.update_cli_account_credentials(account_id, credentials.to_json(), email)
+            credentials, sanitized_json, _ = _sanitize_credentials_instance(credentials)
+            db.update_cli_account_credentials(account_id, sanitized_json, email)
 
     quota_project_id = metadata.get("quota_project_id")
     if not quota_project_id:
@@ -325,15 +326,111 @@ async def _ensure_cli_account_metadata(
     db.touch_cli_account(account_id)
 
 # NOTE: Keep this list aligned with the scopes requested by the official
-# gemini-cli project. Requesting additional scopes (including
-# `https://www.googleapis.com/auth/generative-language`) makes Google OAuth
-# return `restricted_client` errors for the public desktop client we rely on.
+# gemini-cli project.
+#
+# Google explicitly blocks the public desktop client that gemini-cli (and this
+# proxy) relies on from requesting certain sensitive scopes such as
+# `https://www.googleapis.com/auth/generative-language`. When the OAuth
+# refresh flow includes those scopes Google responds with
+# `restricted_client` and the token refresh fails, which bubbles up as a 401
+# during credential import or reuse. We therefore track the allowed default
+# scopes separately from the restricted list and always remove the latter when
+# normalising user supplied credentials.
 DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/generative-language",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
 ]
+
+RESTRICTED_SCOPES = {
+    "https://www.googleapis.com/auth/generative-language",
+}
+
+
+def _resolve_cli_scopes(scopes: Any) -> list:
+    """Return a sanitized scope list compatible with the public CLI client."""
+
+    normalized = _normalize_scopes(scopes) or []
+
+    filtered = []
+    seen = set()
+    for scope in normalized:
+        if scope in RESTRICTED_SCOPES:
+            continue
+        if scope in seen:
+            continue
+        seen.add(scope)
+        filtered.append(scope)
+
+    for scope in DEFAULT_SCOPES:
+        if scope in seen:
+            continue
+        seen.add(scope)
+        filtered.append(scope)
+
+    return filtered
+
+
+def _sanitize_cli_scope_fields(info: Dict[str, Any]) -> Tuple[list, bool]:
+    """Normalise scope fields in-place and report whether any changes were made."""
+
+    # Gather scopes from both legacy "scope" strings and modern "scopes" lists.
+    combined: list = []
+    changed = False
+
+    for field in ("scopes", "scope"):
+        if field not in info:
+            continue
+        original_value = info.get(field)
+        normalised = _normalize_scopes(original_value) or []
+        if original_value != normalised:
+            changed = True
+        combined.extend(normalised)
+
+    resolved = _resolve_cli_scopes(combined)
+
+    if info.get("scopes") != resolved:
+        info["scopes"] = resolved
+        changed = True
+
+    scope_string = " ".join(resolved)
+    if info.get("scope") != scope_string:
+        if scope_string:
+            info["scope"] = scope_string
+        else:
+            info.pop("scope", None)
+        changed = True
+
+    return resolved, changed
+
+
+def _sanitize_credentials_instance(
+    credentials: google_credentials.Credentials,
+) -> Tuple[google_credentials.Credentials, str, bool]:
+    """Ensure a credentials object serializes without restricted scopes."""
+
+    serialized = credentials.to_json()
+    info = json.loads(serialized)
+
+    scopes, changed = _sanitize_cli_scope_fields(info)
+    sanitized_serialized = json.dumps(info)
+
+    if not changed:
+        return credentials, sanitized_serialized, False
+
+    sanitized_credentials = google_credentials.Credentials.from_authorized_user_info(
+        info, scopes=scopes
+    )
+
+    token = getattr(credentials, "token", None)
+    if token:
+        sanitized_credentials.token = token
+
+    expiry = getattr(credentials, "expiry", None)
+    if expiry:
+        sanitized_credentials.expiry = expiry
+
+    return sanitized_credentials, sanitized_serialized, True
 
 
 async def fetch_account_email(access_token: str) -> Optional[str]:
@@ -371,9 +468,10 @@ async def finalize_cli_oauth(
 ) -> CliAuthCompleteResponse:
     """Store CLI OAuth credentials and register a corresponding Gemini key."""
 
+    credentials, credentials_json, _ = _sanitize_credentials_instance(credentials)
+
     access_token = getattr(credentials, "token", None)
     email = await fetch_account_email(access_token) if access_token else None
-    credentials_json = credentials.to_json()
 
     try:
         account_id = db.create_cli_account(credentials_json, email, label)
@@ -440,15 +538,7 @@ async def import_cli_credentials(
         # The library expects 'token_uri' and 'scopes' for proper loading.
         if "token_uri" not in info:
             info["token_uri"] = "https://oauth2.googleapis.com/token"
-        scopes = _normalize_scopes(info.get("scopes"))
-        if scopes is None:
-            scopes = list(DEFAULT_SCOPES)
-        else:
-            required = [scope for scope in DEFAULT_SCOPES if scope not in scopes]
-            scopes.extend(required)
-        info["scopes"] = scopes
-
-        credentials = _load_credentials(json.dumps(info))
+        credentials, _, _ = _load_credentials(json.dumps(info))
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Invalid credentials JSON: {exc}") from exc
 
@@ -463,11 +553,10 @@ async def import_cli_credentials(
         logger.error("Failed to refresh imported CLI credentials: %s", exc)
         raise HTTPException(status_code=401, detail=f"Failed to refresh imported credentials. They might be expired or invalid: {exc}") from exc
 
+    credentials, refreshed_credentials_json, _ = _sanitize_credentials_instance(credentials)
+
     access_token = getattr(credentials, "token", None)
     email = await fetch_account_email(access_token) if access_token else None
-    
-    # Use the refreshed credentials JSON for storage
-    refreshed_credentials_json = credentials.to_json()
 
     try:
         account_id = db.create_cli_account(refreshed_credentials_json, email, label)
@@ -511,10 +600,14 @@ async def import_cli_credentials(
     )
 
 
-def _load_credentials(serialized: str) -> google_credentials.Credentials:
+def _load_credentials(serialized: str) -> Tuple[google_credentials.Credentials, str, bool]:
+    """Load credentials JSON while normalising scope fields."""
+
     info = json.loads(serialized)
-    scopes = _normalize_scopes(info.get("scopes")) or list(DEFAULT_SCOPES)
-    return google_credentials.Credentials.from_authorized_user_info(info, scopes=scopes)
+    scopes, changed = _sanitize_cli_scope_fields(info)
+    sanitized_serialized = json.dumps(info)
+    credentials = google_credentials.Credentials.from_authorized_user_info(info, scopes=scopes)
+    return credentials, sanitized_serialized, changed
 
 
 async def ensure_cli_credentials(
@@ -526,11 +619,27 @@ async def ensure_cli_credentials(
     if not account or account.get("status") != 1:
         raise HTTPException(status_code=503, detail="CLI account is not active")
 
+    original_serialized = account["credentials"]
+
     try:
-        credentials = _load_credentials(account["credentials"])
+        credentials, sanitized_serialized, scopes_changed = _load_credentials(original_serialized)
     except Exception as exc:  # pragma: no cover - invalid data
         logger.error("Failed to load CLI credentials for account %s: %s", account_id, exc)
         raise HTTPException(status_code=500, detail="Stored credentials are invalid") from exc
+
+    if scopes_changed and sanitized_serialized != original_serialized:
+        try:
+            db.update_cli_account_credentials(
+                account_id,
+                sanitized_serialized,
+                account.get("account_email"),
+            )
+        except Exception as exc:  # pragma: no cover - database errors are logged downstream
+            logger.warning(
+                "Failed to persist sanitized scopes for CLI account %s: %s",
+                account_id,
+                exc,
+            )
 
     if credentials.expired and credentials.refresh_token:
         logger.info("Refreshing access token for CLI account %s", account_id)
@@ -545,9 +654,11 @@ async def ensure_cli_credentials(
             logger.error("Failed to refresh CLI credentials: %s", exc)
             raise HTTPException(status_code=401, detail="Failed to refresh CLI credentials") from exc
 
+        credentials, sanitized_json, _ = _sanitize_credentials_instance(credentials)
+
         db.update_cli_account_credentials(
             account_id,
-            credentials.to_json(),
+            sanitized_json,
             account.get("account_email"),
         )
 
