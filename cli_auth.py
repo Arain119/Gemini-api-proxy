@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -34,10 +35,43 @@ SIGN_IN_SUCCESS_URL = "https://developers.google.com/gemini-code-assist/auth_suc
 SIGN_IN_FAILURE_URL = "https://developers.google.com/gemini-code-assist/auth_failure_gemini"
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com"
+
 _MODEL_PREFIXES = ("models/", "tunedModels/", "cachedContents/")
 
-CLI_DEFAULT_USER_AGENT = "GeminiCLIProxy/1.0"
-CLI_CLIENT_HEADER = "gemini-cli-proxy/1.0"
+CLI_VERSION = "0.1.5"
+
+
+def _compute_cli_user_agent() -> str:
+    system = platform.system() or "Unknown"
+    arch = platform.machine() or "Unknown"
+    return f"GeminiCLI/{CLI_VERSION} ({system}; {arch})"
+
+
+CLI_DEFAULT_USER_AGENT = _compute_cli_user_agent()
+CLI_CLIENT_HEADER = f"gemini-cli/{CLI_VERSION}"
+
+
+def _resolve_cli_platform() -> str:
+    system = (platform.system() or "").upper()
+    arch = (platform.machine() or "").upper()
+
+    if system == "DARWIN":
+        return "DARWIN_ARM64" if arch in {"ARM64", "AARCH64"} else "DARWIN_AMD64"
+    if system == "LINUX":
+        return "LINUX_ARM64" if arch in {"ARM64", "AARCH64"} else "LINUX_AMD64"
+    if system == "WINDOWS":
+        return "WINDOWS_AMD64"
+    return "PLATFORM_UNSPECIFIED"
+
+
+def _build_cli_client_metadata(project_id: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": _resolve_cli_platform(),
+        "pluginType": "GEMINI",
+        "duetProject": project_id,
+    }
 
 
 @dataclass
@@ -95,6 +129,17 @@ def _base_headers() -> Dict[str, str]:
         "User-Agent": CLI_DEFAULT_USER_AGENT,
         "X-Goog-Api-Client": CLI_CLIENT_HEADER,
     }
+
+
+def _persist_cli_metadata(db: Database, key_info: Dict[str, Any], metadata: Dict[str, Any]) -> None:
+    key_id = key_info.get("id")
+    if not key_id:
+        return
+
+    try:
+        db.update_gemini_key(key_id, metadata=metadata)
+    except Exception as exc:  # pragma: no cover - defensive persistence
+        logger.warning("Failed to persist CLI metadata for key %s: %s", key_id, exc)
 
 
 def _extract_quota_project(
@@ -177,6 +222,15 @@ def normalize_cli_model_name(model_name: str) -> str:
     return f"models/{normalized}"
 
 
+def _strip_model_prefix(model_name: str) -> str:
+    """Remove known resource prefixes from a model path for Code Assist calls."""
+
+    for prefix in _MODEL_PREFIXES:
+        if model_name.startswith(prefix):
+            return model_name[len(prefix) :]
+    return model_name
+
+
 def resolve_cli_model_name(db: Optional[Database], model_name: str) -> str:
     """Normalize并校验模型是否在系统支持列表中。
 
@@ -236,6 +290,257 @@ def _serialize_cli_payload(value: Any) -> Any:
 
     return value
 
+
+def _format_code_assist_error(response: httpx.Response) -> str:
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if message:
+                    return message
+    except ValueError:
+        pass
+
+    return response.text or f"HTTP {response.status_code}"
+
+
+def _code_assist_headers(credentials: google_credentials.Credentials) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {credentials.token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": CLI_DEFAULT_USER_AGENT,
+        "X-Goog-Api-Client": CLI_CLIENT_HEADER,
+    }
+
+
+async def _post_code_assist_json(
+    credentials: google_credentials.Credentials,
+    endpoint: str,
+    payload: Dict[str, Any],
+    *,
+    timeout: float,
+) -> Dict[str, Any]:
+    url = f"{CODE_ASSIST_ENDPOINT}/{endpoint}"
+    headers = _code_assist_headers(credentials)
+
+    timeout_config = httpx.Timeout(timeout, read=timeout)
+
+    client = await _get_shared_httpx_client()
+    response = await client.post(url, json=payload, headers=headers, timeout=timeout_config)
+
+    if response.status_code >= 400:
+        detail = _format_code_assist_error(response)
+        raise HTTPException(status_code=response.status_code, detail=detail)
+
+    try:
+        return response.json()
+    except ValueError as exc:  # pragma: no cover - unexpected payload
+        raise HTTPException(status_code=502, detail="Invalid response from Google Code Assist") from exc
+
+
+async def _load_code_assist(
+    credentials: google_credentials.Credentials,
+    *,
+    project_id: Optional[str],
+    timeout: float,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"metadata": _build_cli_client_metadata(project_id)}
+    if project_id:
+        payload["cloudaicompanionProject"] = project_id
+
+    return await _post_code_assist_json(
+        credentials,
+        "v1internal:loadCodeAssist",
+        payload,
+        timeout=timeout,
+    )
+
+
+async def _ensure_cli_onboarding(
+    credentials: google_credentials.Credentials,
+    *,
+    project_id: str,
+    load_data: Dict[str, Any],
+    timeout: float,
+) -> bool:
+    if load_data.get("currentTier"):
+        return True
+
+    tiers = load_data.get("allowedTiers") or []
+    tier = None
+    for candidate in tiers:
+        if isinstance(candidate, dict) and candidate.get("isDefault"):
+            tier = candidate
+            break
+
+    if not tier:
+        tier = tiers[0] if tiers else None
+
+    if not tier:
+        tier = {
+            "id": "legacy-tier",
+            "userDefinedCloudaicompanionProject": True,
+        }
+
+    if tier.get("userDefinedCloudaicompanionProject") and not project_id:
+        raise HTTPException(
+            status_code=400,
+            detail="CLI account requires specifying a Google Cloud project",
+        )
+
+    onboard_payload = {
+        "tierId": tier.get("id"),
+        "cloudaicompanionProject": project_id,
+        "metadata": _build_cli_client_metadata(project_id),
+    }
+
+    max_attempts = 6
+    for attempt in range(max_attempts):
+        operation = await _post_code_assist_json(
+            credentials,
+            "v1internal:onboardUser",
+            onboard_payload,
+            timeout=timeout,
+        )
+        if operation.get("done"):
+            return True
+
+        await asyncio.sleep(5)
+
+    logger.warning("CLI onboarding for project %s did not complete after %s attempts", project_id, max_attempts)
+    return False
+
+
+async def _ensure_cli_project(
+    db: Database,
+    key_info: Dict[str, Any],
+    metadata: Dict[str, Any],
+    credentials: google_credentials.Credentials,
+    *,
+    timeout: float,
+) -> str:
+    metadata_changed = False
+    project_id = metadata.get("cloudaicompanion_project") or metadata.get("quota_project_id")
+
+    load_data: Dict[str, Any]
+    if not project_id:
+        load_data = await _load_code_assist(credentials, project_id=None, timeout=timeout)
+        project_id = load_data.get("cloudaicompanionProject")
+        if not project_id:
+            raise HTTPException(status_code=500, detail="Failed to discover Google Code Assist project")
+        metadata["cloudaicompanion_project"] = project_id
+        if not metadata.get("quota_project_id"):
+            metadata["quota_project_id"] = project_id
+        metadata_changed = True
+    else:
+        load_data = await _load_code_assist(credentials, project_id=project_id, timeout=timeout)
+
+    onboarded = await _ensure_cli_onboarding(
+        credentials,
+        project_id=project_id,
+        load_data=load_data,
+        timeout=timeout,
+    )
+
+    if onboarded and not metadata.get("cli_onboarded"):
+        metadata["cli_onboarded"] = True
+        metadata_changed = True
+
+    if metadata_changed:
+        _persist_cli_metadata(db, key_info, metadata)
+
+    return project_id
+
+
+async def _build_cli_oauth_request(
+    db: Database,
+    key_info: Dict[str, Any],
+    payload: Dict[str, Any],
+    model_name: str,
+    *,
+    timeout: float,
+) -> Tuple[Optional[int], google_credentials.Credentials, Dict[str, Any], Dict[str, Any]]:
+    _headers, account_id, credentials, metadata = await _prepare_cli_headers(db, key_info)
+    if not credentials:
+        raise HTTPException(status_code=500, detail="CLI credentials missing")
+
+    project_id = await _ensure_cli_project(
+        db,
+        key_info,
+        metadata,
+        credentials,
+        timeout=timeout,
+    )
+
+    normalized_model = resolve_cli_model_name(db, model_name)
+    code_assist_model = _strip_model_prefix(normalized_model)
+    serialized_payload = _serialize_cli_payload(payload)
+    request_envelope = {
+        "model": code_assist_model,
+        "project": project_id,
+        "request": serialized_payload,
+    }
+
+    return account_id, credentials, metadata, request_envelope
+
+
+async def _stream_code_assist(
+    credentials: google_credentials.Credentials,
+    request_envelope: Dict[str, Any],
+    *,
+    timeout: float,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    url = f"{CODE_ASSIST_ENDPOINT}/v1internal:streamGenerateContent?alt=sse"
+    headers = _code_assist_headers(credentials)
+    timeout_config = httpx.Timeout(timeout, read=timeout)
+
+    client = await _get_shared_httpx_client()
+    async with client.stream(
+        "POST",
+        url,
+        json=request_envelope,
+        headers=headers,
+        timeout=timeout_config,
+    ) as response:
+        if response.status_code >= 400:
+            content_bytes = await response.aread()
+            detail: Optional[str] = None
+            if content_bytes:
+                text = content_bytes.decode("utf-8", "ignore")
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        error = data.get("error")
+                        if isinstance(error, dict):
+                            detail = error.get("message") or text
+                    else:
+                        detail = text
+                except json.JSONDecodeError:
+                    detail = text
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=detail or response.reason_phrase or "Google Code Assist streaming error",
+            )
+
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload_text = line[5:].strip()
+            if not payload_text or payload_text == "[DONE]":
+                if payload_text == "[DONE]":
+                    break
+                continue
+            try:
+                event = json.loads(payload_text)
+            except json.JSONDecodeError:
+                logger.debug("Skipping non-JSON SSE payload: %s", payload_text)
+                continue
+            yield event
 
 async def _prepare_cli_headers(
     db: Database,
@@ -678,6 +983,29 @@ async def call_gemini_with_cli_account(
 ) -> Dict[str, Any]:
     """Send a request to the Gemini API using Gemini CLI authentication."""
 
+    source_type = _normalize_source_type(key_info)
+
+    if source_type == "cli_oauth":
+        account_id, credentials, metadata, request_envelope = await _build_cli_oauth_request(
+            db,
+            key_info,
+            payload,
+            model_name,
+            timeout=timeout,
+        )
+
+        data = await _post_code_assist_json(
+            credentials,
+            "v1internal:generateContent",
+            request_envelope,
+            timeout=timeout,
+        )
+
+        if account_id:
+            await _ensure_cli_account_metadata(db, key_info, metadata, credentials, account_id)
+
+        return data
+
     headers, account_id, credentials, metadata = await _prepare_cli_headers(db, key_info)
 
     normalized_model = resolve_cli_model_name(db, model_name)
@@ -723,6 +1051,34 @@ async def stream_gemini_with_cli_account(
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Stream Gemini responses using Gemini CLI authentication."""
 
+    source_type = _normalize_source_type(key_info)
+
+    if source_type == "cli_oauth":
+        account_id, credentials, metadata, request_envelope = await _build_cli_oauth_request(
+            db,
+            key_info,
+            payload,
+            model_name,
+            timeout=timeout,
+        )
+
+        try:
+            async for event in _stream_code_assist(
+                credentials,
+                request_envelope,
+                timeout=timeout,
+            ):
+                yield event
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - network failure
+            logger.error("CLI streaming request failed for key %s: %s", key_info.get("id"), exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        finally:
+            if account_id:
+                await _ensure_cli_account_metadata(db, key_info, metadata, credentials, account_id)
+        return
+
     headers, account_id, credentials, metadata = await _prepare_cli_headers(db, key_info)
 
     normalized_model = resolve_cli_model_name(db, model_name)
@@ -746,21 +1102,21 @@ async def stream_gemini_with_cli_account(
                 raise HTTPException(status_code=response.status_code, detail=detail)
 
             async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    payload_text = line[5:].strip()
-                    if not payload_text or payload_text == "[DONE]":
-                        if payload_text == "[DONE]":
-                            break
-                        continue
-                    try:
-                        event = json.loads(payload_text)
-                    except json.JSONDecodeError:
-                        logger.debug("Skipping non-JSON SSE payload: %s", payload_text)
-                        continue
-                    yield event
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload_text = line[5:].strip()
+                if not payload_text or payload_text == "[DONE]":
+                    if payload_text == "[DONE]":
+                        break
+                    continue
+                try:
+                    event = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    logger.debug("Skipping non-JSON SSE payload: %s", payload_text)
+                    continue
+                yield event
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - network failure
