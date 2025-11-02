@@ -53,7 +53,13 @@ DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_UNSPECIFIED", "threshold": "BLOCK_NONE"},
 ]
 
-_CODE_ASSIST_MODEL_SUFFIXES = ("-maxthinking", "-nothinking", "-search")
+_CODE_ASSIST_MODEL_SUFFIXES = (
+    "-search-maxthinking",
+    "-search-nothinking",
+    "-maxthinking",
+    "-nothinking",
+    "-search",
+)
 
 CLI_VERSION = "0.1.5"
 
@@ -251,10 +257,76 @@ def _simplify_code_assist_model(model_name: str) -> str:
     """Mirror geminicli2api model normalisation for Code Assist endpoints."""
 
     simplified = _strip_model_prefix(model_name)
-    for suffix in _CODE_ASSIST_MODEL_SUFFIXES:
-        if simplified.endswith(suffix):
-            return simplified[: -len(suffix)]
+    previous = None
+    while previous != simplified:
+        previous = simplified
+        for suffix in _CODE_ASSIST_MODEL_SUFFIXES:
+            if simplified.endswith(suffix):
+                simplified = simplified[: -len(suffix)]
+                break
     return simplified
+
+
+def _is_search_variant(model_name: str) -> bool:
+    simplified = _strip_model_prefix(model_name)
+    return "-search" in simplified
+
+
+def _is_nothinking_variant(model_name: str) -> bool:
+    simplified = _strip_model_prefix(model_name)
+    return "-nothinking" in simplified
+
+
+def _is_maxthinking_variant(model_name: str) -> bool:
+    simplified = _strip_model_prefix(model_name)
+    return "-maxthinking" in simplified
+
+
+def _strip_code_assist_suffixes(model_name: str) -> str:
+    simplified = _strip_model_prefix(model_name)
+    previous = None
+    while previous != simplified:
+        previous = simplified
+        for suffix in _CODE_ASSIST_MODEL_SUFFIXES:
+            if simplified.endswith(suffix):
+                simplified = simplified[: -len(suffix)]
+                break
+    return simplified
+
+
+def _get_thinking_budget(model_name: str) -> Optional[int]:
+    base_model = _strip_code_assist_suffixes(model_name)
+
+    if "gemini-2.5-flash-image" in base_model:
+        return None
+
+    if _is_nothinking_variant(model_name):
+        if "gemini-2.5-flash" in base_model:
+            return 0
+        if "gemini-2.5-pro" in base_model:
+            return 128
+        return 0
+
+    if _is_maxthinking_variant(model_name):
+        if "gemini-2.5-flash" in base_model:
+            return 24576
+        if "gemini-2.5-pro" in base_model:
+            return 32768
+        return 32768
+
+    return -1
+
+
+def _should_include_thoughts(model_name: str) -> Optional[bool]:
+    base_model = _strip_code_assist_suffixes(model_name)
+
+    if "gemini-2.5-flash-image" in base_model:
+        return None
+
+    if _is_nothinking_variant(model_name):
+        return "gemini-2.5-pro" in base_model
+
+    return True
 
 
 def resolve_cli_model_name(db: Optional[Database], model_name: str) -> str:
@@ -317,7 +389,11 @@ def _serialize_cli_payload(value: Any) -> Any:
     return value
 
 
-def _build_code_assist_request_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _build_code_assist_request_payload(
+    payload: Dict[str, Any],
+    *,
+    model_name: str,
+) -> Dict[str, Any]:
     """Construct the request body expected by Code Assist endpoints."""
 
     request_body: Dict[str, Any] = {}
@@ -330,8 +406,44 @@ def _build_code_assist_request_payload(payload: Dict[str, Any]) -> Dict[str, Any
         request_body["safetySettings"] = copy.deepcopy(DEFAULT_SAFETY_SETTINGS)
 
     generation_config = request_body.get("generationConfig")
-    if generation_config is None:
-        request_body["generationConfig"] = {}
+    if not isinstance(generation_config, dict):
+        generation_config = {}
+        request_body["generationConfig"] = generation_config
+
+    thinking_config = generation_config.get("thinkingConfig")
+    if not isinstance(thinking_config, dict):
+        thinking_config = {}
+        generation_config["thinkingConfig"] = thinking_config
+
+    thinking_budget = _get_thinking_budget(model_name)
+    include_thoughts = _should_include_thoughts(model_name)
+
+    if thinking_budget is not None:
+        if "thinkingBudget" in thinking_config and thinking_budget == -1:
+            pass
+        else:
+            thinking_config["thinkingBudget"] = thinking_budget
+
+    if include_thoughts is not None:
+        thinking_config["includeThoughts"] = include_thoughts
+
+    if _is_search_variant(model_name):
+        tools_value = request_body.get("tools")
+        if tools_value is None:
+            tools_list = []
+        elif isinstance(tools_value, list):
+            tools_list = tools_value
+        elif isinstance(tools_value, (tuple, set)):
+            tools_list = list(tools_value)
+        else:
+            tools_list = [tools_value]
+
+        has_search_tool = any(
+            isinstance(tool, dict) and tool.get("googleSearch") is not None for tool in tools_list
+        )
+        if not has_search_tool:
+            tools_list.append({"googleSearch": {}})
+        request_body["tools"] = tools_list
 
     request_body.pop("model", None)
 
@@ -528,7 +640,10 @@ async def _build_cli_oauth_request(
     request_envelope = {
         "model": code_assist_model,
         "project": project_id,
-        "request": _build_code_assist_request_payload(serialized_payload),
+        "request": _build_code_assist_request_payload(
+            serialized_payload,
+            model_name=normalized_model,
+        ),
     }
 
     return account_id, credentials, metadata, request_envelope
