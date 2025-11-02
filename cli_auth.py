@@ -40,27 +40,6 @@ CODE_ASSIST_ENDPOINT = "https://cloudcode-pa.googleapis.com"
 
 _MODEL_PREFIXES = ("models/", "tunedModels/", "cachedContents/")
 
-DEFAULT_SAFETY_SETTINGS = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_IMAGE_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_IMAGE_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_IMAGE_HATE", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_IMAGE_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_UNSPECIFIED", "threshold": "BLOCK_NONE"},
-]
-
-_CODE_ASSIST_MODEL_SUFFIXES = (
-    "-search-maxthinking",
-    "-search-nothinking",
-    "-maxthinking",
-    "-nothinking",
-    "-search",
-)
-
 CLI_VERSION = "0.1.5"
 
 
@@ -384,49 +363,6 @@ def _serialize_cli_payload(value: Any) -> Any:
     return value
 
 
-def _build_code_assist_request_payload(
-    payload: Dict[str, Any],
-    *,
-    model_name: str,
-) -> Dict[str, Any]:
-    """Construct the request body expected by Code Assist endpoints."""
-
-    request_body: Dict[str, Any] = {}
-    for key, value in payload.items():
-        if value is None:
-            continue
-        request_body[key] = value
-
-    if "safetySettings" not in request_body:
-        request_body["safetySettings"] = copy.deepcopy(DEFAULT_SAFETY_SETTINGS)
-
-    generation_config = request_body.get("generationConfig")
-    if not isinstance(generation_config, dict):
-        generation_config = {}
-        request_body["generationConfig"] = generation_config
-
-    thinking_config = generation_config.get("thinkingConfig")
-    if not isinstance(thinking_config, dict):
-        thinking_config = {}
-        generation_config["thinkingConfig"] = thinking_config
-
-    thinking_budget = _get_thinking_budget(model_name)
-    include_thoughts = _should_include_thoughts(model_name)
-
-    if thinking_budget is not None:
-        if "thinkingBudget" in thinking_config and thinking_budget == -1:
-            pass
-        else:
-            thinking_config["thinkingBudget"] = thinking_budget
-
-    if include_thoughts is not None:
-        thinking_config["includeThoughts"] = include_thoughts
-
-    request_body.pop("model", None)
-
-    return request_body
-
-
 def _format_code_assist_error(response: httpx.Response) -> str:
     try:
         data = response.json()
@@ -612,15 +548,11 @@ async def _build_cli_oauth_request(
     )
 
     normalized_model = resolve_cli_model_name(db, model_name)
-    code_assist_model = _simplify_code_assist_model(normalized_model)
     serialized_payload = _serialize_cli_payload(payload)
     request_envelope = {
-        "model": code_assist_model,
+        "model": normalized_model,
         "project": project_id,
-        "request": _build_code_assist_request_payload(
-            serialized_payload,
-            model_name=normalized_model,
-        ),
+        "request": serialized_payload,
     }
 
     return account_id, credentials, metadata, request_envelope
