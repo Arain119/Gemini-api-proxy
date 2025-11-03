@@ -30,10 +30,14 @@ from app.admin.api_models import (
 
 logger = logging.getLogger(__name__)
 
-CLI_DEFAULT_CLIENT_ID = (
-    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+CLI_DEFAULT_CLIENT_ID = os.getenv(
+    "CLI_CLIENT_ID",
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
 )
-CLI_DEFAULT_CLIENT_SECRET = "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"
+CLI_DEFAULT_CLIENT_SECRET = os.getenv(
+    "CLI_CLIENT_SECRET",
+    "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",
+)
 CLI_LOOPBACK_DEFAULT_HOST = "127.0.0.1"
 CLI_LOOPBACK_DEFAULT_PORT = 8765
 CLI_LOOPBACK_REDIRECT_PATH = "/oauth2callback"
@@ -1024,6 +1028,8 @@ async def start_cli_auth_flow(
         include_granted_scopes="true",
         prompt="consent",
     )
+
+    logger.info("CLI OAuth redirect_uri=%s base_url=%s", redirect_uri, base_url)
 
     session = CliAuthSession(
         flow=flow,

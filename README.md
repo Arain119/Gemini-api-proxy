@@ -131,11 +131,50 @@ python -m app.runtime.server
 | `API_BASE_URL` | (空) | 显式指定后端 Base URL，Streamlit 将使用该值调用 API。 |
 | `STREAMLIT_BASE_URL` | (空) | Streamlit 对外访问地址，供自定义域名场景使用。 |
 | `RENDER_EXTERNAL_URL` | (自动) | Render 注入的公网域名，CLI OAuth 回调会使用。 |
+| `CLI_CLIENT_ID` | 官方 CLI Client ID | 自定义 Google OAuth 客户端 ID，启用线上授权时必填。 |
+| `CLI_CLIENT_SECRET` | 官方 CLI Client Secret | 自定义 Google OAuth 客户端密钥，需与 `CLI_CLIENT_ID` 配套。 |
+| `CLI_REDIRECT_BASE_URL` | (自动推断) | 强制指定 OAuth 回调基准域名，Render/自定义域建议显式设置。 |
 | `ENABLE_KEEP_ALIVE` | `true`(Render)/`false`(其他) | 是否默认启用保活任务。 |
 | `KEEP_ALIVE_INTERVAL` | `10` | 保活任务触发间隔（分钟）。 |
 | `CORS_ORIGINS` | `*` | 允许的 CORS 来源列表，逗号分隔。 |
 
 更多运行时配置（如 Failover、DeepThink、搜索策略等）可在控制台页面直接修改，无需更改环境变量。
+
+---
+
+## 在线 OAuth 授权教程（Google CLI 凭证）
+
+若要在 Render、Hugging Face 等公网环境完成 Google OAuth 登录，必须使用自己创建的 OAuth Client（不能继续使用官方 `Gemini Code Assist and Gemini CLI` 默认凭证）。操作步骤如下：
+
+1. **创建 OAuth 客户端**
+   - 访问 *[Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)*。
+   - 选择 *Create Credentials → OAuth client ID*（[参考文档](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred)），将应用类型设置为 **Web application**。
+   - 在 *Authorized redirect URIs* 中添加：
+     - 线上域名：`https://<你的域名>/admin/cli-auth/callback`（Render 例：`https://<render-service>.onrender.com/admin/cli-auth/callback`）。
+     - 可选：本地调试时保留 `http://127.0.0.1:8765/oauth2callback`、`http://localhost:8765/oauth2callback`（[Loopback 说明](https://developers.google.com/identity/protocols/oauth2/native-app#redirect-uri_loopback)）。
+   - 保存后记录生成的 Client ID、Client Secret。
+
+2. **配置部署环境变量**
+   - `CLI_CLIENT_ID`：填入新建的 Client ID（可在 [Credentials 页面](https://console.cloud.google.com/apis/credentials) 查看）。
+   - `CLI_CLIENT_SECRET`：填入 Client Secret。
+   - `CLI_REDIRECT_BASE_URL`：你的公网域名（例：`https://<render-service>.onrender.com` 或自定义域）。如使用反向代理/CDN，需与最终访问域名一致（可参考 [Render 自定义域文档](https://render.com/docs/custom-domains)）。
+   - Render 用户可保留 `RENDER_EXTERNAL_URL` 辅助推断，但显式设置 `CLI_REDIRECT_BASE_URL` 可避免头信息缺失导致的回调错误。
+
+3. **重新部署并验证日志**
+   - 重启服务后，查看日志中是否出现 `Starting CLI OAuth flow: base_url=...`。若仍显示 `http://127.0.0.1/...`，说明转发头或环境变量配置不正确（Render 日志位置：[Dashboard ➝ Logs](https://dashboard.render.com/)）。
+
+4. **在控制台发起授权**
+   - 登录 `/admin` 控制台 → “密钥管理 → Gemini CLI”。（默认面板地址示例：`https://<你的域名>`）
+   - 点击“在线授权”，系统会返回 Google 登录链接并在新标签页打开。
+   - 完成登录后，浏览器会跳转回 `.../admin/cli-auth/callback` 并提示成功。
+   - 返回控制台，通常几秒内会看到新建的 CLI 账号；若状态未刷新可手动点击右上角刷新按钮。
+
+5. **常见问题排查**
+   - **redirect_uri_mismatch**：回调地址未加入 OAuth 客户端白名单（详见 [Google 错误说明](https://developers.google.com/identity/protocols/oauth2/web-server#redirect-uri_mismatch)），返回步骤 1 检查配置。
+   - **仍跳到 localhost 回调**：转发头缺失或 `CLI_REDIRECT_BASE_URL` 未设置，请检查日志中 base_url 是否正确（Render 反向代理头参考：[官方文档](https://render.com/docs/configure-ssl#forwarded-headers)）。
+   - **授权成功但未生成密钥**：确认数据库可写，或在“日志”页面查看 `cli-auth` 模块输出的异常信息（可在 `/admin` → “日志”或 Render Logs 中查看）。
+
+完成上述配置后，即可在公网环境中完成 Google OAuth 登录并自动注入 CLI 账号池。
 
 ---
 
@@ -254,4 +293,3 @@ python -m app.runtime.server
 ## 贡献
 
 欢迎提交 Issue 或 Pull Request，协助完善 CLI 体验、更多模型映射、自动化测试以及运维工具链。
-

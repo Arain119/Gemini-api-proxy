@@ -9,6 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 from typing import Optional
 
@@ -70,12 +71,36 @@ def _resolve_cli_base_url(request: Request) -> str:
         if candidate:
             return candidate.rstrip("/")
 
+    forwarded_header = request.headers.get("forwarded")
+    if forwarded_header:
+        first = forwarded_header.split(",")[0]
+        params: dict[str, str] = {}
+        for part in first.split(";"):
+            if "=" in part:
+                key, value = part.strip().split("=", 1)
+                params[key.lower()] = value.strip().strip('"')
+        host = params.get("host")
+        proto = params.get("proto")
+        if host:
+            scheme = proto or request.url.scheme
+            return f"{scheme}://{host}"
+
     forwarded_host = request.headers.get("x-forwarded-host")
     forwarded_proto = request.headers.get("x-forwarded-proto")
     if forwarded_host:
         host = forwarded_host.split(",")[0].strip()
         proto = forwarded_proto.split(",")[0].strip() if forwarded_proto else request.url.scheme
         return f"{proto}://{host}"
+
+    forwarded_server = request.headers.get("x-forwarded-server")
+    if forwarded_server:
+        host = forwarded_server.split(",")[0].strip()
+        proto = forwarded_proto.split(",")[0].strip() if forwarded_proto else request.url.scheme
+        return f"{proto}://{host}"
+
+    origin_header = request.headers.get("origin")
+    if origin_header and "://" in origin_header:
+        return origin_header.rstrip("/")
 
     base_url = str(request.base_url).rstrip("/")
     if base_url and not base_url.endswith(":0"):
@@ -362,7 +387,7 @@ async def api_v1_info(
     keep_alive_enabled: bool = Depends(get_keep_alive_enabled)
 ):
     render_url = os.getenv('RENDER_EXTERNAL_URL')
-    base_url = render_url if render_url else 'https://your-service.onrender.com'
+    base_url = render_url if render_url else settings.resolved_api_base_url
     return {
         "service": "Gemini API Proxy",
         "version": "2.0",
@@ -914,6 +939,29 @@ async def start_cli_auth_endpoint(
         auto_finalize = bool(raw_auto)
 
     base_url = _resolve_cli_base_url(request_obj)
+    if not base_url.startswith("http"):
+        scheme = request_obj.headers.get("x-forwarded-proto", request_obj.url.scheme)
+        base_url = f"{scheme}://{base_url}" if not base_url.startswith("//") else f"{scheme}:{base_url}"
+    else:
+        parsed = urlsplit(base_url)
+        target_scheme = parsed.scheme
+        forwarded_proto = request_obj.headers.get("x-forwarded-proto")
+        if forwarded_proto:
+            target_scheme = forwarded_proto.split(",")[0].strip()
+        elif parsed.hostname and parsed.hostname.endswith(".onrender.com"):
+            target_scheme = "https"
+
+        if target_scheme and target_scheme != parsed.scheme:
+            base_url = urlunsplit((target_scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+
+    logger.info(
+        "Starting CLI OAuth flow: base_url=%s resolved_api=%s host=%s xfwd_host=%s forwarded=%s",
+        base_url,
+        settings.resolved_api_base_url,
+        request_obj.headers.get("host"),
+        request_obj.headers.get("x-forwarded-host"),
+        request_obj.headers.get("forwarded"),
+    )
 
     return await start_cli_auth_flow(
         db=db,
