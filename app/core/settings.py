@@ -52,6 +52,7 @@ class Settings:
     api_base_url: Optional[str] = field(default_factory=lambda: os.getenv("API_BASE_URL"))
     streamlit_base_url: Optional[str] = field(default_factory=lambda: os.getenv("STREAMLIT_BASE_URL"))
     render_external_url: Optional[str] = field(default_factory=lambda: os.getenv("RENDER_EXTERNAL_URL"))
+    cli_redirect_base_url: Optional[str] = field(default_factory=lambda: os.getenv("CLI_REDIRECT_BASE_URL"))
 
     cors_origins: List[str] = field(default_factory=lambda: _get_list("CORS_ORIGINS", ["*"]))
 

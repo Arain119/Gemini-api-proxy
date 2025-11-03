@@ -14,7 +14,7 @@ from typing import Optional
 
 import psutil
 import sys
-from fastapi import (APIRouter, Depends, File, Header, HTTPException,
+from fastapi import (APIRouter, Body, Depends, File, Header, HTTPException,
                      Request, UploadFile)
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
@@ -58,6 +58,30 @@ from app.admin.cli_auth import (
     fail_cli_auth_flow,
 )
 from app.core.settings import settings
+
+
+def _resolve_cli_base_url(request: Request) -> str:
+    candidates = (
+        settings.cli_redirect_base_url,
+        settings.streamlit_base_url,
+        settings.render_external_url,
+    )
+    for candidate in candidates:
+        if candidate:
+            return candidate.rstrip("/")
+
+    forwarded_host = request.headers.get("x-forwarded-host")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_host:
+        host = forwarded_host.split(",")[0].strip()
+        proto = forwarded_proto.split(",")[0].strip() if forwarded_proto else request.url.scheme
+        return f"{proto}://{host}"
+
+    base_url = str(request.base_url).rstrip("/")
+    if base_url and not base_url.endswith(":0"):
+        return base_url
+
+    return settings.resolved_api_base_url.rstrip("/")
 
 
 logger = logging.getLogger(__name__)
@@ -875,10 +899,11 @@ async def ping_keep_alive():
     response_model=CliAuthStartResponse,
 )
 async def start_cli_auth_endpoint(
-    request: Optional[dict] = None,
+    request_obj: Request,
+    payload: Optional[dict] = Body(default=None),
     db: Database = Depends(get_db),
 ):
-    payload = request or {}
+    payload = payload or {}
     label = payload.get("label")
     raw_auto = payload.get("auto_finalize", True)
     if isinstance(raw_auto, bool):
@@ -888,10 +913,12 @@ async def start_cli_auth_endpoint(
     else:
         auto_finalize = bool(raw_auto)
 
+    base_url = _resolve_cli_base_url(request_obj)
+
     return await start_cli_auth_flow(
         db=db,
         label=label,
-        base_url=settings.resolved_api_base_url,
+        base_url=base_url,
         auto_finalize=auto_finalize,
     )
 

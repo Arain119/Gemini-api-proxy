@@ -1,7 +1,9 @@
 import os
+import socket
 import subprocess
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +28,18 @@ def _build_command() -> list[str]:
         "127.0.0.1",
     ]
 
+def _wait_for_streamlit_ready(process: subprocess.Popen, port: int, timeout: float = 30.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Streamlit 进程启动失败，已提前退出")
+        try:
+            with closing(socket.create_connection(("127.0.0.1", port), timeout=1.0)):
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise TimeoutError("等待 Streamlit 端口就绪超时")
+
 
 def start_streamlit() -> subprocess.Popen:
     env = os.environ.copy()
@@ -43,7 +57,15 @@ def start_streamlit() -> subprocess.Popen:
         stdout=sys.stdout,
         stderr=sys.stderr,
     )
-    time.sleep(1.0)
+    try:
+        _wait_for_streamlit_ready(process, settings.streamlit_internal_port)
+    except Exception:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise
     return process
 
 
