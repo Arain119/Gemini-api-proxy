@@ -179,7 +179,11 @@ async def proxy_admin(request: Request, path: str):
     return await _proxy_request(request, sub_path)
 
 
-@router.api_route("/_stcore/{path:path}", methods=["GET", "POST", "OPTIONS", "HEAD"], include_in_schema=False)
+@router.api_route(
+    "/_stcore/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
 async def proxy_streamlit_core(request: Request, path: str):
     target = f"/_stcore/{path}" if path else "/_stcore"
     return await _proxy_request(request, target)

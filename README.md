@@ -105,6 +105,41 @@ python -m app.runtime.server
    - 部署完成后访问 `<外网域名>/admin`，使用 `admin / GEMINI_AUTH_PASSWORD` 登录。
    - 在“密钥管理”页面发起 CLI 授权或导入 API Key。
 
+### 在线 OAuth 授权（Google CLI 凭证）
+
+Render 等公网环境要完成 Google OAuth 登录，必须使用自行创建的 OAuth Client：
+
+1. **在 Google Cloud 创建 Client ID**
+   - 打开 *[Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)* 并点击 *Create Credentials → OAuth client ID*（[官方步骤](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred)）。
+   - 在弹出的“Create OAuth client ID”页面中：
+     1. **Application type**：选择 **Web application**。
+     2. **Name**：填写便于识别的名称（如 `render`），仅用于控制台展示。
+     3. **Authorized JavaScript origins**：添加 `https://<你的 Render 域名或自定义域>`（例如 `https://example.onrender.com`）。
+     4. **Authorized redirect URIs**：添加 `https://<你的域名>/admin/cli-auth/callback`（确保路径完整包含 `/admin/cli-auth/callback`）。
+     5. 点击 **Create** 保存；Google 会弹出包含 Client ID 与 Client Secret 的对话框，并提示“设置可能需要 5 分钟到几小时才会生效”。
+   - 将 Client ID、Client Secret 妥善保存（后续步骤需要使用）。
+
+2. **在 Render 环境设置变量**
+   - 在服务的 *Environment → Environment Variables* 内新增：
+   - `CLI_CLIENT_ID=<刚创建的 Client ID>`（可在 [Credentials 列表](https://console.cloud.google.com/apis/credentials) 查到）。
+   - `CLI_CLIENT_SECRET=<对应的 Client Secret>`。
+   - `CLI_REDIRECT_BASE_URL=https://<你的 Render 域名或自定义域>`（需与外网访问域保持一致，可参考 [Render 自定义域](https://render.com/docs/custom-domains)）。
+   - 保留 `RENDER_EXTERNAL_URL` 以便日志和备用推断。
+
+3. **重新部署并确认日志**
+   - 改动后重新部署；查看 Render Logs（[Dashboard ➝ Logs](https://dashboard.render.com/)），确认启动日志包含 `CLI OAuth redirect_uri=...` 且域名正确。
+
+4. **控制台发起授权**
+   - 登录 `/admin` → “密钥管理 → Gemini CLI”。
+   - 点击“在线授权”，弹出的 Google 登录页应展示你自定义的客户端名称。
+   - 完成登录后回调到 `.../admin/cli-auth/callback`，页面提示成功即表示凭证已写入。
+   - 返回控制台，几秒内即可看到新增的 CLI 账号；如未刷新可手动点击刷新按钮。
+
+5. **常见问题**
+   - `redirect_uri_mismatch`：回调地址未加入白名单或仍在使用旧的 Client ID，请回到步骤 1、2 检查。
+   - 页面仍显示 “Gemini Code Assist and Gemini CLI”：新的环境变量未生效，确认在 Render 中保存后已重启。
+   - 授权成功但未生成密钥：检查数据库是否可写，或在控制台“日志”页面查看 `cli-auth` 模块输出。
+
 > 建议为 `gemini_proxy.db` 配置持久卷，或迁移至外部数据库，以保留 CLI 凭证与统计数据。
 
 ---
@@ -139,42 +174,6 @@ python -m app.runtime.server
 | `CORS_ORIGINS` | `*` | 允许的 CORS 来源列表，逗号分隔。 |
 
 更多运行时配置（如 Failover、DeepThink、搜索策略等）可在控制台页面直接修改，无需更改环境变量。
-
----
-
-## 在线 OAuth 授权教程（Google CLI 凭证）
-
-若要在 Render、Hugging Face 等公网环境完成 Google OAuth 登录，必须使用自己创建的 OAuth Client（不能继续使用官方 `Gemini Code Assist and Gemini CLI` 默认凭证）。操作步骤如下：
-
-1. **创建 OAuth 客户端**
-   - 访问 *[Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)*。
-   - 选择 *Create Credentials → OAuth client ID*（[参考文档](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred)），将应用类型设置为 **Web application**。
-   - 在 *Authorized redirect URIs* 中添加：
-     - 线上域名：`https://<你的域名>/admin/cli-auth/callback`（Render 例：`https://<render-service>.onrender.com/admin/cli-auth/callback`）。
-     - 可选：本地调试时保留 `http://127.0.0.1:8765/oauth2callback`、`http://localhost:8765/oauth2callback`（[Loopback 说明](https://developers.google.com/identity/protocols/oauth2/native-app#redirect-uri_loopback)）。
-   - 保存后记录生成的 Client ID、Client Secret。
-
-2. **配置部署环境变量**
-   - `CLI_CLIENT_ID`：填入新建的 Client ID（可在 [Credentials 页面](https://console.cloud.google.com/apis/credentials) 查看）。
-   - `CLI_CLIENT_SECRET`：填入 Client Secret。
-   - `CLI_REDIRECT_BASE_URL`：你的公网域名（例：`https://<render-service>.onrender.com` 或自定义域）。如使用反向代理/CDN，需与最终访问域名一致（可参考 [Render 自定义域文档](https://render.com/docs/custom-domains)）。
-   - Render 用户可保留 `RENDER_EXTERNAL_URL` 辅助推断，但显式设置 `CLI_REDIRECT_BASE_URL` 可避免头信息缺失导致的回调错误。
-
-3. **重新部署并验证日志**
-   - 重启服务后，查看日志中是否出现 `Starting CLI OAuth flow: base_url=...`。若仍显示 `http://127.0.0.1/...`，说明转发头或环境变量配置不正确（Render 日志位置：[Dashboard ➝ Logs](https://dashboard.render.com/)）。
-
-4. **在控制台发起授权**
-   - 登录 `/admin` 控制台 → “密钥管理 → Gemini CLI”。（默认面板地址示例：`https://<你的域名>`）
-   - 点击“在线授权”，系统会返回 Google 登录链接并在新标签页打开。
-   - 完成登录后，浏览器会跳转回 `.../admin/cli-auth/callback` 并提示成功。
-   - 返回控制台，通常几秒内会看到新建的 CLI 账号；若状态未刷新可手动点击右上角刷新按钮。
-
-5. **常见问题排查**
-   - **redirect_uri_mismatch**：回调地址未加入 OAuth 客户端白名单（详见 [Google 错误说明](https://developers.google.com/identity/protocols/oauth2/web-server#redirect-uri_mismatch)），返回步骤 1 检查配置。
-   - **仍跳到 localhost 回调**：转发头缺失或 `CLI_REDIRECT_BASE_URL` 未设置，请检查日志中 base_url 是否正确（Render 反向代理头参考：[官方文档](https://render.com/docs/configure-ssl#forwarded-headers)）。
-   - **授权成功但未生成密钥**：确认数据库可写，或在“日志”页面查看 `cli-auth` 模块输出的异常信息（可在 `/admin` → “日志”或 Render Logs 中查看）。
-
-完成上述配置后，即可在公网环境中完成 Google OAuth 登录并自动注入 CLI 账号池。
 
 ---
 
