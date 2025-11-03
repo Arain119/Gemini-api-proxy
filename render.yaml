@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: gemini-api-proxy-beta
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+    startCommand: python -m app.runtime.server
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: STREAMLIT_INTERNAL_PORT
+        value: "7000"
