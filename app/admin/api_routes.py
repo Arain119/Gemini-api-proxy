@@ -156,8 +156,8 @@ SUPPORTED_MIME_TYPES = {
 # General and v1 API Routes
 # ===============================================================================
 
-@router.get("/", summary="服务根端点", tags=["通用"])
-async def root(
+@router.get("/service-info", summary="服务信息概览", tags=["通用"])
+async def service_info(
     db: Database = Depends(get_db),
     keep_alive_enabled: bool = Depends(get_keep_alive_enabled)
 ):
