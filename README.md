@@ -1,90 +1,20 @@
 # Gemini API Proxy 2.0
 
-Gemini API Proxy 2.0 是一个面向 Render / 本地单实例部署的 Gemini 反向代理与运维平台。项目将 FastAPI、Streamlit、任务调度及多账号池管理整合在同一进程中，既能兼容原生 Gemini/Google Generative AI 接口，也提供 OpenAI 格式的 `/v1/chat/completions` 端点与图形化控制台，帮助团队快速落地 Gemini 能力并维持稳定运行。
+Gemini API Proxy 2.0 是一个面向 Render / 本地单实例部署的 Gemini 反向代理与运维平台。项目将 FastAPI、Streamlit、任务调度及多账号池管理整合在同一进程中，既能兼容原生 Gemini/Google Generative AI 接口，也提供 OpenAI 格式的 `/v1/chat/completions` 端点与图形化控制台。
 
 ---
 
 ## 核心特性
 
-- **双账号池调度**：内置 Gemini CLI OAuth 与普通 API Key 两类凭据，按优先级与健康度自动分配请求。
+- **双账号池调度**：支持导入 Gemini CLI 凭证与普通 API Key，按优先级与健康度自动分配请求。
 - **OpenAI 兼容层**：兼容大部分 Chat Completions 能力，含流式响应、模型列表等，便于接入现有 SDK。
 - **模型映射与限额管理**：支持别名、RPM/RPD/TPM 限额、思考预算、流式模式等细粒度配置，并向 CLI 账号自动暴露 `*-search` 模型。
 - **健康检测与故障转移**：带有队列限流、速率缓存、自动熔断/恢复、失败任务清理与多重保活机制。
 - **DeepThink 多轮推理**：可选的链式思考流程，按需串联搜索、代码沙盒和分析步骤，自动决定迭代轮次（最多 7 轮）。
-- **可视化控制台**：Streamlit 仪表盘整合使用率、密钥/账号管理、模型配置、日志查看、任务运行状态与一键 CLI 登录。
+- **可视化控制台**：Streamlit 仪表盘整合使用率、密钥/账号管理、模型配置、日志查看、任务运行状态与 CLI 凭证导入。
 - **任务调度与持久化**：APScheduler 周期触发保活、健康巡检、自动清理等任务；SQLite（或自定义数据库）持久化配置信息、使用记录与授权凭据。
 - **一键部署模板**：随仓库提供 `render.yaml`，在 Render Blueprint 中即可完成持续部署。
 
----
-
-## 架构概览
-
-```
-┌───────────────────────┐
-│  Streamlit 控制台 (UI) │  <---> 终端用户
-└─────────────┬─────────┘
-              │ 反向代理 (app.runtime.streamlit)
-┌─────────────▼─────────┐
-│   FastAPI 主服务        │
-│  ├─ / (公开 API)       │
-│  ├─ /admin (管理 API)  │
-│  └─ /v1/* (OpenAI 兼容)│
-└─────────────┬─────────┘
-              │
-      ┌───────▼─────────┐
-      │ 服务子模块       │
-      │  ├─ 账号池/队列  │
-      │  ├─ CLI OAuth    │
-      │  ├─ Failover     │
-      │  └─ Scheduler    │
-      └────────┬────────┘
-               │
-        ┌──────▼──────┐
-        │ 持久化层    │  (SQLite / 外部数据库)
-        └─────────────┘
-```
-
-所有组件运行在同一 Python 进程内：FastAPI 负责 API，Streamlit 子进程通过内置反向代理暴露，数据库写入采用异步队列串行化，任务调度器按配置启动/关闭。
-
----
-
-## 快速开始
-
-### 环境要求
-
-- Python 3.10+
-- 可访问外网（Gemini 接口、Google OAuth、DuckDuckGo 搜索等）
-- （可选）Google Cloud CLI 账号用于 CLI OAuth
-
-### 克隆与安装
-
-```bash
-git clone https://github.com/your-org/gemini-api-proxy.git
-cd gemini-api-proxy
-python -m venv .venv
-.\.venv\Scripts\activate  # Windows
-# 或 source .venv/bin/activate  # macOS/Linux
-pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
-```
-
-### 启动服务
-
-```bash
-# 默认监听 0.0.0.0:8000，Streamlit 控制台占用 127.0.0.1:7000
-python -m app.runtime.server
-```
-
-启动成功后：
-
-- 管理后台（Streamlit）：`http://127.0.0.1:8000/admin`
-- OpenAI 兼容端点：`POST http://127.0.0.1:8000/v1/chat/completions`
-- 原生 Gemini 端点：`POST http://127.0.0.1:8000/v1beta/models/{model}:generateContent`
-- 健康检查：`GET http://127.0.0.1:8000/health`
-
-首次运行会在仓库根目录生成 `gemini_proxy.db` 作为默认 SQLite 数据库。
-
----
 
 ## Render 部署指南
 
@@ -96,111 +26,47 @@ python -m app.runtime.server
 3. **构建与启动命令**  
    - 构建：`pip install --upgrade pip setuptools wheel && pip install -r requirements.txt`
    - 启动：`python -m app.runtime.server`
-4. **配置环境变量（示例）**
-   - `GEMINI_AUTH_PASSWORD`：控制台登录口令。
-   - `ADMIN_AUTH_TOKEN`：OpenAI 兼容层基础认证（用户名固定为 `admin`）。
-   - `RENDER_EXTERNAL_URL`：Render 自动注入，用于生成 CLI OAuth 回调地址。
-   - `QUEUE_MAX_CONCURRENCY`、`QUEUE_MAX_WAIT_MS`：按机器性能微调。
-5. **首登与 CLI OAuth**
-   - 部署完成后访问 `<外网域名>/admin`，使用 `admin / GEMINI_AUTH_PASSWORD` 登录。
-   - 在“密钥管理”页面发起 CLI 授权或导入 API Key。
+4. **首登与 CLI 凭证导入**
+   - 部署完成后点击页面中的 https://gemini-api-proxy-xx.onrender.com 即可访问。
+   - 在“密钥管理”页面点击“导入 CLI 凭证”，粘贴本地 `gemini-cli login` 导出或在线获取的 JSON；成功后即可沿用官方 CLI 的免费额度。
 
-### 在线 OAuth 授权（Google CLI 凭证）
+### 获取并导入 gemini-cli 凭证
 
-Render 等公网环境要完成 Google OAuth 登录，必须使用自行创建的 OAuth Client：
+要沿用官方 CLI 的免费额度，需要先取得一份有效的 CLI OAuth 凭证（JSON），然后在控制台导入。可以选择本地 CLI 或线上工具：
 
-1. **在 Google Cloud 创建 Client ID**
-   - 打开 *[Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials)* 并点击 *Create Credentials → OAuth client ID*（[官方步骤](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred)）。
-   - 在弹出的“Create OAuth client ID”页面中：
-     1. **Application type**：选择 **Web application**。
-     2. **Name**：填写便于识别的名称（如 `render`），仅用于控制台展示。
-     3. **Authorized JavaScript origins**：添加 `https://<你的 Render 域名或自定义域>`（例如 `https://example.onrender.com`）。
-     4. **Authorized redirect URIs**：添加 `https://<你的域名>/admin/cli-auth/callback`（确保路径完整包含 `/admin/cli-auth/callback`）。
-     5. 点击 **Create** 保存；Google 会弹出包含 Client ID 与 Client Secret 的对话框，并提示“设置可能需要 5 分钟到几小时才会生效”。
-   - 将 Client ID、Client Secret 妥善保存（后续步骤需要使用）。
+**方式 A：本地 `gemini-cli` 登录**
 
-2. **在 Render 环境设置变量**
-   - 在服务的 *Environment → Environment Variables* 内新增：
-   - `CLI_CLIENT_ID=<刚创建的 Client ID>`（可在 [Credentials 列表](https://console.cloud.google.com/apis/credentials) 查到）。
-   - `CLI_CLIENT_SECRET=<对应的 Client Secret>`。
-   - `CLI_REDIRECT_BASE_URL=https://<你的 Render 域名或自定义域>`（需与外网访问域保持一致，可参考 [Render 自定义域](https://render.com/docs/custom-domains)）。
-   - 保留 `RENDER_EXTERNAL_URL` 以便日志和备用推断。
+1. 安装 CLI：`npm install -g @google/geminicli`。
+2. 执行 `gemini-cli login`，按提示完成浏览器授权。
+3. 登录成功后，终端会输出 JSON 凭证（同时写入 `~/.config/geminicli/`），包含 `client_id`、`client_secret`、`refresh_token`、`token_uri`、`project_id` 等。
 
-3. **重新部署并确认日志**
-   - 改动后重新部署；查看 Render Logs（[Dashboard ➝ Logs](https://dashboard.render.com/)），确认启动日志包含 `CLI OAuth redirect_uri=...` 且域名正确。
+**方式 B：在线获取（免本地安装）**
 
-4. **控制台发起授权**
-   - 登录 `/admin` → “密钥管理 → Gemini CLI”。
-   - 点击“在线授权”，弹出的 Google 登录页应展示你自定义的客户端名称。
-   - 完成登录后回调到 `.../admin/cli-auth/callback`，页面提示成功即表示凭证已写入。
-   - 返回控制台，几秒内即可看到新增的 CLI 账号；如未刷新可手动点击刷新按钮。
+我们通过 sukaka 老师搭建的认证网站来获取凭证。赞美 sukaka 老师！
 
-5. **常见问题**
-   - `redirect_uri_mismatch`：回调地址未加入白名单或仍在使用旧的 Client ID，请回到步骤 1、2 检查。
-   - 页面仍显示 “Gemini Code Assist and Gemini CLI”：新的环境变量未生效，确认在 Render 中保存后已重启。
-   - 授权成功但未生成密钥：检查数据库是否可写，或在控制台“日志”页面查看 `cli-auth` 模块输出。
+1. 访问认证网站：[http://gcli-auth.sukaka.top:7861/](http://gcli-auth.sukaka.top:7861/)。
+2. 输入访问密码：`pwd`，即可进入 Google OAuth 认证页面。
+3. **获取认证链接**：
+   - 在页面中可以直接点击“获取认证链接”按钮。
+4. **Google 账号认证**：
+   - 点击刚生成的长链接会打开 Google 登录页面。
+   - 登录完成后会得到一个错误页面，此时需要在浏览器地址栏把 `localhost` 改成 `gcli-auth.sukaka.top`，其余部分（包括冒号后的端口）保持不变，然后按回车访问。
+   - 页面显示 “OAuth authentication successful!” 即表示认证成功，可直接关闭该页面。
+5. **获取认证文件**：
+   - 回到认证网站，点击“获取认证文件”，待提示“步骤二：认证成功”后点击“下载认证文件”。
+   - 下载的内容就是与官方 CLI 相同格式的 JSON 凭证，也可以直接复制页面中的 JSON 文本。
 
-> 建议为 `gemini_proxy.db` 配置持久卷，或迁移至外部数据库，以保留 CLI 凭证与统计数据。
+**导入到控制台**
 
----
+1. 打开 “密钥管理 → Gemini CLI” → “导入 CLI 凭证”。
+2. 将上述获取的 JSON 原样粘贴提交。
+3. 系统会创建 `cli-account-*` 记录并保存 refresh token，后续请求将继续使用官方 CLI 的 OAuth 客户端，从而继承免费额度。
 
-## 环境变量速查
+**维护与撤销**
 
-| 变量名 | 默认值 | 说明 |
-| :--- | :--- | :--- |
-| `APP_NAME` | `gemini-api-proxy-beta` | 应用名称（影响日志与页面标题）。 |
-| `ENVIRONMENT` | `production` | 环境标识，可用于自定义逻辑。 |
-| `DEBUG` | `false` | 是否开启调试模式。 |
-| `HOST` | `0.0.0.0` | FastAPI 监听地址。 |
-| `PORT` | `8000` | FastAPI 监听端口。 |
-| `RELOAD` | `false` | 是否开启自动重载。 |
-| `ADMIN_AUTH_TOKEN` | `admin-secret` | OpenAI 兼容端点的 HTTP Basic 密码。 |
-| `GEMINI_AUTH_PASSWORD` | `123456` | Streamlit 控制台登录密码。 |
-| `DATABASE_URL` | `sqlite:///./proxy.db` | SQLAlchemy 数据库连接字符串。 |
-| `SQLITE_PATH` | `./proxy.db` | 本地 SQLite 文件路径。 |
-| `QUEUE_MAX_CONCURRENCY` | `4` | 每个模型的最大并发请求数。 |
-| `QUEUE_MAX_WAIT_MS` | `30000` | 请求在队列中等待的超时时间（毫秒）。 |
-| `QUEUE_POLL_INTERVAL_MS` | `50` | 队列轮询间隔。 |
-| `DEFAULT_THINKING_BUDGET` | `-1` | 全局默认思考 token 预算，-1 代表按模型配置。 |
-| `STREAMLIT_INTERNAL_PORT` | `7000` | Streamlit 子进程绑定端口。 |
-| `API_BASE_URL` | (空) | 显式指定后端 Base URL，Streamlit 将使用该值调用 API。 |
-| `STREAMLIT_BASE_URL` | (空) | Streamlit 对外访问地址，供自定义域名场景使用。 |
-| `RENDER_EXTERNAL_URL` | (自动) | Render 注入的公网域名，CLI OAuth 回调会使用。 |
-| `CLI_CLIENT_ID` | 官方 CLI Client ID | 自定义 Google OAuth 客户端 ID，启用线上授权时必填。 |
-| `CLI_CLIENT_SECRET` | 官方 CLI Client Secret | 自定义 Google OAuth 客户端密钥，需与 `CLI_CLIENT_ID` 配套。 |
-| `CLI_REDIRECT_BASE_URL` | (自动推断) | 强制指定 OAuth 回调基准域名，Render/自定义域建议显式设置。 |
-| `ENABLE_KEEP_ALIVE` | `true`(Render)/`false`(其他) | 是否默认启用保活任务。 |
-| `KEEP_ALIVE_INTERVAL` | `10` | 保活任务触发间隔（分钟）。 |
-| `CORS_ORIGINS` | `*` | 允许的 CORS 来源列表，逗号分隔。 |
+- 若凭证失效，可重新获取 JSON（本地或线上方式）再导入。
+- 如需撤销访问，可在 Google 账号的“安全性 → 第三方应用访问权限”中移除 `Gemini Code Assist and Gemini CLI`，然后在控制台删除对应账号。
 
-更多运行时配置（如 Failover、DeepThink、搜索策略等）可在控制台页面直接修改，无需更改环境变量。
-
----
-
-## 控制台使用指南
-
-### 登录与总体状态
-- 登录地址：`/admin`，用户名固定为 `admin`，密码由 `GEMINI_AUTH_PASSWORD` 控制。
-- 仪表盘展示密钥状态、核心指标、近 24 小时请求量、失败率及最近日志。
-
-### 密钥与账号管理
-- **CLI 授权**：点击“Gemini CLI”卡片中的授权按钮即可生成 OAuth 链接，完成 Google 登录后自动持久化为 `cli-account-*`，并注入模型别名与限额。
-- **API Key 导入**：支持批量粘贴或单条添加；配套健康检测、状态切换及一键删除异常密钥。
-- **Failover / 自动清理**：可配置失败阈值、熔断策略、每日清理时段等。
-
-### 模型与调用策略
-- 为每个模型设置别名、上下游映射、RPM/RPD/TPM 限额、思考预算、流式策略。
-- CLI 专用模型（如 `gemini-2.5-pro-search`）会自动映射到真实模型并注入搜索链路。
-
-### DeepThink 与工具搜索
-- 可在“高级功能”页启用 DeepThink，配置最大轮次、是否返回思考内容等。
-- 搜索链路通过 DuckDuckGo 聚合网页摘要，与代码沙盒（受限 Python 环境、4 秒超时）协同工作。
-
-### 系统与日志
-- “系统信息”页展示 CPU/内存、运行时长、支持模型、Keep-Alive 状态等。
-- “请求日志”支持分页查看近 200 条 API 调用明细；支持一键触发保活、健康检查。
-
----
 
 ## API 速览
 
@@ -211,10 +77,8 @@ Render 等公网环境要完成 Google OAuth 登录，必须使用自行创建�
 | Gemini 原生 | `POST /v1beta/{model}:streamGenerateContent` | 流式生成。 |
 | OpenAI 兼容 | `POST /v1/chat/completions` | Chat Completions，支持流式与非流式。 |
 | OpenAI 兼容 | `GET /v1/models` | 列出可用模型（去除 `models/` 前缀）。 |
-| 管理 | `GET /admin/stats` 等 | 仪表盘数据、任务配置、日志、密钥 CRUD、CLI 授权等。 |
-| CLI OAuth | `POST /admin/cli-auth/start` | 生成授权链接并创建会话。 |
-| CLI OAuth | `GET /admin/cli-auth/status` | 查询授权状态。 |
-| CLI OAuth | `POST /admin/cli-auth/import` | 导入本地保存的 OAuth 凭证 JSON。 |
+| 管理 | `GET /admin/stats` 等 | 仪表盘数据、任务配置、日志、密钥 CRUD、CLI 凭证导入等。 |
+| CLI 凭证 | `POST /admin/cli-auth/import` | 导入本地保存的 gemini-cli OAuth 凭证 JSON。 |
 
 所有管理端口均需内部调用或受控前端访问，请勿直接暴露给未授权用户。
 
@@ -236,7 +100,7 @@ Render 等公网环境要完成 Google OAuth 登录，必须使用自行创建�
 
 - 默认使用位于项目根目录的 `gemini_proxy.db`，包含密钥表、CLI 凭证、使用日志、配置项等。
 - 可通过 `DATABASE_URL` 切换至 PostgreSQL、MySQL 等外部数据库。
-- CLI OAuth 凭证会以加密 JSON 存储，包含 `refresh_token`、`client_id`、`client_secret` 等字段。
+- CLI 凭证会以加密 JSON 存储，包含 `refresh_token`、`client_id`、`client_secret` 等字段。
 
 ---
 
@@ -247,27 +111,12 @@ Render 等公网环境要完成 Google OAuth 登录，必须使用自行创建�
 - 为长期运行准备持久化存储，防止实例重建或缩容导致的授权丢失。
 - 在日志或第三方监控中避免暴露实际密钥，可使用项目内的 `mask_key` 工具函数。
 
----
-
-## 常见问题
-
-1. **CLI OAuth 在云端失败**  
-   - 确认 `RENDER_EXTERNAL_URL` 或自定义的 `API_BASE_URL`、`STREAMLIT_BASE_URL` 指向公网 HTTPS 地址。  
-   - Google OAuth 不接受纯 HTTP 回调，需使用 Render 提供的正式域名或手动配置反向代理。
-2. **OpenAI 兼容接口报 401**  
-   - 端点使用 HTTP Basic 认证：用户名固定为 `admin`，密码取自 `ADMIN_AUTH_TOKEN`。
-3. **请求频繁返回 429**  
-   - 可能是队列饱和或模型限额达到上限。检查控制台使用率与 `QUEUE_MAX_CONCURRENCY` 设置。
-4. **Streamlit 控制台打不开**  
-   - 查看服务器日志，确认 `streamlit` 子进程已启动且 `STREAMLIT_INTERNAL_PORT` 未被占用。
-
----
 
 ## 目录结构
 
 ```
 ├── app/
-│   ├── admin/          # 管理 API、数据库层、CLI OAuth、配置服务
+│   ├── admin/          # 管理 API、数据库层、CLI 凭证、配置服务
 │   ├── core/           # 全局设置与缓存
 │   ├── proxy/          # Gemini/OpenAI 路由与适配
 │   ├── runtime/        # 进程启动、Streamlit 代理、守护逻辑
@@ -283,7 +132,7 @@ Render 等公网环境要完成 Google OAuth 登录，必须使用自行创建�
 
 ## 开发与测试
 
-- 代码风格遵循项目现有约定，提交前建议运行 `ruff` 或 `black`（仓库未强制）。
+- 代码风格遵循项目现有约定，提交前建议运行 `ruff` 或 `black`。
 - 可使用 `uvicorn app.server:app --reload` 进行热重载开发。
 - 项目当前未包含自动化测试，可根据需要在 `tests/` 目录中补充。
 
