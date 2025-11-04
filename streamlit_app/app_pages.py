@@ -453,8 +453,13 @@ def render_key_management_page():
                     st.markdown("**方式 A：gemini-cli**")
                     st.code("npm install -g @google/geminicli\ngemini-cli login", language="bash")
                     st.caption("登录成功后，终端会输出 JSON，或在 `~/.config/geminicli/` 中生成凭证文件。")
-                    st.markdown("**方式 B：在线工具（示例）**")
-                    st.write("访问 sukaka 教师搭建的认证站点 [gcli-auth.sukaka.top](http://gcli-auth.sukaka.top:7861/) 并按提示获取 JSON。")
+                    st.markdown("**方式 B：在线获取**")
+                    st.caption("通过 sukaka 老师搭建的认证网站来获取凭证。")
+                    st.write("1. 访问认证网站：[http://gcli-auth.sukaka.top:7861/](http://gcli-auth.sukaka.top:7861/)。")
+                    st.write("2. 输入访问密码：`pwd`，即可进入 Google OAuth 认证页面。")
+                    st.write("3. 点击“获取认证链接”按钮；如需指定项目，可展开“高级选项”。")
+                    st.write("4. 点击生成的链接完成 Google 登录；若出现错误页面，请将浏览器地址栏中的 `localhost` 替换为 `gcli-auth.sukaka.top`（端口和其他参数保持不变），随后页面会提示 “OAuth authentication successful!”。")
+                    st.write("5. 返回认证网站，点击“获取认证文件”，待提示“步骤二：认证成功”后下载或复制 JSON 凭证。")
 
                 manual_json = st.text_area(
                     "粘贴 JSON 凭证内容",
