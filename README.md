@@ -66,7 +66,7 @@ Gemini API Proxy 2.0 是一个面向 Render / 本地单实例部署的 Gemini �
 2. 将上述获取的 JSON 原样粘贴提交。
 3. 系统会创建 `cli-account-*` 记录并保存 refresh token，后续请求将继续使用官方 CLI 的 OAuth 客户端，从而继承免费额度。
 
-> 默认限额（按单个 CLI 账号计算）：`gemini-2.5-pro` 每日 100 次；`gemini-2.5-pro-preview` 合计每日 1000 次；`gemini-2.5-flash` 每日 100 次。
+> 默认限额（按单个 CLI 账号计算）：`gemini-2.5-pro` 每日 100 次；`gemini-2.5-pro-preview` 合计每日 1000 次；`gemini-2.5-flash` 每日 1000 次。
 
 **维护与撤销**
 

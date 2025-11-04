@@ -470,7 +470,7 @@ class Database:
         default_models = [
             ('gemini-2.5-pro', 5, 250000, 100),  # 单API: RPM, TPM, RPD
             ('gemini-2.5-pro-preview-06-05', 5, 250000, 1000),
-            ('gemini-2.5-flash', 10, 250000, 100),
+            ('gemini-2.5-flash', 10, 250000, 1000),
             ('gemini-2.5-flash-lite', 15, 250000, 1000),
             ('gemini-embedding-001', 100, 30000, 1000),
         ]
@@ -490,22 +490,7 @@ class Database:
             except Exception as e:
                 logger.error(f"Failed to insert model config {model_name}: {e}")
 
-        obsolete_models = [
-            'gemini-2.5-pro-preview',
-            'gemini-2.5-pro-preview-03-25',
-            'gemini-2.5-pro-preview-05-06',
-            'gemini-2.5-flash-preview',
-            'gemini-2.5-flash-preview-04-17',
-            'gemini-2.5-flash-preview-05-20',
-            'gemini-2.5-flash-image-preview',
-        ]
-        try:
-            cursor.execute(
-                f"DELETE FROM model_configs WHERE model_name IN ({','.join('?' for _ in obsolete_models)})",
-                obsolete_models,
-            )
-        except Exception as e:
-            logger.error(f"Failed to purge obsolete model configs: {e}")
+
 
     @staticmethod
     def _strip_variant_suffix(model_name: str) -> Tuple[str, Optional[str]]:
