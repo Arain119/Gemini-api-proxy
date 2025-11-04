@@ -26,25 +26,15 @@ KEY_OPTIONAL_MODELS = [
 ]
 
 CLI_PREVIEW_MODELS = [
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-pro-preview-06-05",
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.5-flash-preview-04-17",
-    "gemini-2.5-flash-image-preview",
 ]
 
 CLI_ALIAS_MAP = {}
 
 CLI_LIMIT_MODELS = {
     "gemini-2.5-pro",
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-pro-preview-05-06",
     "gemini-2.5-pro-preview-06-05",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-preview-05-20",
-    "gemini-2.5-flash-preview-04-17",
-    "gemini-2.5-flash-image-preview",
 }
 
 MODEL_VARIANT_SUFFIXES = [
@@ -55,7 +45,6 @@ MODEL_VARIANT_SUFFIXES = [
 
 SEARCH_VARIANT_EXCLUDE = {
     "gemini-embedding-001",
-    "gemini-2.5-flash-image-preview",
 }
 
 class Database:
@@ -480,15 +469,8 @@ class Database:
         """初始化模型配置（单个API限制）"""
         default_models = [
             ('gemini-2.5-pro', 5, 250000, 100),  # 单API: RPM, TPM, RPD
-            ('gemini-2.5-pro-preview', 5, 250000, 1000),
-            ('gemini-2.5-pro-preview-03-25', 5, 250000, 1000),
-            ('gemini-2.5-pro-preview-05-06', 5, 250000, 1000),
             ('gemini-2.5-pro-preview-06-05', 5, 250000, 1000),
             ('gemini-2.5-flash', 10, 250000, 100),
-            ('gemini-2.5-flash-preview', 10, 250000, 1000),
-            ('gemini-2.5-flash-preview-05-20', 10, 250000, 1000),
-            ('gemini-2.5-flash-preview-04-17', 10, 250000, 1000),
-            ('gemini-2.5-flash-image-preview', 10, 250000, 1000),
             ('gemini-2.5-flash-lite', 15, 250000, 1000),
             ('gemini-embedding-001', 100, 30000, 1000),
         ]
@@ -507,6 +489,23 @@ class Database:
                 ''', (model_name, rpm, tpm, rpd, -1, 1))
             except Exception as e:
                 logger.error(f"Failed to insert model config {model_name}: {e}")
+
+        obsolete_models = [
+            'gemini-2.5-pro-preview',
+            'gemini-2.5-pro-preview-03-25',
+            'gemini-2.5-pro-preview-05-06',
+            'gemini-2.5-flash-preview',
+            'gemini-2.5-flash-preview-04-17',
+            'gemini-2.5-flash-preview-05-20',
+            'gemini-2.5-flash-image-preview',
+        ]
+        try:
+            cursor.execute(
+                f"DELETE FROM model_configs WHERE model_name IN ({','.join('?' for _ in obsolete_models)})",
+                obsolete_models,
+            )
+        except Exception as e:
+            logger.error(f"Failed to purge obsolete model configs: {e}")
 
     @staticmethod
     def _strip_variant_suffix(model_name: str) -> Tuple[str, Optional[str]]:
