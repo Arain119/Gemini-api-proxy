@@ -34,14 +34,7 @@ CLI_PREVIEW_MODELS = [
     "gemini-2.5-flash-image-preview",
 ]
 
-CLI_ALIAS_MAP = {
-    "gemini-2.5-pro-preview-03-25": {"gemini-2.5-pro-preview-03-25"},
-    "gemini-2.5-pro-preview-05-06": {"gemini-2.5-pro-preview-05-06"},
-    "gemini-2.5-pro-preview-06-05": {"gemini-2.5-pro-preview-06-05"},
-    "gemini-2.5-flash-preview-05-20": {"gemini-2.5-flash-preview-05-20"},
-    "gemini-2.5-flash-preview-04-17": {"gemini-2.5-flash-preview-04-17"},
-    "gemini-2.5-flash-image-preview": {"gemini-2.5-flash-image-preview"},
-}
+CLI_ALIAS_MAP = {}
 
 CLI_LIMIT_MODELS = {
     "gemini-2.5-pro",
@@ -1056,8 +1049,6 @@ class Database:
                 if supported_models:
                     supported_base_models = {self.resolve_model_name(name) for name in supported_models}
                     configs = [config for config in configs if config.get('model_name') in supported_base_models]
-                else:
-                    configs = []
 
                 overall_effective_count = self._get_effective_active_key_count()
                 cli_accounts_count = len(self.list_cli_accounts())
