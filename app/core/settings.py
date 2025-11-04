@@ -28,7 +28,7 @@ def _get_list(name: str, default: List[str]) -> List[str]:
 
 @dataclass(frozen=True)
 class Settings:
-    app_name: str = field(default_factory=lambda: os.getenv("APP_NAME", "gemini-api-proxy-beta"))
+    app_name: str = field(default_factory=lambda: os.getenv("APP_NAME", "gemini-api-proxy"))
     environment: str = field(default_factory=lambda: os.getenv("ENVIRONMENT", "production"))
     debug: bool = field(default_factory=lambda: _get_bool("DEBUG", False))
 

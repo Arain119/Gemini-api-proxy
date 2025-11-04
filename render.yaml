@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: gemini-api-proxy-beta
+  name: gemini-api-proxy
     env: python
     plan: free
     region: oregon
