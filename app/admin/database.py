@@ -35,16 +35,23 @@ CLI_PREVIEW_MODELS = [
 ]
 
 CLI_ALIAS_MAP = {
-    "gemini-2.5-pro": {
+    "gemini-2.5-pro-preview": {
         "gemini-2.5-pro-preview-03-25",
         "gemini-2.5-pro-preview-05-06",
         "gemini-2.5-pro-preview-06-05",
     },
-    "gemini-2.5-flash": {
+    "gemini-2.5-flash-preview": {
         "gemini-2.5-flash-preview-05-20",
         "gemini-2.5-flash-preview-04-17",
         "gemini-2.5-flash-image-preview",
     },
+}
+
+CLI_LIMIT_MODELS = {
+    "gemini-2.5-pro",
+    "gemini-2.5-pro-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-preview",
 }
 
 MODEL_VARIANT_SUFFIXES = [
@@ -479,10 +486,12 @@ class Database:
     def _init_model_configs(self, cursor):
         """初始化模型配置（单个API限制）"""
         default_models = [
-            ('gemini-2.5-flash', 10, 250000, 1000),  # 单API: RPM, TPM, RPD
-            ('gemini-2.5-flash-lite', 15, 250000, 1000),  # 单API: RPM, TPM, RPD
-            ('gemini-2.5-pro', 5, 250000, 1000),  # 单API: RPM, TPM, RPD
-            ('gemini-embedding-001', 100, 30000, 1000), # 单API: RPM, TPM, RPD
+            ('gemini-2.5-pro', 5, 250000, 100),  # 单API: RPM, TPM, RPD
+            ('gemini-2.5-pro-preview', 5, 250000, 1000),
+            ('gemini-2.5-flash', 10, 250000, 100),
+            ('gemini-2.5-flash-preview', 10, 250000, 1000),
+            ('gemini-2.5-flash-lite', 15, 250000, 1000),
+            ('gemini-embedding-001', 100, 30000, 1000),
         ]
 
         for model_name, rpm, tpm, rpd in default_models:
@@ -990,7 +999,15 @@ class Database:
                 config.setdefault('default_thinking_budget', -1)
                 config.setdefault('include_thoughts_default', 1)
 
-                effective_keys_count = self._get_effective_active_key_count()
+                cli_accounts_count = len(self.list_cli_accounts())
+
+                if base_model in CLI_LIMIT_MODELS and cli_accounts_count > 0:
+                    effective_keys_count = cli_accounts_count
+                else:
+                    effective_keys_count = self._get_effective_active_key_count()
+
+                if effective_keys_count <= 0:
+                    effective_keys_count = 1
 
                 config['total_rpm_limit'] = config['single_api_rpm_limit'] * effective_keys_count
                 config['total_tpm_limit'] = config['single_api_tpm_limit'] * effective_keys_count
@@ -1036,12 +1053,21 @@ class Database:
                 else:
                     configs = []
 
-                effective_keys_count = self._get_effective_active_key_count()
+                overall_effective_count = self._get_effective_active_key_count()
+                cli_accounts_count = len(self.list_cli_accounts())
 
                 # 为每个配置添加总限制
                 for config in configs:
                     config.setdefault('default_thinking_budget', -1)
                     config.setdefault('include_thoughts_default', 1)
+                    if config['model_name'] in CLI_LIMIT_MODELS and cli_accounts_count > 0:
+                        effective_keys_count = cli_accounts_count
+                    else:
+                        effective_keys_count = overall_effective_count
+
+                    if effective_keys_count <= 0:
+                        effective_keys_count = 1
+
                     config['total_rpm_limit'] = config['single_api_rpm_limit'] * effective_keys_count
                     config['total_tpm_limit'] = config['single_api_tpm_limit'] * effective_keys_count
                     config['total_rpd_limit'] = config['single_api_rpd_limit'] * effective_keys_count

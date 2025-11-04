@@ -368,127 +368,144 @@ def render_key_management_page():
 
         with st.container(border=True):
             st.markdown("##### Gemini CLI 账号接入")
-            st.caption("可通过浏览器授权或上传 CLI 凭证的方式接入账号，系统会自动纳入号池并参与轮询。")
+            st.caption("导入官方 CLI 获取的 OAuth 凭证，系统会自动纳入号池并参与轮询。")
 
-            col_auth, col_upload = st.columns([1.1, 0.9], gap="large")
+            show_online_auth = os.getenv("RENDER") is None
 
-            with col_auth:
-                st.markdown("###### 在线授权登录")
-                st.caption("无需手动上传文件，直接跳转 Google 登录页完成授权。")
+            if show_online_auth:
+                col_auth, col_import = st.columns([1.1, 0.9], gap="large")
+            else:
+                col_import = st.container()
 
-                auto_finalize = st.checkbox(
-                    "授权完成后自动导入",
-                    value=st.session_state.get("cli_auth_auto", True),
-                    help="勾选后，授权完成会立即导入账号并刷新密钥池。",
-                    key="cli_auth_auto_checkbox"
-                )
+            if show_online_auth:
+                with col_auth:
+                    st.markdown("###### 在线授权登录")
+                    st.caption("无需手动上传文件，直接跳转 Google 登录页完成授权。")
 
-                if st.button("生成登录链接", type="primary", use_container_width=True, key="create_cli_auth_link"):
-                    payload = {
-                        "auto_finalize": auto_finalize,
-                    }
-                    result = call_api('/admin/cli-auth/start', 'POST', payload)
-                    if result and result.get('authorization_url'):
-                        st.session_state['cli_auth_session'] = result
-                        st.session_state['cli_auth_status'] = {"status": "pending", "state": result['state']}
-                        st.session_state['cli_auth_auto'] = auto_finalize
-                        st.success("登录链接已生成，请在下方打开授权页面。")
-
-                session = st.session_state.get('cli_auth_session')
-
-                if session:
-                    status_payload = st.session_state.get('cli_auth_status') or {}
-                    status_text = status_payload.get('status', 'pending')
-
-                    st.link_button("打开授权页面", session.get("authorization_url"), use_container_width=True)
-                    if status_text in (None, 'pending', 'callback_received'):
-                        st.caption(f"若浏览器未自动刷新，请确认回调地址：{session.get('callback_url')}")
-
-                    if st.button("刷新授权状态", use_container_width=True, key="refresh_cli_auth_status"):
-                        status_resp = call_api(f"/admin/cli-auth/status?state={session['state']}")
-                        if status_resp:
-                            st.session_state['cli_auth_status'] = status_resp
-                            status_payload = status_resp
-                            status_text = status_payload.get('status', 'pending')
-
-                    if status_text == 'completed':
-                        result_info = status_payload.get('result') or {}
-                        email = status_payload.get('account_email') or result_info.get('account_email') or '授权已完成'
-                        st.success(f"授权成功：{email}")
-                        st.session_state['cli_auth_session'] = None
-                        st.session_state['cli_auth_status'] = None
-                        st.cache_data.clear()
-                        time.sleep(1)
-                        st.rerun()
-                    elif status_text == 'failed':
-                        st.error(status_payload.get('message') or '授权失败，请重新生成链接。')
-                        if st.button("重新生成登录链接", key="cli_auth_reset", use_container_width=True):
-                            st.session_state['cli_auth_session'] = None
-                            st.session_state['cli_auth_status'] = None
-                            st.rerun()
-                    elif status_text == 'callback_received':
-                        st.info("已收到回调，正在完成授权，请稍后点击“刷新授权状态”。")
-                    elif status_text == 'unknown':
-                        st.info("授权会话已结束，请刷新密钥列表确认账号是否导入。")
-                        st.session_state['cli_auth_session'] = None
-                        st.session_state['cli_auth_status'] = None
-                        time.sleep(0.5)
-                        st.rerun()
-                    else:
-                        st.info("等待您在新页面完成授权…")
-                else:
-                    st.caption("点击“生成登录链接”按钮，在新页面完成 Google 登录。授权完成后在此页面点击“刷新授权状态”。")
-
-            with col_upload:
-                st.markdown("###### 导入凭证文件")
-                st.caption("适合已通过 Gemini CLI 登录且持有 `oauth_creds.json` 文件的场景。")
-
-                with st.expander("如何获取凭证", expanded=False):
-                    st.markdown("1. **安装/更新 Gemini CLI**")
-                    st.code("npm install -g @google/gemini-cli", language="bash")
-                    st.markdown("2. **执行登录**")
-                    st.code("gemini auth login", language="bash")
-                    st.caption("运行后，浏览器将打开授权页面，请完成登录。")
-                    st.markdown("3. **找到凭证文件**")
-                    st.info(
-                        "登录成功后，CLI 会在您的用户主目录中创建一个凭证文件。\n\n"
-                        "**Windows:** `C:\\Users\\<您的用户名>\\.gemini\\oauth_creds.json`\n\n"
-                        "**macOS/Linux:** `~/.gemini/oauth_creds.json`"
+                    auto_finalize = st.checkbox(
+                        "授权完成后自动导入",
+                        value=st.session_state.get("cli_auth_auto", True),
+                        help="勾选后，授权完成会立即导入账号并刷新密钥池。",
+                        key="cli_auth_auto_checkbox"
                     )
 
+                    if st.button("生成登录链接", type="primary", use_container_width=True, key="create_cli_auth_link"):
+                        payload = {
+                            "auto_finalize": auto_finalize,
+                        }
+                        result = call_api('/admin/cli-auth/start', 'POST', payload)
+                        if result and result.get('authorization_url'):
+                            st.session_state['cli_auth_session'] = result
+                            st.session_state['cli_auth_status'] = {"status": "pending", "state": result['state']}
+                            st.session_state['cli_auth_auto'] = auto_finalize
+                            st.success("登录链接已生成，请在下方打开授权页面。")
+
+                    session = st.session_state.get('cli_auth_session')
+
+                    if session:
+                        status_payload = st.session_state.get('cli_auth_status') or {}
+                        status_text = status_payload.get('status', 'pending')
+
+                        st.link_button("打开授权页面", session.get("authorization_url"), use_container_width=True)
+                        if status_text in (None, 'pending', 'callback_received'):
+                            st.caption(f"若浏览器未自动刷新，请确认回调地址：{session.get('callback_url')}")
+
+                        if st.button("刷新授权状态", use_container_width=True, key="refresh_cli_auth_status"):
+                            status_resp = call_api(f"/admin/cli-auth/status?state={session['state']}")
+                            if status_resp:
+                                st.session_state['cli_auth_status'] = status_resp
+                                status_payload = status_resp
+                                status_text = status_payload.get('status', 'pending')
+
+                        if status_text == 'completed':
+                            result_info = status_payload.get('result') or {}
+                            email = status_payload.get('account_email') or result_info.get('account_email') or '授权已完成'
+                            st.success(f"授权成功：{email}")
+                            st.session_state['cli_auth_session'] = None
+                            st.session_state['cli_auth_status'] = None
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+                        elif status_text == 'failed':
+                            st.error(status_payload.get('message') or '授权失败，请重新生成链接。')
+                            if st.button("重新生成登录链接", key="cli_auth_reset", use_container_width=True):
+                                st.session_state['cli_auth_session'] = None
+                                st.session_state['cli_auth_status'] = None
+                                st.rerun()
+                        elif status_text == 'callback_received':
+                            st.info("已收到回调，正在完成授权，请稍后点击“刷新授权状态”。")
+                        elif status_text == 'unknown':
+                            st.info("授权会话已结束，请刷新密钥列表确认账号是否导入。")
+                            st.session_state['cli_auth_session'] = None
+                            st.session_state['cli_auth_status'] = None
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.info("等待您在新页面完成授权…")
+                    else:
+                        st.caption("点击“生成登录链接”按钮，在新页面完成 Google 登录。授权完成后在此页面点击“刷新授权状态”。")
+
+            with col_import:
+                st.markdown("###### 导入 CLI 凭证")
+                st.caption("复制 JSON 内容或上传 `oauth_creds.json` 文件均可。")
+
+                with st.expander("如何获取凭证", expanded=False):
+                    st.markdown("**方式 A：gemini-cli**")
+                    st.code("npm install -g @google/geminicli\ngemini-cli login", language="bash")
+                    st.caption("登录成功后，终端会输出 JSON，或在 `~/.config/geminicli/` 中生成凭证文件。")
+                    st.markdown("**方式 B：在线工具（示例）**")
+                    st.write("访问 sukaka 教师搭建的认证站点 [gcli-auth.sukaka.top](http://gcli-auth.sukaka.top:7861/) 并按提示获取 JSON。")
+
+                manual_json = st.text_area(
+                    "粘贴 JSON 凭证内容",
+                    value="",
+                    height=180,
+                    placeholder="{\n  \"client_id\": \"...apps.googleusercontent.com\",\n  \"client_secret\": \"...\",\n  ...\n}"
+                )
+
                 uploaded_file = st.file_uploader(
-                    "点击或拖拽 `oauth_creds.json` 文件到这里",
+                    "或上传 `oauth_creds.json` 文件",
                     type=['json'],
                     label_visibility="collapsed"
                 )
 
-                if uploaded_file is not None:
+                credentials_json = None
+
+                if manual_json.strip():
+                    credentials_json = manual_json.strip()
+                elif uploaded_file is not None:
                     try:
                         credentials_json = uploaded_file.getvalue().decode("utf-8")
-                        json.loads(credentials_json)
-
-                        if st.button("确认导入凭证", type="primary", use_container_width=True):
-                            with st.spinner("正在导入并验证凭证..."):
-                                result = call_api(
-                                    '/admin/cli-auth/import',
-                                    'POST',
-                                    {'credentials_json': credentials_json}
-                                )
-
-                                if result and result.get('account_id'):
-                                    email = result.get('account_email', '未知账号')
-                                    st.success(f"凭证导入成功！已添加账号：{email}")
-                                    st.cache_data.clear()
-                                    time.sleep(1)
-                                    st.rerun()
-                                elif result:
-                                    error_message = result.get('message') or result.get('detail') or '未知错误'
-                                    st.error(f"导入失败：{error_message}")
-
-                    except json.JSONDecodeError:
-                        st.error("文件格式无效，请确保上传的是一个有效的 JSON 文件。")
                     except Exception as e:
-                        st.error(f"处理文件时出错：{e}")
+                        st.error(f"读取文件失败：{e}")
+
+                if credentials_json:
+                    try:
+                        json.loads(credentials_json)
+                    except json.JSONDecodeError:
+                        st.error("JSON 格式无效，请检查内容。")
+                        credentials_json = None
+
+                if credentials_json:
+                    if st.button("确认导入凭证", type="primary", use_container_width=True):
+                        with st.spinner("正在导入并验证凭证..."):
+                            result = call_api(
+                                '/admin/cli-auth/import',
+                                'POST',
+                                {'credentials_json': credentials_json}
+                            )
+
+                            if result and result.get('account_id'):
+                                email = result.get('account_email', '未知账号')
+                                st.success(f"凭证导入成功！已添加账号：{email}")
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.rerun()
+                            elif result:
+                                error_message = result.get('message') or result.get('detail') or '未知错误'
+                                st.error(f"导入失败：{error_message}")
+                else:
+                    st.caption("请粘贴有效 JSON 或上传凭证文件后再点击确认导入。")
 
         st.markdown('<hr style="margin: 1.5rem 0;">', unsafe_allow_html=True)
 
