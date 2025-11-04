@@ -9,7 +9,7 @@ import copy
 import itertools
 import textwrap
 import re
-from typing import Coroutine, Dict, List, Optional, AsyncGenerator, Any
+from typing import Coroutine, Dict, List, Optional, AsyncGenerator, Any, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import httpx
@@ -28,6 +28,7 @@ from app.admin.api_utils import (
     check_gemini_key_health,
     RateLimitCache,
     openai_to_gemini,
+    estimate_token_count,
 )
 from app.admin.cli_auth import (
     call_gemini_with_cli_account,
@@ -88,6 +89,54 @@ def _should_apply_queue(db: Database) -> bool:
     except Exception:
         return True
     return any(not _is_cli_key(key) for key in keys)
+
+
+def _estimate_prompt_tokens_from_request(request: ChatCompletionRequest) -> int:
+    """估算请求的上下文 token 数，用于路由策略决策。"""
+    if not request or not getattr(request, "messages", None):
+        return 0
+
+    total_tokens = 0
+    for message in request.messages:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            total_tokens += estimate_token_count(content)
+            continue
+
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, str):
+                    total_tokens += estimate_token_count(item)
+                elif isinstance(item, dict):
+                    text_value = item.get("text")
+                    if isinstance(text_value, str):
+                        total_tokens += estimate_token_count(text_value)
+                else:
+                    text_value = getattr(item, "text", None)
+                    if isinstance(text_value, str):
+                        total_tokens += estimate_token_count(text_value)
+            continue
+
+        text_value = getattr(content, "text", None)
+        if isinstance(text_value, str):
+            total_tokens += estimate_token_count(text_value)
+
+    return total_tokens
+
+
+def _determine_selection_preferences(model_name: str, context_tokens: int) -> Tuple[bool, bool]:
+    """根据模型与上下文长度确定密钥选择偏好。"""
+    normalized = (model_name or "").lower()
+    prefer_non_cli = False
+    force_cli_only = False
+
+    if "gemini-2.5-pro" in normalized:
+        if context_tokens > 125_000:
+            force_cli_only = True
+        else:
+            prefer_non_cli = True
+
+    return prefer_non_cli, force_cli_only
 
 
 def _get_cli_account_id(key_info: Dict[str, Any]) -> Optional[int]:
@@ -718,6 +767,9 @@ async def _make_request_with_fast_failover_body(
 
     track_usage = bool(user_key_info) and not _internal_call
 
+    context_tokens = _estimate_prompt_tokens_from_request(openai_request)
+    prefer_non_cli, force_cli_only = _determine_selection_preferences(model_name, context_tokens)
+
     for attempt in range(max_key_attempts):
         try:
             # 选择下一个可用的key（排除已失败的）
@@ -725,7 +777,10 @@ async def _make_request_with_fast_failover_body(
                 db,
                 rate_limiter,
                 model_name,
-                excluded_keys=set(failed_keys)
+                excluded_keys=set(failed_keys),
+                context_tokens=context_tokens,
+                prefer_non_cli=prefer_non_cli,
+                force_cli_only=force_cli_only,
             )
 
             # 增强的空值检查
@@ -1167,7 +1222,16 @@ async def should_use_fast_failover(db: Database) -> bool:
     config = db.get_failover_config()
     return config.get('fast_failover_enabled', True)
 
-async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLimitCache, model_name: str, excluded_keys: set = None) -> Optional[Dict]:
+async def select_gemini_key_and_check_limits(
+        db: Database,
+        rate_limiter: RateLimitCache,
+        model_name: str,
+        *,
+        excluded_keys: set = None,
+        context_tokens: Optional[int] = None,
+        prefer_non_cli: bool = False,
+        force_cli_only: bool = False,
+) -> Optional[Dict]:
     """自适应选择可用的Gemini Key并检查模型限制"""
     if excluded_keys is None:
         excluded_keys = set()
@@ -1180,13 +1244,11 @@ async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLim
         return None
 
     available_keys = [k for k in available_keys if k['id'] not in excluded_keys]
-
     if not available_keys:
         logger.warning("No available Gemini keys found after exclusions")
         return None
 
     cli_candidates = [k for k in available_keys if _is_cli_key(k)]
-    use_cli_only = bool(cli_candidates)
 
     model_config = db.get_model_config(model_name)
     if not model_config:
@@ -1197,32 +1259,61 @@ async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLim
         f"Model {model_name} limits: RPM={model_config['total_rpm_limit']}, TPM={model_config['total_tpm_limit']}, RPD={model_config['total_rpd_limit']}")
     logger.info(f"Available credentials: {len(available_keys)} (CLI: {len(cli_candidates)})")
 
-    candidate_pool = cli_candidates if use_cli_only else available_keys
+    candidate_pool: List[Dict[str, Any]] = list(available_keys)
 
-    if not use_cli_only:
+    if force_cli_only:
+        if cli_candidates:
+            candidate_pool = cli_candidates
+        else:
+            logger.warning("Force CLI-only requested but no CLI keys available; using all keys instead.")
+
+    use_non_cli = any(not _is_cli_key(key) for key in candidate_pool)
+    if use_non_cli:
         current_usage = await rate_limiter.get_current_usage(model_name)
 
         if (current_usage['requests'] >= model_config['total_rpm_limit'] or
                 current_usage['tokens'] >= model_config['total_tpm_limit']):
             logger.warning(
                 f"Model {model_name} has reached rate limits: requests={current_usage['requests']}/{model_config['total_rpm_limit']}, tokens={current_usage['tokens']}/{model_config['total_tpm_limit']}")
-            return None
+            if cli_candidates:
+                logger.info("Falling back to CLI keys due to aggregated rate limit.")
+                candidate_pool = cli_candidates
+                use_non_cli = False
+            else:
+                return None
 
         day_usage = db.get_usage_stats(model_name, 'day', include_cli=False)
         if day_usage['requests'] >= model_config['total_rpd_limit']:
             logger.warning(
                 f"Model {model_name} has reached daily request limit: {day_usage['requests']}/{model_config['total_rpd_limit']}")
-            return None
+            if cli_candidates:
+                logger.info("Falling back to CLI keys due to daily limit.")
+                candidate_pool = cli_candidates
+                use_non_cli = False
+            else:
+                return None
 
     strategy = db.get_config('load_balance_strategy', 'adaptive')
 
+    prefer_non_cli_effective = prefer_non_cli and any(not _is_cli_key(k) for k in candidate_pool)
+
     if strategy == 'round_robin':
+        if prefer_non_cli_effective:
+            ordered_pool = [k for k in candidate_pool if not _is_cli_key(k)] + [
+                k for k in candidate_pool if _is_cli_key(k)
+            ]
+        else:
+            ordered_pool = candidate_pool
         async with _rr_lock:
-            idx = next(_rr_counter) % len(candidate_pool)
-            selected_key = candidate_pool[idx]
+            idx = next(_rr_counter) % len(ordered_pool)
+            selected_key = ordered_pool[idx]
     elif strategy == 'least_used':
-        # 按总请求数排序
-        sorted_keys = sorted(candidate_pool, key=lambda k: k.get('total_requests', 0))
+        # 按总请求数排序，并根据偏好调整优先级
+        def _least_used_sort_key(key: Dict[str, Any]) -> tuple:
+            preference_bucket = 1 if (_is_cli_key(key) and prefer_non_cli_effective) else 0
+            return preference_bucket, key.get('total_requests', 0)
+
+        sorted_keys = sorted(candidate_pool, key=_least_used_sort_key)
         selected_key = sorted_keys[0]
     else:  # adaptive strategy
         best_key = None
@@ -1239,6 +1330,12 @@ async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLim
             # 最终评分：成功率权重70%，时间权重30%
             score = ema_success_rate * 0.7 + time_score * 0.3
 
+            if prefer_non_cli_effective:
+                if _is_cli_key(key_info):
+                    score *= 0.9
+                else:
+                    score *= 1.05
+
             # 增加近期失败惩罚
             last_failure = key_info.get('last_failure_timestamp', 0)
             time_since_failure = time.time() - last_failure
@@ -1252,7 +1349,14 @@ async def select_gemini_key_and_check_limits(db: Database, rate_limiter: RateLim
 
         selected_key = best_key if best_key else candidate_pool[0]
 
-    logger.info(f"Selected API key #{selected_key['id']} for model {model_name} (strategy: {strategy})")
+    if context_tokens is None:
+        logger.info(
+            f"Selected API key #{selected_key['id']} for model {model_name} (strategy: {strategy}, prefer_non_cli={prefer_non_cli_effective})"
+        )
+    else:
+        logger.info(
+            f"Selected API key #{selected_key['id']} for model {model_name} (strategy: {strategy}, prefer_non_cli={prefer_non_cli_effective}, context_tokens={context_tokens})"
+        )
 
     return {
         'key_info': selected_key,
@@ -1420,13 +1524,19 @@ async def _make_request_with_failover_body(
 
     track_usage = bool(user_key_info) and not _internal_call
 
+    context_tokens = _estimate_prompt_tokens_from_request(openai_request)
+    prefer_non_cli, force_cli_only = _determine_selection_preferences(model_name, context_tokens)
+
     for attempt in range(max_key_attempts):
         try:
             selection_result = await select_gemini_key_and_check_limits(
                 db,
                 rate_limiter,
                 model_name,
-                excluded_keys=excluded_keys.union(set(failed_keys))
+                excluded_keys=excluded_keys.union(set(failed_keys)),
+                context_tokens=context_tokens,
+                prefer_non_cli=prefer_non_cli,
+                force_cli_only=force_cli_only,
             )
 
             if not selection_result:
@@ -1623,13 +1733,18 @@ async def _stream_with_failover_body(
 
     failed_keys = []
     track_usage = bool(user_key_info) and not _internal_call
+    context_tokens = _estimate_prompt_tokens_from_request(openai_request)
+    prefer_non_cli, force_cli_only = _determine_selection_preferences(model_name, context_tokens)
 
     for attempt in range(max_key_attempts):
         selection_result = await select_gemini_key_and_check_limits(
             db,
             rate_limiter,
             model_name,
-            excluded_keys=excluded_keys.union(set(failed_keys))
+            excluded_keys=excluded_keys.union(set(failed_keys)),
+            context_tokens=context_tokens,
+            prefer_non_cli=prefer_non_cli,
+            force_cli_only=force_cli_only,
         )
 
         if not selection_result:
@@ -2223,7 +2338,12 @@ async def create_embeddings(
     if request.output_dimensionality:
         config['output_dimensionality'] = request.output_dimensionality
 
-    selection_result = await select_gemini_key_and_check_limits(db, rate_limiter, model_name)
+    selection_result = await select_gemini_key_and_check_limits(
+        db,
+        rate_limiter,
+        model_name,
+        force_cli_only=True,
+    )
     if not selection_result:
         raise HTTPException(status_code=429, detail="Rate limit exceeded or no available keys.")
 
@@ -2329,7 +2449,12 @@ async def create_gemini_native_embeddings(
 
     config_dict = request.config.dict() if request.config else {}
 
-    selection_result = await select_gemini_key_and_check_limits(db, rate_limiter, model_name)
+    selection_result = await select_gemini_key_and_check_limits(
+        db,
+        rate_limiter,
+        model_name,
+        force_cli_only=True,
+    )
     if not selection_result:
         raise HTTPException(status_code=429, detail="Rate limit exceeded or no available keys.")
 

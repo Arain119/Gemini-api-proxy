@@ -2,6 +2,8 @@
 
 Gemini API Proxy 2.0 是一个面向 Render / 本地单实例部署的 Gemini 反向代理与运维平台。项目将 FastAPI、Streamlit、任务调度及多账号池管理整合在同一进程中，既能兼容原生 Gemini/Google Generative AI 接口，也提供 OpenAI 格式的 `/v1/chat/completions` 端点与图形化控制台。
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Arain119/Gemini-api-proxy)
+
 ---
 
 ## 核心特性
