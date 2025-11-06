@@ -226,6 +226,7 @@ def _health_check_candidates(key_info: Dict[str, Any]) -> List[str]:
             "gemini-2.5-flash",
             "gemini-2.5-pro",
             "gemini-2.5-pro-preview-06-05",
+            "gemini-3-pro-preview-11-2025",
         ]
 
     if source_type == "cli_api_key":
@@ -233,6 +234,7 @@ def _health_check_candidates(key_info: Dict[str, Any]) -> List[str]:
             "gemini-2.5-flash-lite",
             "gemini-2.5-flash",
             "gemini-2.5-pro",
+            "gemini-3-pro-preview-11-2025",
         ]
 
     return ["gemini-2.5-flash-lite"]

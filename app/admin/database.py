@@ -27,6 +27,7 @@ KEY_OPTIONAL_MODELS = [
 
 CLI_PREVIEW_MODELS = [
     "gemini-2.5-pro-preview-06-05",
+    "gemini-3-pro-preview-11-2025",
 ]
 
 CLI_ALIAS_MAP = {}
@@ -35,6 +36,7 @@ CLI_LIMIT_MODELS = {
     "gemini-2.5-pro",
     "gemini-2.5-pro-preview-06-05",
     "gemini-2.5-flash",
+    "gemini-3-pro-preview-11-2025",
 }
 
 MODEL_VARIANT_SUFFIXES = [
@@ -470,6 +472,7 @@ class Database:
         default_models = [
             ('gemini-2.5-pro', 5, 250000, 100),  # 单API: RPM, TPM, RPD
             ('gemini-2.5-pro-preview-06-05', 5, 250000, 1000),
+            ('gemini-3-pro-preview-11-2025', 5, 250000, 1000),
             ('gemini-2.5-flash', 10, 250000, 1000),
             ('gemini-2.5-flash-lite', 15, 250000, 1000),
             ('gemini-embedding-001', 100, 30000, 1000),
