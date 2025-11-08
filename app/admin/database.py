@@ -451,6 +451,7 @@ class Database:
             # 流式模式配置
             ('stream_mode', 'auto', 'Stream mode setting: auto, stream, non_stream'),
             ('deepthink_enabled', 'false', 'Enable DeepThink mode for multi-step reasoning'),
+            ('deepthink_max_rounds', '7', 'Maximum rounds for DeepThink multi-step reasoning'),
 
             # 搜索功能配置
             ('search_enabled', 'false', '启用搜索模式进行网页抓取'),
@@ -844,18 +845,34 @@ class Database:
     def get_deepthink_config(self) -> Dict[str, any]:
         """获取DeepThink配置"""
         try:
+            rounds_value = self.get_config('deepthink_max_rounds', '7')
+            try:
+                rounds = max(1, min(10, int(rounds_value)))
+            except (TypeError, ValueError):
+                rounds = 7
             return {
-                'enabled': self.get_config('deepthink_enabled', 'false').lower() == 'true'
+                'enabled': self.get_config('deepthink_enabled', 'false').lower() == 'true',
+                'rounds': rounds
             }
         except Exception as e:
             logger.error(f"Failed to get deepthink config: {e}")
-            return {'enabled': False}
+            return {'enabled': False, 'rounds': 7}
 
-    def set_deepthink_config(self, enabled: bool = None) -> bool:
+    def set_deepthink_config(self, enabled: bool = None, rounds: int = None) -> bool:
         """设置DeepThink配置"""
         try:
             if enabled is not None:
                 self.set_config('deepthink_enabled', 'true' if enabled else 'false')
+            if rounds is not None:
+                try:
+                    rounds_int = int(rounds)
+                except (TypeError, ValueError):
+                    raise ValueError("rounds must be an integer")
+
+                if rounds_int < 1 or rounds_int > 10:
+                    raise ValueError("rounds must be between 1 and 10")
+
+                self.set_config('deepthink_max_rounds', str(rounds_int))
 
             return True
         except Exception as e:

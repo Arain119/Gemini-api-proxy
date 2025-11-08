@@ -594,6 +594,7 @@ async def chat_completions(
             user_key_info,
             anti_detection,
             file_storage,
+            deepthink_config=deepthink_config,
             enable_anti_detection=False
         )
 
@@ -1178,10 +1179,34 @@ async def get_deepthink_config_endpoint(db: Database = Depends(get_db)):
 
 @admin_router.post("/config/deepthink", summary="更新DeepThink配置")
 async def update_deepthink_config_endpoint(request: dict, db: Database = Depends(get_db)):
-    db.set_deepthink_config(
-        enabled=request.get('enabled'),
-        rounds=request.get('rounds')
-    )
+    enabled_raw = request.get('enabled')
+    enabled: Optional[bool] = None
+    if enabled_raw is not None:
+        if isinstance(enabled_raw, bool):
+            enabled = enabled_raw
+        elif isinstance(enabled_raw, str):
+            normalized = enabled_raw.strip().lower()
+            if normalized in {"true", "1", "yes", "on"}:
+                enabled = True
+            elif normalized in {"false", "0", "no", "off"}:
+                enabled = False
+            else:
+                raise HTTPException(status_code=422, detail="Invalid enabled value")
+        else:
+            raise HTTPException(status_code=422, detail="Invalid enabled value type")
+
+    rounds = request.get('rounds')
+    if rounds is not None:
+        try:
+            rounds = int(rounds)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="rounds must be an integer")
+        if rounds < 1 or rounds > 10:
+            raise HTTPException(status_code=422, detail="rounds must be between 1 and 10")
+
+    if not db.set_deepthink_config(enabled=enabled, rounds=rounds):
+        raise HTTPException(status_code=500, detail="Failed to update DeepThink config")
+
     return {"success": True, "message": "Config updated"}
 
 @admin_router.get("/config/search", summary="获取搜索配置")
