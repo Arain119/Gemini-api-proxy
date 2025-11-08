@@ -2577,6 +2577,7 @@ async def _execute_deepthink_preprocessing(
     user_key_info: Dict,
     anti_detection: Any,
     file_storage: Dict,
+    deepthink_config: Optional[Dict[str, Any]] = None,
     enable_anti_detection: bool = False
 ) -> Dict:
     """执行串行 DeepThink 流程，允许搜索与代码工具交替运行。"""
@@ -2586,7 +2587,15 @@ async def _execute_deepthink_preprocessing(
         raise HTTPException(status_code=400, detail="User prompt is missing.")
 
     search_config = db.get_search_config()
+    if deepthink_config is None:
+        deepthink_config = db.get_deepthink_config()
+
     default_search_pages = max(1, min(5, int(search_config.get('num_pages_per_query', 3))))
+    try:
+        max_rounds = int(deepthink_config.get('rounds', 7))
+    except (TypeError, ValueError):
+        max_rounds = 7
+    max_rounds = max(1, min(10, max_rounds))
 
     async def _execute_sub_request(prompt: str, *, is_json: bool = False):
         try:
@@ -2628,14 +2637,21 @@ async def _execute_deepthink_preprocessing(
                 exec_result = item.get('result', {})
                 stdout_excerpt = textwrap.shorten(exec_result.get('stdout', ''), width=120, placeholder='…')
                 parts.append(f"第 {item['round']} 轮 - 代码: {code_excerpt}\n输出: {stdout_excerpt or '无输出'}")
+                error_excerpt = textwrap.shorten(exec_result.get('error', ''), width=80, placeholder='…') if exec_result.get('error') else ''
+                if error_excerpt:
+                    parts[-1] += f"\n错误: {error_excerpt}"
+                sandbox_limits = exec_result.get('sandbox_limits')
+                if isinstance(sandbox_limits, dict):
+                    allowed_modules = sandbox_limits.get('allowed_modules')
+                    if isinstance(allowed_modules, list):
+                        module_excerpt = ", ".join(list(allowed_modules)[:6])
+                        parts[-1] += f"\n沙盒模块: {module_excerpt}"
             else:
                 analysis_excerpt = textwrap.shorten(item.get('result', ''), width=220, placeholder='…')
                 parts.append(f"第 {item['round']} 轮 - 分析: {analysis_excerpt}")
             if summary:
                 parts[-1] += f"\n摘要: {summary}"
         return "\n\n".join(parts)
-
-    max_rounds = 7
 
     for round_index in range(1, max_rounds + 1):
         history_digest = _history_digest()
@@ -2658,9 +2674,10 @@ async def _execute_deepthink_preprocessing(
         }}
 
         Guidelines:
+        - Prioritise a balanced plan for research or long-form writing: gather facts with "search" and refine drafts with multiple "analysis" iterations before concluding.
         - Choose "search" when recent or external information is required.
-        - Choose "code" for mathematical or algorithmic computation; keep code under 80 lines, no files or network, and only use safe standard modules (math, statistics, random, datetime, time, re, functools, itertools, collections, decimal, fractions, json).
-        - Choose "analysis" to perform reasoning with the core model.
+        - Choose "code" for mathematical or algorithmic computation; keep code under 80 lines, no files or network, and only use the sandboxed modules (math, statistics, random, datetime, time, re, functools, itertools, collections, decimal, fractions, json).
+        - Choose "analysis" to perform reasoning with the core model or to improve a draft across rounds.
         - Choose "final" only when you can compose the final answer.
         """
 
@@ -2740,9 +2757,22 @@ async def _execute_deepthink_preprocessing(
             stdout_excerpt = textwrap.shorten(result.get('stdout', ''), width=200, placeholder='…')
             stderr_excerpt = textwrap.shorten(result.get('stderr', ''), width=120, placeholder='…')
             code_excerpt = textwrap.shorten(item.get('code', ''), width=160, placeholder='…')
-            history_sections.append(
+            error_excerpt = textwrap.shorten(result.get('error', ''), width=120, placeholder='…') if result.get('error') else ''
+            section = (
                 f"第 {item['round']} 轮 - 代码\n代码片段: {code_excerpt}\n输出: {stdout_excerpt or '无'}\n错误: {stderr_excerpt or '无'}"
             )
+            if error_excerpt:
+                section += f"\n沙盒提示: {error_excerpt}"
+            sandbox_limits = result.get('sandbox_limits')
+            if isinstance(sandbox_limits, dict):
+                modules = sandbox_limits.get('allowed_modules')
+                timeout_seconds = sandbox_limits.get('timeout_seconds')
+                if isinstance(modules, list) and modules:
+                    module_excerpt = ", ".join(modules[:6])
+                    section += f"\n可用模块: {module_excerpt}"
+                if timeout_seconds:
+                    section += f"\n超时时间: {timeout_seconds}s"
+            history_sections.append(section)
         elif action == 'search':
             query = item.get('query', '')
             search_excerpt = textwrap.shorten(item.get('result', ''), width=220, placeholder='…')

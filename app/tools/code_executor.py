@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+from .sandbox_runner import ALLOWED_MODULES as SANDBOX_ALLOWED_MODULES
+
 RUNNER_PATH = Path(__file__).with_name("sandbox_runner.py")
 DEFAULT_TIMEOUT = 5.0
 MAX_CAPTURE_LENGTH = 4000
@@ -21,15 +23,24 @@ async def execute_python_snippet(code: str, *, timeout: float = DEFAULT_TIMEOUT)
 
     The snippet runs in isolated mode (``python -I``) with a restricted
     runner that limits available modules and builtins. Outputs are truncated
-    to avoid overwhelming the caller.
+    to avoid overwhelming the caller. The returned dictionary always
+    includes ``sandbox_limits`` metadata describing the active sandbox
+    policy so DeepThink can surface the constraints in audit logs.
     """
+
+    sandbox_limits = {
+        "timeout_seconds": timeout,
+        "allowed_modules": sorted(SANDBOX_ALLOWED_MODULES),
+        "max_output_chars": MAX_CAPTURE_LENGTH,
+    }
 
     if not code or not code.strip():
         return {
             "ok": False,
             "stdout": "",
             "stderr": "",
-            "error": "代码内容为空"
+            "error": "代码内容为空",
+            "sandbox_limits": sandbox_limits,
         }
 
     env = {
@@ -58,7 +69,8 @@ async def execute_python_snippet(code: str, *, timeout: float = DEFAULT_TIMEOUT)
             "ok": False,
             "stdout": "",
             "stderr": "",
-            "error": "代码执行超时"
+            "error": "代码执行超时",
+            "sandbox_limits": sandbox_limits,
         }
 
     if stderr:
@@ -66,7 +78,8 @@ async def execute_python_snippet(code: str, *, timeout: float = DEFAULT_TIMEOUT)
             "ok": False,
             "stdout": "",
             "stderr": _truncate(stderr.decode("utf-8", "ignore")),
-            "error": "代码执行失败"
+            "error": "代码执行失败",
+            "sandbox_limits": sandbox_limits,
         }
 
     try:
@@ -76,13 +89,15 @@ async def execute_python_snippet(code: str, *, timeout: float = DEFAULT_TIMEOUT)
             "ok": False,
             "stdout": _truncate(stdout.decode("utf-8", "ignore")),
             "stderr": "",
-            "error": "沙盒返回数据异常"
+            "error": "沙盒返回数据异常",
+            "sandbox_limits": sandbox_limits,
         }
 
     result = {
         "ok": bool(payload.get("ok")),
         "stdout": _truncate(payload.get("stdout", "")),
         "stderr": _truncate(payload.get("stderr", "")),
+        "sandbox_limits": sandbox_limits,
     }
 
     if payload.get("error"):
